@@ -1,0 +1,6 @@
+langgraph>=1.2
+openai>=1.78.0
+langchain-mcp-adapters
+langsmith==0.8.8
+pyyaml
+python-dotenv

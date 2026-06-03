@@ -8,6 +8,7 @@ import io
 import contextlib
 import pwd
 import grp
+from tools import calculate
 
 root_dir = "skills"
 
@@ -81,7 +82,7 @@ Repeat this block for each step in sequence.
 url = "https://api.deepseek.com"
 # modelName = "deepseek-v4-flash"
 modelName = "deepseek-v4-pro"
-api_key = "sk-"
+api_key = "sk-d6dbea0408e9471da7a71af4496634b4"
 
 client = OpenAI(
     api_key=api_key,
