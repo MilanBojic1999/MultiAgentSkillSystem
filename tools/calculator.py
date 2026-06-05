@@ -329,6 +329,7 @@ def calculate(expr: str, verbose: bool = True) -> float:
     Returns:
         The numeric result as a float.
     """
+    
     tokens = tokenize(expr)
     parser = Parser(tokens)
     result = parser.parse()

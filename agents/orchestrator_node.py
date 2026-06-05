@@ -25,7 +25,7 @@ AGENT_ROSTER = {
     "writer": "Proficient in crafting clear and engaging written content on a wide range of topics.",
 }
 
-SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills("./skills")
+SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
 
 ORCHESTRATOR_SYSTEM = """
 You are the Orchestrator in a multi-agent pipeline.

@@ -1,10 +1,10 @@
 import asyncio
-from langchain_core.chat_models import ChatOpenAI
-from langgraph.prelude import create_react_agent
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills, load_skills_body
 from agent_tools import AGENT_TOOLS
-from agent_mcp_tools import get_mcp_tools_for_agent, MCP_ACCESS_AGENT
+from agent_mcp_tools import create_mcp_client, MCP_ACCESS_AGENT
 from dotenv import load_dotenv
 import os
 
@@ -47,40 +47,48 @@ Use tools when needed. Return your final answer as plain text. No meta-commentar
 async def run_sub_agent_async(
     step: dict,
     skill_index: list[dict],
+    skill_dictionary_pairs: dict[str, str],
     results: dict,
 ) -> tuple[int, str]:
     """Run one sub-agent step. Returns (step_number, output_text)."""
     agent_name   = step["agent"]
-    agent_cfg    = next(a for a in AGENT_ROSTER if a["name"] == agent_name)
+    agent_cfg    = next(a_name for a_name in AGENT_ROSTER.keys() if a_name == agent_name)
     step_num     = step["step"]
 
     # Activate only the skills this step needs
-    requested   = step.get("skills_needed", agent_cfg["skills"])
+    requested   = step.get("skills_needed", [])
     skill_bodies = [
-        load_skills_body(s["path"])
+        load_skills_body(skill_dictionary_pairs, s_name)
         for skill_name in requested
-        for s in skill_index if s["name"] == skill_name
+        for s_name in skill_index.keys() if s_name == skill_name
     ]
 
     # Gather upstream context from completed dependency steps
     context = {d: results.get(d, "") for d in step.get("depends_on", [])}
 
     system_prompt = _build_system_prompt(
-        agent_name, agent_cfg["description"], skill_bodies, context
+        agent_name, AGENT_ROSTER[agent_cfg], skill_bodies, context
     )
 
     # Combine native tools + MCP tools for this agent
     native_tools = AGENT_TOOLS.get(agent_name, [])
-    mcp_tools    = await get_mcp_tools_for_agent(agent_name)
-    all_tools    = native_tools + mcp_tools
+    mcp_client, mcp_tools = create_mcp_client(agent_name)
+    all_tools = native_tools + mcp_tools
 
     agent = create_react_agent(
         model=llm,
         tools=all_tools,
-        state_modifier=SystemMessage(content=system_prompt),
+        prompt=SystemMessage(content=system_prompt),
     )
 
-    result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+    print(f"Running Step {step_num} with agent '{agent_name}' using skills {requested} and context from steps {step.get('depends_on', [])}\n-----------\n{step["subtask"]}")
+    if mcp_client is not None:
+        async with mcp_client:
+            result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+    else:
+        result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+
+
     output = result["messages"][-1].content
     return step_num, output
 
@@ -90,7 +98,7 @@ def sub_agent_node(state: dict) -> dict:
     Sequential node: executes the next uncompleted step in the plan.
     For parallel fan-out, see Phase 6 (Send API).
     """
-    skill_index, skill_dictionary_pairs = load_skills("./skills")
+    skill_index, skill_dictionary_pairs = load_skills()
 
     plan    = state["plan"]
     results = state.get("results", {})
@@ -102,7 +110,7 @@ def sub_agent_node(state: dict) -> dict:
         deps_met = all(d in results for d in step.get("depends_on", []))
         if deps_met:
             step_num, output = asyncio.run(
-                run_sub_agent_async(step, skill_index, results)
+                run_sub_agent_async(step, skill_index, skill_dictionary_pairs, results)
             )
             return {"results": {step_num: output}}
 
