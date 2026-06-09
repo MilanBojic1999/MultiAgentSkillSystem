@@ -4,6 +4,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills
 from dotenv import load_dotenv
+from utils.logger import log_event
+from utils.senitize import sanitize_content
 
 load_dotenv()
 
@@ -66,11 +68,13 @@ def orchestrator_agent(state: dict):
         agent_roster=agent_roster_str,
         skill_index=skill_summery,
     )
-
+    user_task = sanitize_content(user_task, "user")
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_task),
     ]
+    
+    log_event("orchestrator_agent_start", user_task=user_task)
 
     response = llm.invoke(messages)
     try:

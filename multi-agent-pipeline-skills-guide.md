@@ -756,7 +756,7 @@ the next:
 ## Summary Checklist (LangGraph Edition)
 
 **State & Graph**
-- [ ] `AgentState` TypedDict defined with correct `Annotated` reducer on `results`
+- [x] `AgentState` TypedDict defined with correct `Annotated` reducer on `results`
 - [ ] `StateGraph` has `orchestrator`, `sub_agent` (or `parallel_sub_agent`), and `assemble` nodes
 - [ ] `conditional_edges` from orchestrator routes to `sub_agent` or `assemble`
 - [ ] Graph compiled with `SqliteSaver` checkpointer for production runs

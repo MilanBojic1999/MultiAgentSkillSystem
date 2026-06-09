@@ -4,9 +4,10 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills, load_skills_body
 from agent_tools import AGENT_TOOLS
-from agent_mcp_tools import create_mcp_client, MCP_ACCESS_AGENT
+from agent_mcp_tools import create_mcp_client, close_mcp_client
 from dotenv import load_dotenv
 import os
+from utils.logger import log_event
 
 load_dotenv()
 
@@ -82,9 +83,11 @@ async def run_sub_agent_async(
     )
 
     print(f"Running Step {step_num} with agent '{agent_name}' using skills {requested} and context from steps {step.get('depends_on', [])}\n-----------\n{step["subtask"]}")
+    log_event("run_sub_agent_start", step_num=step_num, agent_name=agent_name, skills=requested, dependencies=step.get("depends_on", []))
     if mcp_client is not None:
         async with mcp_client:
             result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+        close_mcp_client(mcp_client)
     else:
         result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
 
@@ -96,7 +99,6 @@ async def run_sub_agent_async(
 def sub_agent_node(state: dict) -> dict:
     """
     Sequential node: executes the next uncompleted step in the plan.
-    For parallel fan-out, see Phase 6 (Send API).
     """
     skill_index, skill_dictionary_pairs = load_skills()
 
