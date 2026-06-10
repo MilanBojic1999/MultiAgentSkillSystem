@@ -8,7 +8,7 @@ DEDICATED_MCP_OWNERS: dict[str, str] = {
     "yotta_mcp": "researcher",
 }
 
-def create_mcp_client(agent_name: str) -> tuple:
+async def create_mcp_client(agent_name: str) -> tuple:
     """
     Returns (client, tools) for the given agent.
     The caller MUST use `async with client:` around tool usage to keep
@@ -28,10 +28,5 @@ def create_mcp_client(agent_name: str) -> tuple:
         {name: {"url": url, "transport": "streamable_http"}
          for name, url in server_map.items()}
     )
-    return client, client.get_tools()
-
-
-def close_mcp_client(client: MultiServerMCPClient):
-    """Utility function to close the MCP client connection."""
-    if client is not None:
-        client.close()
+    async with client:
+        return client, client.get_tools()

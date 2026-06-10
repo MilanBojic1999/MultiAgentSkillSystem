@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 from utils.logger import log_event
 from utils.senitize import sanitize_content
 
+from agents import AGENT_ROSTER
+
+
 load_dotenv()
 
 LLM_URL = os.getenv("LLM_URL")
@@ -20,12 +23,6 @@ llm = ChatOpenAI(
     max_tokens=4048,
     temperature=0.9
 )
-
-AGENT_ROSTER = {
-    "mathematician": "Expert in solving complex mathematical problems and plotting functions.",
-    "researcher": "Skilled in gathering and synthesizing information from various sources.",
-    "writer": "Proficient in crafting clear and engaging written content on a wide range of topics.",
-}
 
 SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
 
@@ -79,6 +76,6 @@ def orchestrator_agent(state: dict):
     response = llm.invoke(messages)
     try:
         plan = json.loads(response.content)["plan"]
-        return {"plan": plan, "results": {}, "current_step": 0}
+        return {"plan": plan, "skill_index": SKILL_INDEX, "skill_dictionary_pairs": SKILLS_DICTIONARY_PAIRS, "results": {}, "current_step": 0}
     except Exception as e:
         raise ValueError(f"Failed to parse JSON response: {e}")
