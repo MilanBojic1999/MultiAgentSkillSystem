@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import RetryPolicy
 from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
 from agents.sub_agents_nodes import run_sub_agent_async
@@ -45,7 +46,7 @@ def assemble_node(state: dict) -> dict:
 
 builder = StateGraph(AgentState)
 builder.add_node("orchestrator", orchestrator_agent)
-builder.add_node("parallel_sub_agent",    parallel_sub_agent_node)
+builder.add_node("parallel_sub_agent",    parallel_sub_agent_node, retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
 builder.add_node("assemble",     assemble_node)
 
 builder.set_entry_point("orchestrator")

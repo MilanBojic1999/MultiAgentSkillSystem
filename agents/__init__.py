@@ -1,12 +1,17 @@
-from agents.orchestrator_node import orchestrator_agent
-from agents.sub_agents_nodes import sub_agent_node, run_sub_agent_async
+import json
+from pathlib import Path
 
 
-__all__ = ["orchestrator_agent", "sub_agent_node", "run_sub_agent_async"]
+def _load_agent_roster() -> dict:
+    roster_path = Path(__file__).parent / "agent_rouster.json"
+    with open(roster_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-AGENT_ROSTER = {
-    "mathematician": "Expert in solving complex mathematical problems and plotting functions.",
-    "researcher": "Skilled in gathering and synthesizing information from various sources.",
-    "writer": "Proficient in crafting clear and engaging written content on a wide range of topics.",
-}
+AGENT_ROSTER = _load_agent_roster()
+
+from agents.orchestrator_node import orchestrator_agent  # noqa: E402
+from agents.sub_agents_nodes import sub_agent_node, run_sub_agent_async  # noqa: E402
+
+
+__all__ = ["orchestrator_agent", "sub_agent_node", "run_sub_agent_async", "AGENT_ROSTER"]

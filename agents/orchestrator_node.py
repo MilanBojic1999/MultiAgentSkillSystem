@@ -6,6 +6,7 @@ from skill_loader import load_skills
 from dotenv import load_dotenv
 from utils.logger import log_event
 from utils.senitize import sanitize_content
+import re
 
 from agents import AGENT_ROSTER
 
@@ -23,6 +24,32 @@ llm = ChatOpenAI(
     max_tokens=4048,
     temperature=0.9
 )
+
+
+def _extract_json(text: str) -> dict:
+    """
+    Extract JSON from LLM response, handling common failure modes:
+    - Markdown code fences (```json ... ```)
+    - Leading/trailing prose
+    """
+    # Try direct parse first (best case)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract from markdown code fence
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        return json.loads(fence_match.group(1))
+
+    # Try to find the outermost JSON object
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        return json.loads(brace_match.group(0))
+
+    raise ValueError(f"Could not extract JSON from response: {text[:500]}...")
+
 
 SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
 
@@ -75,7 +102,11 @@ def orchestrator_agent(state: dict):
 
     response = llm.invoke(messages)
     try:
-        plan = json.loads(response.content)["plan"]
-        return {"plan": plan, "skill_index": SKILL_INDEX, "skill_dictionary_pairs": SKILLS_DICTIONARY_PAIRS, "results": {}, "current_step": 0}
+        plan_json = _extract_json(response.content)
+        plan = plan_json.get("plan", [])
+        if not isinstance(plan, list) or len(plan) == 0:
+            raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
+
+        return {"plan": plan, "results": {}, "current_step": 0}
     except Exception as e:
         raise ValueError(f"Failed to parse JSON response: {e}")

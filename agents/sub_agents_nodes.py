@@ -4,6 +4,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills, load_skills_body
 from tools.agent_tools import AGENT_TOOLS
+from utils.validator import validate_step_output
 from agent_mcp_tools import create_mcp_client
 from dotenv import load_dotenv
 import os
@@ -25,6 +26,9 @@ llm = ChatOpenAI(
     max_tokens=4048,
     temperature=0.9
 )
+
+
+_SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
 
 def _build_system_prompt(agent_name: str, agent_description: str,
                           skill_bodies: list[str], context: dict) -> str:
@@ -68,25 +72,35 @@ async def run_sub_agent_async(
 
     # Combine native tools + MCP tools for this agent
     native_tools = AGENT_TOOLS.get(agent_name, [])
-    mcp_client, mcp_tools = await create_mcp_client(agent_name)
-    all_tools = native_tools + mcp_tools
+    mcp_client = create_mcp_client(agent_name)
 
-    agent = create_react_agent(
-        model=llm,
-        tools=all_tools,
-        prompt=SystemMessage(content=system_prompt),
-    )
 
     print(f"Running Step {step_num} with agent '{agent_name}' using skills {requested} and context from steps {step.get('depends_on', [])}\n-----------\n{step["subtask"]}")
     log_event("run_sub_agent_start", step_num=step_num, agent_name=agent_name, skills=requested, dependencies=step.get("depends_on", []))
+
+
     if mcp_client is not None:
         async with mcp_client:
+            mcp_tools = mcp_client.get_tools()
+            all_tools = native_tools + mcp_tools
+
+            agent = create_react_agent(
+                model=llm,
+                tools=all_tools,
+                prompt=SystemMessage(content=system_prompt),
+            )
             result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
     else:
+        agent = create_react_agent(
+                model=llm,
+                tools=native_tools,
+                prompt=SystemMessage(content=system_prompt),
+            )
         result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
 
 
     output = result["messages"][-1].content
+    output = validate_step_output(step_num, agent_name, output)
     return step_num, output
 
 
@@ -97,17 +111,14 @@ def sub_agent_node(state: dict) -> dict:
 
     plan    = state["plan"]
     results = state.get("results", {})
-    skill_index = state["skill_index"]
-    skill_dictionary_pairs = state["skill_dictionary_pairs"]
     # Find the next step whose dependencies are all resolved
     for step in plan:
         if step["step"] in results:
             continue
         deps_met = all(d in results for d in step.get("depends_on", []))
         if deps_met:
-            step_num, output = asyncio.run(
-                run_sub_agent_async(step, skill_index, skill_dictionary_pairs, results)
-            )
+            step_num, output = asyncio.run(run_sub_agent_async(step, _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS, results))
+            
             return {"results": {step_num: output}}
 
     return {}
