@@ -80,16 +80,15 @@ async def run_sub_agent_async(
 
 
     if mcp_client is not None:
-        async with mcp_client:
-            mcp_tools = mcp_client.get_tools()
-            all_tools = native_tools + mcp_tools
+        mcp_tools = await mcp_client.get_tools()
+        all_tools = native_tools + mcp_tools
 
-            agent = create_react_agent(
-                model=llm,
-                tools=all_tools,
-                prompt=SystemMessage(content=system_prompt),
-            )
-            result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+        agent = create_react_agent(
+            model=llm,
+            tools=all_tools,
+            prompt=SystemMessage(content=system_prompt),
+        )
+        result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
     else:
         agent = create_react_agent(
                 model=llm,

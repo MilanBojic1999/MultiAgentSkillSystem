@@ -33,6 +33,5 @@ def load_skills_body(skills_directory_pairs, skill_name):
     
     with open(skill_path, "r") as f:
         skill_content = f.read()
-        # print(skill_content.split("---"))
-        body_str = skill_content.split("---")[2].strip()
+        body_str = skill_content.split("---", maxsplit=2)[2].strip()
         return body_str

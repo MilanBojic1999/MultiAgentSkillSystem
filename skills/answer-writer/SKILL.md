@@ -88,14 +88,72 @@ a caveat, a nuance, a recommended next step. Do not summarize what you just said
 
 ## Tone Calibration
 
-| Situation | Tone |
-|---|---|
-| Factual / research query | Clear, neutral, informative |
-| Technical explanation | Precise, confident, no unnecessary hedging |
-| Ambiguous or contested topic | Balanced, acknowledges competing views |
-| Personal or sensitive topic | Warm, measured, non-judgmental |
+Tone is a **configurable parameter**. The programmer or system prompt sets it explicitly.
+If no tone is specified, fall back to the default. Claude must not override a set tone
+based on its own judgment about what "feels right" for the topic.
 
-Default to professional but human. Avoid being either stiff/robotic or overly casual.
+---
+
+### Setting the Tone Parameter
+
+In the system prompt or skill invocation, set tone like this:
+
+```
+ANSWER_TONE: professional
+```
+
+Or pass it inline when calling the skill:
+
+```
+Write the final answer. Tone: casual
+```
+
+---
+
+### Available Tone Levels
+
+**`professional`** *(default)*
+Formal but not stiff. Complete sentences, precise word choices, no slang. Suitable for
+business reports, research summaries, client-facing content. Avoids contractions where
+they feel too loose.
+> Example: "The API rate limit was increased to 1,000 requests per minute in the latest release."
+
+**`neutral`**
+Plain and factual. No personality either way — just clear, direct information delivery.
+Good for documentation, FAQs, or contexts where the writer should be invisible.
+> Example: "The rate limit is 1,000 requests per minute."
+
+**`conversational`**
+Warm, natural, like explaining something to a colleague. Contractions are fine. Occasional
+rhetorical questions or light analogies are allowed. No slang. Suitable for blog posts,
+help articles, or general-audience explainers.
+> Example: "The good news is they bumped the rate limit to 1,000 requests per minute, so most apps won't hit it."
+
+**`casual`**
+Relaxed and direct, as if texting a technically literate friend. Short sentences, contractions,
+minor informalities. No forced enthusiasm or filler. Suitable for developer tools, chat
+interfaces, or informal internal tools.
+> Example: "Rate limit's now 1k/min — you're probably fine unless you're hammering it."
+
+**`informal`**
+Same as casual but allows light humor, colloquialisms, and a more playful voice where
+it fits naturally. Never forced. Suitable for consumer apps, communities, or anywhere
+the brand voice is explicitly relaxed.
+> Example: "They finally raised the rate limit to 1k/min. No more babysitting your request queue."
+
+---
+
+### Tone × Topic Overrides
+
+Even with a set tone, a few topic-driven adjustments always apply regardless:
+
+| Topic type | Override |
+|---|---|
+| Sensitive or personal topic | Pull one level warmer (e.g. casual → conversational) |
+| Safety-critical information | Pull one level more precise (e.g. casual → neutral) |
+| Contested or ambiguous topic | Add balance regardless of tone level |
+
+These are the only automatic overrides. Everything else respects the set tone parameter.
 
 ---
 
@@ -149,5 +207,6 @@ Before finalizing the answer, ask:
 4. Does the length match the actual complexity of the question?
 5. Does it sound like a knowledgeable person explaining something, or like a summary report?
 6. Does it contain any word from the Banned AI Vocabulary list? If so, rewrite that sentence.
+7. Does the writing match the set tone parameter? If no tone was set, is it defaulting to `professional`?
 
 If any answer is "no", revise before delivering.
