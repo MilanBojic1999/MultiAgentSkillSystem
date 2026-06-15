@@ -1,6 +1,13 @@
 from typing import Annotated
 from typing_extensions import TypedDict
 import operator
+from datetime import datetime
+
+
+def get_current_datetime_str() -> str:
+    """Return the current datetime as a human-friendly long-form string."""
+    now = datetime.now().astimezone()
+    return now.strftime("%A, %d %B %Y at %H:%M:%S %Z")
 
 
 class PlanStep(TypedDict):
@@ -14,8 +21,12 @@ class AgentState(TypedDict):
     # Inputs
     task: str
 
+    # Current datetime (human-friendly) — set at pipeline start, available to all nodes
+    current_datetime: str
+
     # Set by Orchestrator node
     plan: list[PlanStep]
+
 
     # Accumulated by sub-agent nodes; reducer merges dicts
     results: Annotated[dict[int, str], lambda a, b: {**a, **b}]

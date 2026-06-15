@@ -9,6 +9,7 @@ from utils.senitize import sanitize_content
 import re
 
 from agents import AGENT_ROSTER
+from agent_states import get_current_datetime_str
 
 
 load_dotenv()
@@ -63,6 +64,8 @@ You are the Orchestrator in a multi-agent pipeline.
 4. Output a JSON plan in the exact format shown.
 5. Do NOT execute any subtask yourself.
 
+Current datetime: {current_datetime}
+
 ## Available sub-agents
 {agent_roster}
 
@@ -85,12 +88,14 @@ You are the Orchestrator in a multi-agent pipeline.
 
 def orchestrator_agent(state: dict):
     user_task = state["task"]
+    current_datetime = state.get("current_datetime") or get_current_datetime_str()
     skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items()])
     agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()])
 
     system_prompt = ORCHESTRATOR_SYSTEM.format(
         agent_roster=agent_roster_str,
         skill_index=skill_summery,
+        current_datetime=current_datetime,
     )
     user_task = sanitize_content(user_task, "user")
     messages = [
@@ -106,6 +111,7 @@ def orchestrator_agent(state: dict):
         plan = plan_json.get("plan", [])
         if not isinstance(plan, list) or len(plan) == 0:
             raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
+        log_event("orchestrator_agent_plan", pipeline_plan=plan)
 
         return {"plan": plan, "results": {}, "current_step": 0}
     except Exception as e:

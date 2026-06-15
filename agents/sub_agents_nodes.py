@@ -11,6 +11,7 @@ import os
 from utils.logger import log_event
 
 from agents import AGENT_ROSTER
+from agent_states import get_current_datetime_str
 
 
 load_dotenv()
@@ -31,15 +32,17 @@ llm = ChatOpenAI(
 _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
 
 def _build_system_prompt(agent_name: str, agent_description: str,
-                          skill_bodies: list[str], context: dict) -> str:
+                          skill_bodies: list[str], context: dict,
+                          current_datetime: str = "") -> str:
     skill_block   = "\n\n---\n\n".join(skill_bodies)
     context_block = f"\n\n## Upstream context\n{context}" if context else ""
+    datetime_line = f"\n\nCurrent datetime: {current_datetime}" if current_datetime else ""
     return f"""You are the {agent_name} specialist agent.
 Role: {agent_description}
 
 ## Active skills
 {skill_block}
-{context_block}
+{context_block}{datetime_line}
 
 Use tools when needed. Return your final answer as plain text. No meta-commentary."""
 
@@ -49,12 +52,13 @@ async def run_sub_agent_async(
     skill_index: dict[str, dict],
     skill_dictionary_pairs: dict[str, str],
     results: dict,
+    current_datetime: str = "",
 ) -> tuple[int, str]:
     """Run one sub-agent step. Returns (step_number, output_text)."""
     agent_name   = step["agent"]
     agent_cfg    = next(a_name for a_name in AGENT_ROSTER.keys() if a_name == agent_name)
     step_num     = step["step"]
-    
+
     # Activate only the skills this step needs
     requested   = step.get("skills_needed", [])
     skill_bodies = [
@@ -66,8 +70,11 @@ async def run_sub_agent_async(
     # Gather upstream context from completed dependency steps
     context = {d: results.get(d, "") for d in step.get("depends_on", [])}
 
+    # Fallback to live datetime if not provided from state
+    dt = current_datetime or get_current_datetime_str()
+
     system_prompt = _build_system_prompt(
-        agent_name, AGENT_ROSTER[agent_cfg], skill_bodies, context
+        agent_name, AGENT_ROSTER[agent_cfg], skill_bodies, context, dt
     )
 
     # Combine native tools + MCP tools for this agent
@@ -97,7 +104,12 @@ async def run_sub_agent_async(
             )
         result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
 
+    # log tool calls and final output for this step
+    print("`"*50)
+    print(result)
+    print("`"*50)
 
+    log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name, tools_used=result["messages"][-1].tool_calls)
     output = result["messages"][-1].content
     output = validate_step_output(step_num, agent_name, output)
     return step_num, output
@@ -110,14 +122,15 @@ def sub_agent_node(state: dict) -> dict:
 
     plan    = state["plan"]
     results = state.get("results", {})
+    current_datetime = state.get("current_datetime", "")
     # Find the next step whose dependencies are all resolved
     for step in plan:
         if step["step"] in results:
             continue
         deps_met = all(d in results for d in step.get("depends_on", []))
         if deps_met:
-            step_num, output = asyncio.run(run_sub_agent_async(step, _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS, results))
-            
+            step_num, output = asyncio.run(run_sub_agent_async(step, _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS, results, current_datetime))
+
             return {"results": {step_num: output}}
 
     return {}

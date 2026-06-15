@@ -1,17 +1,16 @@
-import json
-from pathlib import Path
+from config_loader import AGENT_CONFIG  # noqa: E402
 
-
-def _load_agent_roster() -> dict:
-    roster_path = Path(__file__).parent / "agent_rouster.json"
-    with open(roster_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-AGENT_ROSTER = _load_agent_roster()
+# Backward-compatible AGENT_ROSTER: name → description
+AGENT_ROSTER = {name: cfg["description"] for name, cfg in AGENT_CONFIG.items()}
 
 from agents.orchestrator_node import orchestrator_agent  # noqa: E402
 from agents.sub_agents_nodes import sub_agent_node, run_sub_agent_async  # noqa: E402
 
 
-__all__ = ["orchestrator_agent", "sub_agent_node", "run_sub_agent_async", "AGENT_ROSTER"]
+__all__ = [
+    "AGENT_CONFIG",
+    "AGENT_ROSTER",
+    "orchestrator_agent",
+    "run_sub_agent_async",
+    "sub_agent_node",
+]

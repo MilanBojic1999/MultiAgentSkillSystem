@@ -1,0 +1,19 @@
+{
+    "mathematician": {
+        "description": "Expert in solving complex mathematical problems and plotting functions.",
+        "tools": ["calculate", "plotting_tool", "run_bash"],
+        "mcp_servers": {}
+    },
+    "researcher": {
+        "description": "Skilled in gathering and synthesizing information from various sources.",
+        "tools": ["run_bash"],
+        "mcp_servers": {
+            "yotta_mcp": "http://207.189.105.118:8001/mcp"
+        }
+    },
+    "writer": {
+        "description": "Proficient in crafting clear and engaging written content on a wide range of topics.",
+        "tools": [],
+        "mcp_servers": {}
+    }
+}

@@ -5,7 +5,6 @@ from langgraph.types import RetryPolicy
 from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
 from agents.sub_agents_nodes import run_sub_agent_async
-from skill_loader import load_skills
 
 def fan_out_router(state: dict):
     """
@@ -18,6 +17,7 @@ def fan_out_router(state: dict):
     results = state.get("results", {})
     skill_index = state["skill_index"]
     skill_dictionary_pairs = state["skill_dictionary_pairs"]
+    current_datetime = state.get("current_datetime", "")
     # Find all steps whose dependencies are satisfied
     ready = [
         s for s in plan
@@ -29,11 +29,11 @@ def fan_out_router(state: dict):
         return "assemble"
 
     # Send each ready step to the sub_agent_node in parallel
-    return [Send("parallel_sub_agent", {"step": s, "results": results, "skill_index":skill_index, "skill_dictionary_pairs":skill_dictionary_pairs}) for s in ready]
+    return [Send("parallel_sub_agent", {"step": s, "results": results, "skill_index":skill_index, "skill_dictionary_pairs":skill_dictionary_pairs, "current_datetime": current_datetime}) for s in ready]
 
 
 async def parallel_sub_agent_node(state: dict) -> dict:
-    step_num, output = await run_sub_agent_async(state["step"], state["skill_index"], state["skill_dictionary_pairs"], state["results"])
+    step_num, output = await run_sub_agent_async(state["step"], state["skill_index"], state["skill_dictionary_pairs"], state["results"], state.get("current_datetime", ""))
 
     return {"results": {step_num: output}}
 
