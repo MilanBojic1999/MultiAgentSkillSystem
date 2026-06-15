@@ -49,8 +49,6 @@ Use tools when needed. Return your final answer as plain text. No meta-commentar
 
 async def run_sub_agent_async(
     step: dict,
-    skill_index: dict[str, dict],
-    skill_dictionary_pairs: dict[str, str],
     results: dict,
     current_datetime: str = "",
 ) -> tuple[int, str]:
@@ -62,9 +60,9 @@ async def run_sub_agent_async(
     # Activate only the skills this step needs
     requested   = step.get("skills_needed", [])
     skill_bodies = [
-        load_skills_body(skill_dictionary_pairs, s_name)
+        load_skills_body(_SKILL_DICTIONARY_PAIRS, s_name)
         for skill_name in requested
-        for s_name in skill_index.keys() if s_name == skill_name
+        for s_name in _SKILL_INDEX.keys() if s_name == skill_name
     ]
 
     # Gather upstream context from completed dependency steps
@@ -104,10 +102,6 @@ async def run_sub_agent_async(
             )
         result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
 
-    # log tool calls and final output for this step
-    print("`"*50)
-    print(result)
-    print("`"*50)
 
     log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name, tools_used=result["messages"][-1].tool_calls)
     output = result["messages"][-1].content
@@ -129,7 +123,7 @@ def sub_agent_node(state: dict) -> dict:
             continue
         deps_met = all(d in results for d in step.get("depends_on", []))
         if deps_met:
-            step_num, output = asyncio.run(run_sub_agent_async(step, _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS, results, current_datetime))
+            step_num, output = asyncio.run(run_sub_agent_async(step, results, current_datetime))
 
             return {"results": {step_num: output}}
 

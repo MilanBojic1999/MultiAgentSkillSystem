@@ -27,6 +27,7 @@ def load_skills_body(skills_directory_pairs, skill_name):
     if not skill_dir:
         raise ValueError(f"Skill '{skill_name}' not found in directory pairs.")
     
+
     skill_path = os.path.join(skill_dir, "SKILL.md")
     if not os.path.isfile(skill_path):
         raise ValueError(f"SKILL.md not found for skill '{skill_name}' at path: {skill_path}")

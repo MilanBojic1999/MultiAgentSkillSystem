@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Artifacts (created at runtime)
+artifacts/*
+
+# Root-level docs only (skills/ SKILL.md files are runtime data and MUST be copied)
+/README.md
+/codebase-review-fixes.md
+/langgraph-multi-agent-skills-plan.md
+/multi-agent-pipeline-skills-guide.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Secrets (copy .env explicitly if needed, or use env_file in compose)
+.env.example
+.env.local
+
+# Misc
+tmp.txt
+agent_output.txt

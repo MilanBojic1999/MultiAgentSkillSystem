@@ -1,0 +1,21 @@
+services:
+  agent-pipeline:
+    build: .
+    container_name: agent-skills-pipeline
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Mount artifacts so generated plots survive container restarts
+      - ./artifacts:/app/artifacts
+      # Mount skills so new/modified skills are picked up without rebuild
+      - ./skills:/app/skills:ro
+    restart: unless-stopped
+    # Health check using the API's own health endpoint
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

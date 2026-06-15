@@ -6,9 +6,9 @@ Usage:
 """
 
 import sys
-from pipeline_graph import graph
+from paralel_pipeline_graph import graph
 from agent_states import get_current_datetime_str
-
+import asyncio
 
 def run(task: str) -> str:
     # thread_id groups checkpoints for this run; use a fixed one for dev/test
@@ -16,6 +16,11 @@ def run(task: str) -> str:
     result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
     return result.get("final_output", "No final output produced.")
 
+async def run_async(task: str) -> str:
+    # thread_id groups checkpoints for this run; use a fixed one for dev/test
+    config = {"configurable": {"thread_id": "test-run-1"}}
+    result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
+    return result.get("final_output", "No final output produced.")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
@@ -32,6 +37,6 @@ if __name__ == "__main__":
 
     print(f"Running pipeline with task:\n  {task}\n")
     print("=" * 60)
-    output = run(task)
+    output = asyncio.run(run_async(task))
     print("=" * 60)
     print(output)
