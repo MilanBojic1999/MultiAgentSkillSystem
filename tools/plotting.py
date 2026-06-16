@@ -32,7 +32,7 @@ def plot_function(
     output_file: str = "plot.png",
 ):
     """
-    Plot a mathematical expression containing x.
+    Plot a mathematical expression containing x. It uses eval to evaluate the expression, so only safe functions are allowed. (e.g. x^2 is not allowed, use x**2 instead). The expression can contain any of the following functions: sin, cos, tan, arcsin, arccos, arctan, sinh, cosh, tanh, exp, log, log10, sqrt, abs. It can also contain the constants pi and e.
 
     Example:
         plot_function("sin(x)")
@@ -47,7 +47,7 @@ def plot_function(
     try:
         y = eval(expression, safe_globals, safe_locals)
     except Exception as e:
-        raise ValueError(f"Invalid expression: {e}")
+        raise ValueError(f"Invalid expression: {expression} --> {e}")
 
     plt.figure(figsize=(8, 5))
     plt.plot(x, y)

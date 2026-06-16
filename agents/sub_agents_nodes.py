@@ -104,6 +104,8 @@ async def run_sub_agent_async(
 
 
     log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name, tools_used=result["messages"][-1].tool_calls)
+    print(agent_name, "-------------", result["messages"][-1])
+    print("+"*50)
     output = result["messages"][-1].content
     output = validate_step_output(step_num, agent_name, output)
     return step_num, output
