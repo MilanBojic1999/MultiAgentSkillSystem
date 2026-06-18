@@ -317,7 +317,7 @@ def _fmt(n: float) -> str:
 @tool
 def calculate(expr: str, verbose: bool = True) -> float:
     """
-    Parse and evaluate an expression string. Used for calculating mathematical equations. Use this tool over reasoning with numbers.
+    Parse and evaluate an expression string. Used for calculating mathematical equations. Use this tool over reasoning with numbers. Write expressions in python syntax. Use parentheses to group operations and control order of evaluation. Use functions for more complex calculations.
 
     Args:
         expr:    The expression to evaluate, e.g. "2 + 3 * sqrt(10) - e / pi"

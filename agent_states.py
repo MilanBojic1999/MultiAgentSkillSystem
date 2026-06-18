@@ -36,3 +36,10 @@ class AgentState(TypedDict):
 
     # Final assembled output
     final_output: str
+
+    # Set by the verifier node — drives conditional routing to assemble vs re-orchestrate
+    verification_result: str
+    verification_notes: str
+
+    # Synthetic step used by verify / writer nodes (not part of the plan)
+    step: dict

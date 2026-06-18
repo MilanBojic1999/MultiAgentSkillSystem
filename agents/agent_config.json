@@ -15,5 +15,10 @@
         "description": "Proficient in crafting clear and engaging written content on a wide range of topics.",
         "tools": [],
         "mcp_servers": {}
+    },
+    "verifier": {
+        "description": "Specialist in reviewing and validating information for accuracy and reliability.",
+        "tools": ["run_bash"],
+        "mcp_servers": {}
     }
 }
