@@ -305,6 +305,179 @@ START → orchestrator → router → [sub_agent(s)] → router → assembler �
 - `pipeline_graph.py` runs one step at a time, in dependency order
 - `paralel_pipeline_graph.py` runs all ready steps concurrently via LangGraph's `Send` API (used by default)
 
+### Creating a Custom Graph
+
+The two pipeline graphs (`pipeline_graph.py` and `paralel_pipeline_graph.py`) serve as templates — you can mix their patterns or add entirely new nodes to build your own workflow. All graphs share the same building blocks:
+
+| Building block | Source | What it provides |
+|---|---|---|
+| `AgentState` | `agent_states.py` | Shared state TypedDict — add your own fields here |
+| `orchestrator_agent` | `agents/orchestrator_node.py` | Node function: decomposes a task into a JSON plan |
+| `run_sub_agent_async` | `agents/sub_agents_nodes.py` | Async function: runs one plan step with tools + skills |
+| `sub_agent_node` | `agents/sub_agents_nodes.py` | Sync wrapper: calls `run_sub_agent_async` for one step |
+| `StateGraph`, `END`, `Send` | `langgraph.graph` | Graph builder, terminal sentinel, and parallel fan-out |
+| `MemorySaver` | `langgraph.checkpoint.memory` | In-memory checkpointing (swap for `SqliteSaver` in production) |
+| `RetryPolicy` | `langgraph.types` | Auto-retry on node failure |
+
+#### Pattern 1: Sequential pipeline (`pipeline_graph.py`)
+
+The simplest graph — one step at a time, in dependency order.
+
+```
+  START → orchestrator → sub_agent → (loop: more steps?) → assemble → END
+```
+
+**Step-by-step construction:**
+
+```python
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import RetryPolicy
+from agent_states import AgentState
+from agents.orchestrator_node import orchestrator_agent
+from agents.sub_agents_nodes import sub_agent_node
+
+# 1. Define a router — decides "keep going" or "wrap up"
+def should_continue(state: dict) -> str:
+    plan = state.get("plan", [])
+    results = state.get("results", {})
+    if len(results) < len(plan):
+        return "sub_agent"        # more steps to do
+    return "assemble"             # all steps done
+
+# 2. Define an assembler — merges step outputs into final answer
+def assemble_node(state: dict) -> dict:
+    plan = state.get("plan", [])
+    results = state.get("results", {})
+    parts = [
+        f"## Step {s['step']}: {s['subtask']}\n{results.get(s['step'], '')}"
+        for s in plan
+    ]
+    return {"final_output": "\n\n".join(parts)}
+
+# 3. Build the graph
+builder = StateGraph(AgentState)
+builder.add_node("orchestrator", orchestrator_agent)
+builder.add_node("sub_agent", sub_agent_node,
+                 retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
+builder.add_node("assemble", assemble_node)
+
+# 4. Wire edges
+builder.set_entry_point("orchestrator")
+builder.add_conditional_edges("orchestrator", should_continue)
+builder.add_conditional_edges("sub_agent", should_continue)
+builder.add_edge("assemble", END)
+
+# 5. Compile with persistence
+graph = builder.compile(checkpointer=MemorySaver())
+```
+
+#### Pattern 2: Parallel pipeline with fan-out (`paralel_pipeline_graph.py`)
+
+This is the **default** pattern used by `run_pipeline.py` and `api_server.py`. Independent steps run concurrently via LangGraph's `Send` API — steps with satisfied dependencies all dispatch at once.
+
+```
+  START → orchestrator → router ──Send──→ parallel_sub_agent ─┐
+                            ──Send──→ parallel_sub_agent ─┤  (fan back to router)
+                            ──Send──→ parallel_sub_agent ─┘
+                            ──→ assemble (when all done) → END
+```
+
+**Key differences from the sequential pattern:**
+
+```python
+from langgraph.types import Send
+from agents.sub_agents_nodes import run_sub_agent_async
+
+# 1. Router uses Send to fan out ALL ready steps at once
+def fan_out_router(state: dict):
+    plan    = state["plan"]
+    results = state.get("results", {})
+    current_datetime = state.get("current_datetime", "")
+
+    # Find every step whose dependencies are all satisfied
+    ready = [
+        s for s in plan
+        if s["step"] not in results
+        and all(d in results for d in s.get("depends_on", []))
+    ]
+
+    if not ready:
+        return "assemble"          # all done
+
+    # Send each ready step in parallel — LangGraph merges results
+    return [
+        Send("parallel_sub_agent",
+             {"step": s, "results": results, "current_datetime": current_datetime})
+        for s in ready
+    ]
+
+# 2. Sub-agent node is async and receives a single step dict
+async def parallel_sub_agent_node(state: dict) -> dict:
+    step_num, output = await run_sub_agent_async(
+        state["step"], state["results"], state.get("current_datetime", "")
+    )
+    return {"results": {step_num: output}}
+
+# 3. The conditional-edge map has an extra key for Send
+builder = StateGraph(AgentState)
+builder.add_node("orchestrator", orchestrator_agent)
+builder.add_node("parallel_sub_agent", parallel_sub_agent_node,
+                 retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
+builder.add_node("assemble", assemble_node)
+
+builder.set_entry_point("orchestrator")
+builder.add_conditional_edges(
+    "orchestrator", fan_out_router,
+    {"assemble": "assemble", Send: "parallel_sub_agent"}   # ← note the extra Send key
+)
+builder.add_conditional_edges(
+    "parallel_sub_agent", fan_out_router,
+    {"assemble": "assemble", Send: "parallel_sub_agent"}
+)
+builder.add_edge("assemble", END)
+
+graph = builder.compile(checkpointer=MemorySaver())
+```
+
+#### Writing a runner for your graph
+
+Once your graph is built (in a `.py` file like `paralel_pipeline_graph.py`), create a runner that invokes it:
+
+```python
+# my_runner.py
+import sys
+import asyncio
+from my_custom_graph import graph          # your compiled graph
+from agent_states import get_current_datetime_str
+
+async def run_async(task: str) -> str:
+    config = {"configurable": {"thread_id": "my-run-1"}}
+    result = await graph.ainvoke(
+        {"task": task, "current_datetime": get_current_datetime_str()},
+        config=config,
+    )
+    return result.get("final_output", "No final output produced.")
+
+if __name__ == "__main__":
+    task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Default task here"
+    output = asyncio.run(run_async(task))
+    print(output)
+```
+
+#### What you can customize
+
+| Customization | Where to change it |
+|---|---|
+| **Add new state fields** | Extend `AgentState` in `agent_states.py` — new keys flow through all nodes automatically |
+| **Add a new node** | Write a node function `def my_node(state: dict) -> dict:` and call `builder.add_node("my_name", my_node)` |
+| **Change routing logic** | Edit the router function (`should_continue` / `fan_out_router`) — return a node name, `"assemble"`, or a `Send` list |
+| **Custom assemble step** | Replace `assemble_node` with your own — e.g., call an LLM to synthesize results instead of concatenating |
+| **Add pre-processing** | Insert a node between `START` and `orchestrator` — e.g., validate input, expand shorthand, load files |
+| **Add post-processing** | Insert a node between `assemble` and `END` — e.g., format output, write to a file, send a notification |
+| **Change checkpointing** | Replace `MemorySaver` with `SqliteSaver.from_conn_string("checkpoints.db")` for persistent state across restarts |
+| **Run via FastAPI** | Import your `graph` into `api_server.py` (replace the existing import) — all endpoints work unchanged |
+
 ### Tools
 
 Tools are LangChain `@tool`-decorated Python functions that sub-agents can call.
