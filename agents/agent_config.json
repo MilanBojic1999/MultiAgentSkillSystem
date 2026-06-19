@@ -6,7 +6,7 @@
     },
     "researcher": {
         "description": "Skilled in gathering and synthesizing information from various sources.",
-        "tools": ["run_bash"],
+        "tools": [],
         "mcp_servers": {
             "yotta_mcp": "http://207.189.105.118:8001/mcp"
         }
@@ -18,7 +18,7 @@
     },
     "verifier": {
         "description": "Specialist in reviewing and validating information for accuracy and reliability.",
-        "tools": ["run_bash"],
+        "tools": [],
         "mcp_servers": {}
     }
 }

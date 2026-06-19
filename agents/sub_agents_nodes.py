@@ -20,14 +20,6 @@ LLM_URL = os.getenv("LLM_URL")
 LLM_MODEL = os.getenv("LLM_MODEL")
 LLM_KEY = os.getenv("LLM_KEY")
 
-llm = ChatOpenAI(
-    model=LLM_MODEL, # Must match the --model flag you gave vLLM
-    openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
-    openai_api_base=LLM_URL, 
-    max_tokens=4048,
-    temperature=0.9
-)
-
 
 _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
 
@@ -51,6 +43,7 @@ async def run_sub_agent_async(
     step: dict,
     results: dict,
     current_datetime: str = "",
+    streaming: bool = False
 ) -> tuple[int, str]:
     """Run one sub-agent step. Returns (step_number, output_text)."""
     agent_name   = step["agent"]
@@ -78,6 +71,15 @@ async def run_sub_agent_async(
     # Combine native tools + MCP tools for this agent
     native_tools = AGENT_TOOLS.get(agent_name, [])
     mcp_client = create_mcp_client(agent_name)
+
+    llm = ChatOpenAI(
+        model=LLM_MODEL, # Must match the --model flag you gave vLLM
+        openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
+        openai_api_base=LLM_URL, 
+        max_tokens=4048,
+        temperature=0.9,
+        streaming=streaming,
+    )
 
 
     print(f"Running Step {step_num} with agent '{agent_name}' using skills {requested} and context from steps {step.get('depends_on', [])}\n-----------\n")
@@ -119,13 +121,15 @@ def sub_agent_node(state: dict) -> dict:
     plan    = state["plan"]
     results = state.get("results", {})
     current_datetime = state.get("current_datetime", "")
+    streaming = state.get("streaming", False)
+
     # Find the next step whose dependencies are all resolved
     for step in plan:
         if step["step"] in results:
             continue
         deps_met = all(d in results for d in step.get("depends_on", []))
         if deps_met:
-            step_num, output = asyncio.run(run_sub_agent_async(step, results, current_datetime))
+            step_num, output = asyncio.run(run_sub_agent_async(step, results, current_datetime, streaming))
 
             return {"results": {step_num: output}}
 

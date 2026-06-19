@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,9 +24,9 @@ from dotenv import load_dotenv
 # Load env before importing pipeline modules (they read os.getenv at import time)
 load_dotenv()
 
-from paralel_pipeline_graph import graph
+from yotta_graph import graph
 from agent_states import get_current_datetime_str
-
+from streaming import stream_pipeline
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -189,6 +190,20 @@ async def task_status(task_id: str):
         error=entry.get("error"),
     )
 
+
+@app.post("/run-stream")
+async def run_pipeline_stream(req: RunRequest):
+    """Stream the pipeline using the marker protocol as Server-Sent Events."""
+    async def event_source():
+        try:
+            async for token in stream_pipeline(req.task):
+                yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
+        except Exception as exc:
+            yield f"data: [error] {exc}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"          # replaces the old None sentinel
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")
 
 # ---------------------------------------------------------------------------
 # Direct runner (for ``python api_server.py`` without uvicorn)

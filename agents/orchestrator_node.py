@@ -18,14 +18,6 @@ LLM_URL = os.getenv("LLM_URL")
 LLM_MODEL = os.getenv("LLM_MODEL")
 LLM_KEY = os.getenv("LLM_KEY")
 
-llm = ChatOpenAI(
-    model=LLM_MODEL, # Must match the --model flag you gave vLLM
-    openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
-    openai_api_base=LLM_URL, 
-    max_tokens=4048,
-    temperature=0.9
-)
-
 
 def _extract_json(text: str) -> dict:
     """
@@ -86,11 +78,22 @@ Current datetime: {current_datetime}
 }}
 """.strip()
 
+# Agents that are handled by dedicated pipeline nodes (verify_node, assemble_node)
+# and should NOT appear in the orchestrator's plan — they run after the sub-agent loop.
+_PIPELINE_RESERVED_AGENTS = {"verifier", "writer"}
+
+
 def orchestrator_agent(state: dict):
     user_task = state["task"]
     current_datetime = state.get("current_datetime") or get_current_datetime_str()
+    streaming = state.get("streaming", False)
+
     skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items()])
-    agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()])
+    # Exclude pipeline-reserved agents so the orchestrator doesn't put them in the plan
+    agent_roster_str = "\n".join(
+        [f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()
+         if name not in _PIPELINE_RESERVED_AGENTS]
+    )
 
     system_prompt = ORCHESTRATOR_SYSTEM.format(
         agent_roster=agent_roster_str,
@@ -104,6 +107,15 @@ def orchestrator_agent(state: dict):
     ]
     
     log_event("orchestrator_agent_start", user_task=user_task)
+
+    llm = ChatOpenAI(
+        model=LLM_MODEL, # Must match the --model flag you gave vLLM
+        openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
+        openai_api_base=LLM_URL, 
+        max_tokens=4048,
+        temperature=0.9,
+        streaming=streaming,
+    )
 
     response = llm.invoke(messages)
     try:

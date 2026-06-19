@@ -24,6 +24,9 @@ class AgentState(TypedDict):
     # Current datetime (human-friendly) — set at pipeline start, available to all nodes
     current_datetime: str
 
+    # Whether the pipeline is running in streaming mode (affects how outputs are handled)
+    streaming: bool
+
     # Set by Orchestrator node
     plan: list[PlanStep]
 

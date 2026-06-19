@@ -5,6 +5,9 @@ CLI client for the Agent Skills Pipeline API.
 Zero external dependencies — uses only Python stdlib (urllib + json).
 
 Usage:
+    # Interactive mode — no arguments, prompts for tasks in a REPL loop
+    python api_client.py
+
     # Run a task through the pipeline
     python api_client.py "Calculate sin(pi/4) + cos(pi/4) and explain the result"
 
@@ -17,9 +20,14 @@ Usage:
     # Async mode: start a task and poll until it finishes
     python api_client.py --async "Research the history of machine learning"
 
+    # Stream mode: stream tokens from /run-stream as they arrive
+    python api_client.py --stream "Write a haiku about neural networks"
+
 Examples:
+    python api_client.py                           # interactive REPL
     python api_client.py "What is 2 + 2?"
     python api_client.py --health
+    python api_client.py --stream "Tell me a joke"
     python api_client.py --url http://localhost:9000 "Plot sin(x) from -pi to pi"
 """
 
@@ -131,6 +139,158 @@ def run_task_async(task: str, base_url: str) -> str | None:
         print(f"\r   Running{'.' * dots}{' ' * (3 - dots)}", end="", flush=True)
 
 
+def run_task_stream(task: str, base_url: str) -> str | None:
+    """Run a task via the /run-stream SSE endpoint and print tokens as they arrive.
+
+    Returns the full assembled output, or None on error.
+    """
+    print(f"🚀 Starting stream task:\n   {task}\n")
+    print(f"📡 POST {base_url}/run-stream ...\n")
+
+    url = f"{base_url.rstrip('/')}/run-stream"
+    data = json.dumps({"task": task}).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream")
+
+    full_output: list[str] = []
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            # Read SSE line by line
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue  # skip empty lines (SSE framing)
+                if not line.startswith("data: "):
+                    continue
+
+                payload = line.removeprefix("data: ")
+                if payload == "[DONE]":
+                    break
+                if payload.startswith("[error] "):
+                    error_msg = payload.removeprefix("[error] ")
+                    print(f"\n❌ Stream error: {error_msg}")
+                    return None
+
+                # Normal token — print in-place and accumulate
+                full_output.append(payload)
+                print(payload, end="", flush=True)
+
+        print()  # final newline after stream
+        assembled = "".join(full_output)
+        return assembled if assembled else None
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(error_body).get("detail", error_body)
+        except json.JSONDecodeError:
+            detail = error_body
+        print(f"❌ Error: {detail}")
+        return None
+    except urllib.error.URLError as exc:
+        print(f"❌ Connection error: {exc.reason}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL
+# ---------------------------------------------------------------------------
+
+HELP_TEXT = """\
+Commands:
+  <any text>     Run the text as a task through the pipeline
+  :health        Check if the API server is healthy
+  :url <URL>     Change the server URL (current: {url})
+  :async         Toggle async mode (currently: {async_mode})
+  :stream        Toggle stream mode (currently: {stream_mode})
+  :help, :?      Show this help
+  :quit, :q      Exit the client
+
+You can also paste multi-line input — press Enter twice on an empty line to submit.\
+"""
+
+
+def interactive_repl(base_url: str) -> None:
+    """Run an interactive REPL loop for submitting tasks."""
+    print()
+    print("╔══════════════════════════════════════════════════╗")
+    print("║     Agent Skills Pipeline — Interactive CLI      ║")
+    print("╚══════════════════════════════════════════════════╝")
+    print()
+    print(f"Server: {base_url}")
+    print("Type a task to run it, or :help for commands.")
+    print()
+
+    async_mode = False
+    stream_mode = False
+
+    while True:
+        try:
+            if stream_mode:
+                prompt = "🌊"
+            elif async_mode:
+                prompt = "⏳"
+            else:
+                prompt = "⚡"
+            line = input(f"{prompt} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Goodbye!")
+            break
+
+        # Empty input — skip
+        if not line:
+            continue
+
+        # Commands
+        if line.startswith(":"):
+            cmd, *rest = line[1:].split(maxsplit=1)
+            arg = rest[0] if rest else ""
+
+            if cmd in ("quit", "q"):
+                print("👋 Goodbye!")
+                break
+            elif cmd in ("help", "?"):
+                print(HELP_TEXT.format(url=base_url, async_mode=async_mode, stream_mode=stream_mode))
+            elif cmd == "health":
+                check_health(base_url)
+            elif cmd == "url":
+                if arg:
+                    base_url = arg.rstrip("/")
+                    print(f"✅ Server URL set to {base_url}")
+                else:
+                    print(f"Current URL: {base_url}")
+            elif cmd == "async":
+                async_mode = not async_mode
+                stream_mode = False  # mutually exclusive
+                state = "ON" if async_mode else "OFF"
+                print(f"✅ Async mode: {state}")
+            elif cmd == "stream":
+                stream_mode = not stream_mode
+                async_mode = False  # mutually exclusive
+                state = "ON" if stream_mode else "OFF"
+                print(f"✅ Stream mode: {state}")
+            else:
+                print(f"❌ Unknown command: :{cmd}  (type :help for help)")
+            continue
+
+        # Run the task
+        if stream_mode:
+            output = run_task_stream(line, base_url)
+        elif async_mode:
+            output = run_task_async(line, base_url)
+        else:
+            output = run_task(line, base_url)
+
+        if output is not None:
+            print("\n" + "─" * 60)
+            print(output)
+            print("─" * 60)
+        print()
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -142,8 +302,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python api_client.py                           # interactive REPL
   python api_client.py "What is 2 + 2?"
   python api_client.py --health
+  python api_client.py --stream "Tell me a joke"
   python api_client.py --async "Research the history of AI"
   python api_client.py --url http://192.168.1.100:8000 "Plot sin(x)"
         """.strip(),
@@ -151,7 +313,7 @@ Examples:
     parser.add_argument(
         "task",
         nargs="?",
-        help="The task to run through the pipeline (wrap in quotes)",
+        help="The task to run through the pipeline (wrap in quotes). Omit to enter interactive mode.",
     )
     parser.add_argument(
         "--url", "-u",
@@ -169,20 +331,29 @@ Examples:
         action="store_true",
         help="Run the task asynchronously (start and poll until done)",
     )
+    parser.add_argument(
+        "--stream", "-s",
+        dest="stream_mode",
+        action="store_true",
+        help="Run the task via the /run-stream SSE endpoint (streams tokens live)",
+    )
 
     args = parser.parse_args()
 
-    # --health mode
+    # --health mode (works with or without a task)
     if args.health:
         ok = check_health(args.url)
         sys.exit(0 if ok else 1)
 
-    # Task required for run modes
+    # No task and no --health → interactive REPL
     if not args.task:
-        parser.error("A task string is required (unless using --health).")
+        interactive_repl(args.url)
+        return
 
-    # Run
-    if args.async_mode:
+    # Task supplied — run once
+    if args.stream_mode:
+        output = run_task_stream(args.task, args.url)
+    elif args.async_mode:
         output = run_task_async(args.task, args.url)
     else:
         output = run_task(args.task, args.url)
