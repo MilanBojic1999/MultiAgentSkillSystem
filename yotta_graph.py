@@ -3,10 +3,35 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import RetryPolicy
 from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
-from agents.sub_agents_nodes import sub_agent_node, run_sub_agent_async
+from agents.sub_agents_nodes import run_sub_agent_async
 
 import json
 import re
+
+
+async def sub_agent_node(state: dict) -> dict:
+    """
+    Async sequential node: executes the next uncompleted step in the plan
+    whose dependencies are all satisfied.  Mirrors the pattern in
+    ``paralel_pipeline_graph.py`` — await the LLM call directly instead of
+    wrapping it in ``asyncio.run()``.
+    """
+    plan = state["plan"]
+    results = state.get("results", {})
+    current_datetime = state.get("current_datetime", "")
+    streaming = state.get("streaming", False)
+
+    for step in plan:
+        if step["step"] in results:
+            continue
+        if all(d in results for d in step.get("depends_on", [])):
+            step_num, output = await run_sub_agent_async(
+                step, results, current_datetime, streaming
+            )
+            return {"results": {step_num: output}}
+
+    return {}
+
 
 def should_continue(state: dict) -> str:
     plan = state.get("plan", [])
