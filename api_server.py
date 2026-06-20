@@ -197,11 +197,12 @@ async def run_pipeline_stream(req: RunRequest):
     async def event_source():
         try:
             async for token in stream_pipeline(req.task):
-                yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
+                yield f"{token}"   # SSE frame; client strips "data: "
         except Exception as exc:
-            yield f"data: [error] {exc}\n\n"
+            yield f"[error] {exc}"
         finally:
-            yield "data: [DONE]\n\n"          # replaces the old None sentinel
+            yield "<stop>"          # replaces the old None sentinel
+            yield "\n\n"
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
@@ -212,4 +213,4 @@ async def run_pipeline_stream(req: RunRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api_server:app", host="0.0.0.0", port=8999, reload=True)

@@ -81,14 +81,14 @@ Current datetime: {current_datetime}
 # Agents that are handled by dedicated pipeline nodes (verify_node, assemble_node)
 # and should NOT appear in the orchestrator's plan — they run after the sub-agent loop.
 _PIPELINE_RESERVED_AGENTS = {"verifier", "writer"}
-
+_PIPELINE_RESERVED_SKILLS = {"answer-writer", "information-verifier"}
 
 def orchestrator_agent(state: dict):
     user_task = state["task"]
     current_datetime = state.get("current_datetime") or get_current_datetime_str()
     streaming = state.get("streaming", False)
 
-    skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items()])
+    skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items() if name not in _PIPELINE_RESERVED_SKILLS])
     # Exclude pipeline-reserved agents so the orchestrator doesn't put them in the plan
     agent_roster_str = "\n".join(
         [f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()

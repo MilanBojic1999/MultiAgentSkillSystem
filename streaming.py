@@ -54,12 +54,13 @@ async def stream_pipeline(task: str):
 
     is_thinking = None                        # None = undecided for this step
     open_step = False
-
+    current_agent = None
     async for event in graph.astream_events(state_in, config=config, version="v2"):
         kind = event["event"]
-        agent = event.get("name", "unknown_agent")
+        agent_name = event.get("name", "unknown_agent")
         # --- New agent turn -> <thinking_step> ---------------------------
-        if kind == "on_chain_start" and agent in _AGENT_NODES:
+        if kind == "on_chain_start" and agent_name in _AGENT_NODES:
+            current_agent = agent_name
             if open_step:
                 yield "\n\n"                  # close previous iteration (old l. 220)
             yield "<thinking_step>\n"
@@ -72,8 +73,8 @@ async def stream_pipeline(task: str):
             tool_args = event.get("data", {})
             if tool_args:
                 tool_args = tool_args.get("input", tool_args)  # some providers nest it
-            yield "TOOL "
-            yield f"{tool_name}"
+            yield "TOOL\n"
+            yield f"{tool_name}\n"
             yield f"({json.dumps(tool_args)})\n"
             continue
 
@@ -89,7 +90,11 @@ async def stream_pipeline(task: str):
                 continue
             visible = _visible_delta(chunk)
             if visible:
-                if is_thinking is not False and agent == "assemble":
+                print(f"DEBUG: visible delta: '{visible}':: {current_agent}")  # Debug log for visible deltas
+                print("-"*50)
+                print(event)
+                print("-"*50)
+                if is_thinking is not False and current_agent == "assemble":
                     is_thinking = False
                     yield "<non_think>\n"
                 yield visible          # raw token delta — yield as-is
