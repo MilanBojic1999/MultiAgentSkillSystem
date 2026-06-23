@@ -197,12 +197,11 @@ async def run_pipeline_stream(req: RunRequest):
     async def event_source():
         try:
             async for token in stream_pipeline(req.task):
-                yield f"{token}"   # SSE frame; client strips "data: "
+                yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
         except Exception as exc:
-            yield f"[error] {exc}"
+            yield f"data: [error] {exc}\n\n"
         finally:
-            yield "<stop>"          # replaces the old None sentinel
-            yield "\n\n"
+            yield "data: <stop>\n\n"          # replaces the old None sentinel
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 

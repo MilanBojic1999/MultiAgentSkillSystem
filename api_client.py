@@ -40,7 +40,7 @@ import urllib.request
 from typing import Any
 
 
-DEFAULT_URL = "http://localhost:8000"
+DEFAULT_URL = "http://localhost:8999"
 POLL_INTERVAL = 2  # seconds between async status checks
 
 
@@ -163,11 +163,11 @@ def run_task_stream(task: str, base_url: str) -> str | None:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue  # skip empty lines (SSE framing)
-                if not line.startswith("data: "):
-                    continue
+                # if not line.startswith("data: "):
+                #     continue
 
                 payload = line.removeprefix("data: ")
-                if payload == "[DONE]":
+                if payload == "<stop>":
                     break
                 if payload.startswith("[error] "):
                     error_msg = payload.removeprefix("[error] ")
@@ -176,7 +176,11 @@ def run_task_stream(task: str, base_url: str) -> str | None:
 
                 # Normal token — print in-place and accumulate
                 full_output.append(payload)
-                print(payload, end="", flush=True)
+                print(repr(payload), end="", flush=True)
+                if payload == "<thinking_step>":
+                    print("\n")
+                if payload == "<think>" or payload == "<non_think>":
+                    print("")
 
         print()  # final newline after stream
         assembled = "".join(full_output)
@@ -284,10 +288,10 @@ def interactive_repl(base_url: str) -> None:
         else:
             output = run_task(line, base_url)
 
-        if output is not None:
-            print("\n" + "─" * 60)
-            print(output)
-            print("─" * 60)
+        # if output is not None:
+        #     print("\n" + "─" * 60)
+        #     print(output)
+        #     print("─" * 60)
         print()
 
 

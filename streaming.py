@@ -3,6 +3,28 @@ import json
 import uuid
 from agent_states import get_current_datetime_str
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: ChatOpenAI._convert_delta_to_message_chunk drops
+# `reasoning_content` from the delta (it only targets the official OpenAI
+# spec — see langchain_openai/chat_models/base.py:5-11).  Recover it so
+# _reasoning_delta() can find it in additional_kwargs.
+# ---------------------------------------------------------------------------
+import langchain_openai.chat_models.base as _lc_base
+
+_original_convert = _lc_base._convert_delta_to_message_chunk
+
+
+def _patched_convert_delta_to_message_chunk(_dict, default_class):
+    chunk = _original_convert(_dict, default_class)
+    reasoning = _dict.get("reasoning_content")
+    if reasoning and isinstance(reasoning, str) and hasattr(chunk, "additional_kwargs"):
+        chunk.additional_kwargs["reasoning_content"] = reasoning
+    return chunk
+
+
+_lc_base._convert_delta_to_message_chunk = _patched_convert_delta_to_message_chunk
+# ---------------------------------------------------------------------------
+
 # Stream the SEQUENTIAL graph — parallel interleaves tokens (see §4).
 from yotta_graph import graph
 
@@ -57,13 +79,15 @@ async def stream_pipeline(task: str):
     current_agent = None
     async for event in graph.astream_events(state_in, config=config, version="v2"):
         kind = event["event"]
+
         agent_name = event.get("name", "unknown_agent")
         # --- New agent turn -> <thinking_step> ---------------------------
         if kind == "on_chain_start" and agent_name in _AGENT_NODES:
             current_agent = agent_name
             if open_step:
                 yield "\n\n"                  # close previous iteration (old l. 220)
-            yield "<thinking_step>\n"
+            yield "<thinking_step>"
+            yield f"{current_agent}"
             open_step = True
             is_thinking = None                # reset toggle each step
             continue
@@ -73,9 +97,10 @@ async def stream_pipeline(task: str):
             tool_args = event.get("data", {})
             if tool_args:
                 tool_args = tool_args.get("input", tool_args)  # some providers nest it
-            yield "TOOL\n"
-            yield f"{tool_name}\n"
-            yield f"({json.dumps(tool_args)})\n"
+            yield "<tool>"
+            yield f"{tool_name}"
+            yield f"({json.dumps(tool_args)})"
+            yield "</tool>"
             continue
 
         # --- Streaming LLM tokens ----------------------------------------
@@ -85,17 +110,17 @@ async def stream_pipeline(task: str):
             if reasoning:
                 if is_thinking is not True:
                     is_thinking = True
-                    yield "<think>\n"
+                    yield "<think>"
                 yield reasoning        # raw token delta — yield as-is
                 continue
             visible = _visible_delta(chunk)
             if visible:
-                print(f"DEBUG: visible delta: '{visible}':: {current_agent}")  # Debug log for visible deltas
-                print("-"*50)
-                print(event)
-                print("-"*50)
-                if is_thinking is not False and current_agent == "assemble":
+                print(f"DEBUG: visible delta ::'{visible}':: {current_agent}")  # Debug log for visible deltas
+                # print("-"*50)
+                # print(event)
+                # print("-"*50)
+                if is_thinking is not False:
                     is_thinking = False
-                    yield "<non_think>\n"
+                    yield "<non_think>"
                 yield visible          # raw token delta — yield as-is
             continue
