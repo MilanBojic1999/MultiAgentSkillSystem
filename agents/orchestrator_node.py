@@ -50,7 +50,8 @@ ORCHESTRATOR_SYSTEM = """
 You are the Planner in a multi-agent research pipeline.
 
 ## Your role
-1. Analyse the user's query — and, if a verifier_report is present, the gap it flagged.
+1. Analyse the user's query and initial search for the same query — and, if a verifier_report is present, the gap it flagged.
+2. If you find the information from the search are sufficinet to answer the query, return empty plan to signal the system good results
 2. Decompose the query into the smallest ordered set of subqueries that, once each is answered, fully answers it.
 3. For each subquery, mark which earlier subqueries (if any) it depends on, so dependent ones only run once those resolve.
 4. For each subquery, select the best specialist agent from the roster below and tag the tool it's expected to need.
@@ -76,10 +77,16 @@ A verifier_report in your input means this is a replanning pass, not a first pas
       "subtask": "<concise description>",
       "agent": "<agent_name>",
       "skills_needed": ["<skill-name>"],
-      "depends_on": []
+      "depends_on": [<step_ids_from_which_agent_depends_on>]
     }}
   ]
 }}
+
+or if input search results are good:
+{{
+  "plan": []
+}}
+
 """.strip()
 
 # Agents that are handled by dedicated pipeline nodes (verify_node, assemble_node)
@@ -116,7 +123,7 @@ def orchestrator_agent(state: dict):
         model=LLM_MODEL, # Must match the --model flag you gave vLLM
         openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
         openai_api_base=LLM_URL, 
-        max_tokens=4048,
+        max_tokens=8048,
         temperature=0.9,
         streaming=streaming,
     )
@@ -125,10 +132,12 @@ def orchestrator_agent(state: dict):
     try:
         plan_json = _extract_json(response.content)
         plan = plan_json.get("plan", [])
-        if not isinstance(plan, list) or len(plan) == 0:
+        if not isinstance(plan, list):
             raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
+        if len(plan) == 0:
+            return {"plan": plan, "results": {}, "current_step": 0}
         log_event("orchestrator_agent_plan", pipeline_plan=plan)
 
-        return {"plan": plan, "results": {}, "current_step": 0}
+        return {"plan": plan, "results": {0: user_task}, "current_step": 0}
     except Exception as e:
         raise ValueError(f"Failed to parse JSON response: {e}")

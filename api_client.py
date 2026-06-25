@@ -160,13 +160,13 @@ def run_task_stream(task: str, base_url: str) -> str | None:
         with urllib.request.urlopen(req) as resp:
             # Read SSE line by line
             for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").strip()
+                line = raw_line.decode("utf-8", errors="replace")
                 if not line:
                     continue  # skip empty lines (SSE framing)
                 # if not line.startswith("data: "):
                 #     continue
 
-                payload = line.removeprefix("data: ")
+                payload = line.replace("data: ", "", 1).rstrip("\n\n")
                 if payload == "<stop>":
                     break
                 if payload.startswith("[error] "):
@@ -176,7 +176,8 @@ def run_task_stream(task: str, base_url: str) -> str | None:
 
                 # Normal token — print in-place and accumulate
                 full_output.append(payload)
-                print(repr(payload), end="", flush=True)
+                # print(repr(payload), end="", flush=True)
+                print(payload, end="", flush=True)
                 if payload == "<thinking_step>":
                     print("\n")
                 if payload == "<think>" or payload == "<non_think>":

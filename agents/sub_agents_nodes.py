@@ -76,7 +76,7 @@ async def run_sub_agent_async(
         model=LLM_MODEL, # Must match the --model flag you gave vLLM
         openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
         openai_api_base=LLM_URL, 
-        max_tokens=4048,
+        max_tokens=8048,
         temperature=0.9,
         streaming=streaming,
     )

@@ -27,6 +27,7 @@ load_dotenv()
 from yotta_graph import graph
 from agent_states import get_current_datetime_str
 from streaming import stream_pipeline
+from yotta_tool import call_yotta, parse_yotta_results
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -106,9 +107,14 @@ app.add_middleware(
 
 async def _run_pipeline(task: str) -> str:
     """Run the parallel LangGraph pipeline and return the assembled output."""
+    # Pre-search with yotta, same as the streaming path
+    yotta_results = await call_yotta(task)
+    clean_findings = parse_yotta_results(yotta_results)
+    task_with_results = f"Query: {task}\n\n## Search results\n{clean_findings}"
+
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
     result = await graph.ainvoke(
-        {"task": task, "current_datetime": get_current_datetime_str()},
+        {"task": task_with_results, "current_datetime": get_current_datetime_str()},
         config=config,
     )
     return result.get("final_output", "No final output produced.")
@@ -197,6 +203,7 @@ async def run_pipeline_stream(req: RunRequest):
     async def event_source():
         try:
             async for token in stream_pipeline(req.task):
+                token = token.replace('\n','\\n')
                 yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
         except Exception as exc:
             yield f"data: [error] {exc}\n\n"

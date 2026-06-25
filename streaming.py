@@ -11,6 +11,8 @@ from agent_states import get_current_datetime_str
 # ---------------------------------------------------------------------------
 import langchain_openai.chat_models.base as _lc_base
 
+from yotta_tool import call_yotta, parse_yotta_results
+
 _original_convert = _lc_base._convert_delta_to_message_chunk
 
 
@@ -29,7 +31,7 @@ _lc_base._convert_delta_to_message_chunk = _patched_convert_delta_to_message_chu
 from yotta_graph import graph
 
 # Nodes that represent an "agent turn"; each opens a new <thinking_step>.
-_AGENT_NODES = {"orchestrator", "sub_agent", "verify", "assemble"}
+_AGENT_NODES = {"orchestrator", "sub_agent", "verify", "writer", "citatitaion"}
 
 
 def _reasoning_delta(chunk) -> str | None:
@@ -66,6 +68,13 @@ async def stream_pipeline(task: str):
     Each call uses a unique thread_id so the MemorySaver checkpointer never
     resumes a previous run — every request starts fresh.
     """
+
+
+    yotta_results = await call_yotta(task)
+
+    clean_findings = parse_yotta_results(yotta_results)
+    task = f"Query: {task}\n\n## Search results\n{clean_findings}"
+
     # Unique thread_id per invocation — prevents checkpoint collision across calls
     config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}"}}
     state_in = {
@@ -87,7 +96,7 @@ async def stream_pipeline(task: str):
             if open_step:
                 yield "\n\n"                  # close previous iteration (old l. 220)
             yield "<thinking_step>"
-            yield f"{current_agent}"
+            yield f"{current_agent}\n"
             open_step = True
             is_thinking = None                # reset toggle each step
             continue
@@ -115,10 +124,6 @@ async def stream_pipeline(task: str):
                 continue
             visible = _visible_delta(chunk)
             if visible:
-                print(f"DEBUG: visible delta ::'{visible}':: {current_agent}")  # Debug log for visible deltas
-                # print("-"*50)
-                # print(event)
-                # print("-"*50)
                 if is_thinking is not False:
                     is_thinking = False
                     yield "<non_think>"

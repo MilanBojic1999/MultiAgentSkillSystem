@@ -51,10 +51,10 @@ Cite every specific claim that depends on an external source. Citations must:
 - Be **invisible as citations** — the prose must flow naturally around them
 - Never be piled up; one tight citation per discrete claim is the target
 
-**Citation format:** Always use `{{URL}}` syntax, placing the URL of the source directly
+**Citation format:** Always use `{URL}` syntax, placing the URL of the source directly
 inside double curly braces immediately after the claim. Example:
 
-> The company reported a 40% increase in revenue last quarter {{https://example.com/report}}.
+> The company reported a 40% increase in revenue last quarter {https://example.com/report}.
 
 **What requires a citation:**
 - Statistics, figures, dates, named findings
@@ -202,7 +202,7 @@ a specific description of what makes it impressive.
 Before finalizing the answer, ask:
 
 1. Does this read as one unified voice, or does it feel like a transcript of tool calls?
-2. Is every specific claim that needs a citation actually cited, using `{{URL}}` format?
+2. Is every specific claim that needs a citation actually cited, using `{URL}` formatE?
 3. Is there any sentence that could be cut without losing meaning?
 4. Does the length match the actual complexity of the question?
 5. Does it sound like a knowledgeable person explaining something, or like a summary report?
