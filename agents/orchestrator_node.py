@@ -6,7 +6,7 @@ from skill_loader import load_skills
 from dotenv import load_dotenv
 from utils.logger import log_event
 from utils.senitize import sanitize_content
-import re
+from utils.json_utils import extract_json
 
 from agents import AGENT_ROSTER
 from agent_states import get_current_datetime_str
@@ -19,31 +19,6 @@ LLM_MODEL = os.getenv("LLM_MODEL")
 LLM_KEY = os.getenv("LLM_KEY")
 
 
-def _extract_json(text: str) -> dict:
-    """
-    Extract JSON from LLM response, handling common failure modes:
-    - Markdown code fences (```json ... ```)
-    - Leading/trailing prose
-    """
-    # Try direct parse first (best case)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code fence
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        return json.loads(fence_match.group(1))
-
-    # Try to find the outermost JSON object
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        return json.loads(brace_match.group(0))
-
-    raise ValueError(f"Could not extract JSON from response: {text[:500]}...")
-
-
 SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
 
 ORCHESTRATOR_SYSTEM = """
@@ -51,7 +26,7 @@ You are the Planner in a multi-agent research pipeline.
 
 ## Your role
 1. Analyse the user's query and initial search for the same query — and, if a verifier_report is present, the gap it flagged.
-2. If you find the information from the search are sufficinet to answer the query, return empty plan to signal the system good results
+2. If you find the information from the search are sufficinet to answer the query to the fullest, return empty plan to signal the system good results
 2. Decompose the query into the smallest ordered set of subqueries that, once each is answered, fully answers it.
 3. For each subquery, mark which earlier subqueries (if any) it depends on, so dependent ones only run once those resolve.
 4. For each subquery, select the best specialist agent from the roster below and tag the tool it's expected to need.
@@ -130,7 +105,7 @@ def orchestrator_agent(state: dict):
 
     response = llm.invoke(messages)
     try:
-        plan_json = _extract_json(response.content)
+        plan_json = extract_json(response.content)
         plan = plan_json.get("plan", [])
         if not isinstance(plan, list):
             raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")

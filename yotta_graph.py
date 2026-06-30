@@ -5,6 +5,8 @@ from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
 from agents.sub_agents_nodes import run_sub_agent_async
 
+from utils.json_utils import extract_json
+
 import json
 import re
 
@@ -38,34 +40,10 @@ def should_continue(state: dict) -> str:
     results = state.get("results", {})
     if len(plan) == 0:
         return "writer"
-    if len(results) < len(plan):
+    if len(results) <= len(plan):
         return "sub_agent"
     return "verify"
 
-
-def _extract_json(text: str) -> dict:
-    """
-    Extract JSON from LLM response, handling common failure modes:
-    - Markdown code fences (```json ... ```)
-    - Leading/trailing prose
-    """
-    # Try direct parse first (best case)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code fence
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        return json.loads(fence_match.group(1))
-
-    # Try to find the outermost JSON object
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        return json.loads(brace_match.group(0))
-
-    raise ValueError(f"Could not extract JSON from response: {text[:500]}...")
 
 
 async def verify_node(state: dict) -> dict:
@@ -79,6 +57,11 @@ async def verify_node(state: dict) -> dict:
         f"Step {s['step']} ({s['agent']}): {s['subtask']}"
         for s in plan
     )
+
+    print("Verifier input:", results)
+    print("-"*50)
+    print("+"*50)
+
     results_summary = "\n\n".join(
         f"--- Step {step_num} output ---\n{output}"
         for step_num, output in results.items()
@@ -104,8 +87,8 @@ async def verify_node(state: dict) -> dict:
 
     # Parse the verifier's JSON output to extract the routing decision
     try:
-        parsed = _extract_json(output)
-        print(f"Parsed verifier output: {parsed}")
+        parsed = extract_json(output)
+        print(f"Parsed verifier output: {len(results)} : {parsed}")
         if isinstance(parsed, list):
             parsed = parsed[0]
         verification_result = parsed.get("verification_result", "PASSED").upper()
@@ -120,10 +103,12 @@ async def verify_node(state: dict) -> dict:
             verification_result = "PASSED WITH NOTES"
         verification_notes = output
 
+
+
     return {
         "verification_result": verification_result,
         "verification_notes": verification_notes,
-        "final_output": output,
+        "results": {len(results): output}
     }
 
 
@@ -135,16 +120,6 @@ def after_verify(state: dict) -> str:
     if verdict == "FAILED":
         return "orchestrator"
     return "writer"
-
-
-def assemble_node(state: dict) -> dict:
-    plan = state.get("plan", [])
-    results = state.get("results", {})
-    parts = [
-        f"## Step {s['step']}: {s['subtask']}\n{results.get(s['step'], '')}"
-        for s in plan
-    ]
-    return {"final_output": "\n\n".join(parts)}
 
 async def writer_node(state: dict) -> dict:
     """Assemble sub-agent results (or direct yotta findings) plus verifier notes
@@ -162,6 +137,12 @@ async def writer_node(state: dict) -> dict:
     verification_notes = state.get("verification_notes", "")
     plan = state.get("plan", [])
     task = state.get("task", "")
+
+    
+    print("Writer input:", results)
+    print("-"*50)
+    print("+"*50, flush=True)
+
 
     # ---- build the writer's prompt blocks -----------------------------------
     blocks: list[str] = []
@@ -184,6 +165,9 @@ async def writer_node(state: dict) -> dict:
 
     # Sub-agent results — skip step 0 (it's just the task string stored by the
     # orchestrator); real sub-agent outputs have step numbers >= 1.
+    print("Writer results:")
+    for k, v in results.items():
+        print(k,"___",v)
     if plan:
         results_summary = "\n\n".join(
             f"--- Step {step_num} output ---\n{output}"
@@ -231,7 +215,7 @@ async def writer_node(state: dict) -> dict:
         streaming=state.get("streaming", False),
     )
 
-    return {"final_output": output}
+    return {"final_output": output, "results": {step_num: output}}
 
 async def citatitaion_node(state: dict) -> dict:
     """Citation & QA gate: runs after the writer, checks the draft against the
@@ -275,7 +259,7 @@ async def citatitaion_node(state: dict) -> dict:
     )
 
     try:
-        parsed = _extract_json(output)
+        parsed = extract_json(output)
         final_answer = parsed.get("final_answer", output)
     except (ValueError, json.JSONDecodeError):
         final_answer = output

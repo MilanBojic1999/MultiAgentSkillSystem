@@ -206,6 +206,7 @@ async def run_pipeline_stream(req: RunRequest):
                 token = token.replace('\n','\\n')
                 yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
         except Exception as exc:
+            print(traceback.format_exc())
             yield f"data: [error] {exc}\n\n"
         finally:
             yield "data: <stop>\n\n"          # replaces the old None sentinel
