@@ -73,6 +73,7 @@ async def stream_pipeline(task: str):
     yotta_results = await call_yotta(task)
 
     clean_findings = parse_yotta_results(yotta_results)
+    # clean_findings = ""
     task = f"Query: {task}\n\n## Search results\n{clean_findings}"
 
     # Unique thread_id per invocation — prevents checkpoint collision across calls

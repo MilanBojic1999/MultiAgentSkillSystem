@@ -315,10 +315,11 @@ def get_page(
     extra_headers: Optional[dict] = None,
     polite_delay: float = 0.0,
     text_only: bool = False,
-) -> dict:
+) -> str:
     """
-    Fetch a page with requests and return a structured result dict.
-
+    Fetch a page with requests and return a content of the page as a string. 
+    It is good for pure html pages, but not usable to pages that host files like PDFs
+    
     Parameters
     ----------
     url            : Target URL.
@@ -340,17 +341,13 @@ def get_page(
 
     Returns
     -------
-    {
-        "url":          str,   – final URL after redirects
-        "status_code":  int,
-        "content_type": str,
-        "html":         str,   – full HTML, up to MAX_RETURNED_CHARS chars.
-                                  Always "" when text_only=True.
-        "text":         str,   – plain text extracted by BS4. Populated
-                                  whenever BS4 is available, regardless of
-                                  text_only.
-        "error":        str | None
-    }
+    URL: `url`
+    Status: `status_code`
+    Content-Type: `content_type`
+    === PAGE TEXT ===
+    `page_text`
+    === RAW HTML ===
+    `html_page`
     """
     _validate_url(url)
 
@@ -524,7 +521,7 @@ def get_page(
         parts += ["=== PAGE TEXT ===", result["text"]]
     else:
         if result["text"]:
-            parts += ["=== PLAIN TEXT ===", result["text"], "", "=== RAW HTML ==="]
+            parts += ["=== PAGE TEXT ===", result["text"], "", "=== RAW HTML ==="]
         parts.append(result["html"])
 
     return "\n".join(parts)
