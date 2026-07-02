@@ -33,12 +33,26 @@ from yotta_tool import call_yotta, parse_yotta_results
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+class FileInput(BaseModel):
+    """A file attached as input context for the pipeline."""
+    filename: str = Field(..., description="Name of the file (e.g. 'notes.md')")
+    content: str = Field(..., description="File contents as plain UTF-8 text, or base64-encoded when encoding='base64'")
+    encoding: str | None = Field(
+        default=None,
+        description="'base64' if the content is base64-encoded binary; omit for plain UTF-8 text",
+    )
+
+
 class RunRequest(BaseModel):
     task: str = Field(
         ...,
         min_length=1,
         description="The natural-language task to run through the pipeline",
         examples=["Calculate sin(pi/4) + cos(pi/4) and plot both functions"],
+    )
+    files: list[FileInput] | None = Field(
+        default=None,
+        description="Optional list of files to include as input context",
     )
 
 
@@ -105,12 +119,46 @@ app.add_middleware(
 # Pipeline runner (shared by sync and async endpoints)
 # ---------------------------------------------------------------------------
 
-async def _run_pipeline(task: str) -> str:
+# Server-side safety cap — client should truncate first, but this is a backstop.
+_SERVER_MAX_FILE_CHARS = 100_000
+
+
+def _truncate_file_content(filename: str, content: str, max_chars: int) -> str:
+    """Truncate *content* to *max_chars*, keeping head + tail with a notice."""
+    if len(content) <= max_chars:
+        return content
+    half = max_chars // 2
+    return (
+        content[:half]
+        + f"\n\n... [TRUNCATED — {len(content) - max_chars:,} chars omitted] ...\n\n"
+        + content[-half:]
+    )
+
+
+def _build_task_with_files(task: str, files: list[FileInput] | None) -> str:
+    """Prepend attached file contents to the task string as context."""
+    if not files:
+        return task
+    file_blocks: list[str] = []
+    for f in files:
+        content = _truncate_file_content(f.filename, f.content, _SERVER_MAX_FILE_CHARS)
+        if f.encoding == "base64":
+            file_blocks.append(
+                f"### File: {f.filename} [binary — base64-encoded]\n"
+                f"```\n{content}\n```"
+            )
+        else:
+            file_blocks.append(f"### File: {f.filename}\n```\n{content}\n```")
+    return "## Attached files (input context)\n\n" + "\n\n".join(file_blocks) + f"\n\n## Task\n{task}"
+
+
+async def _run_pipeline(task: str, files: list[FileInput] | None = None) -> str:
     """Run the parallel LangGraph pipeline and return the assembled output."""
+    task_with_files = _build_task_with_files(task, files)
     # Pre-search with yotta, same as the streaming path
-    yotta_results = await call_yotta(task)
+    yotta_results = await call_yotta(task_with_files)
     clean_findings = parse_yotta_results(yotta_results)
-    task_with_results = f"Query: {task}\n\n## Search results\n{clean_findings}"
+    task_with_results = f"Query: {task_with_files}\n\n## Search results\n{clean_findings}"
 
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
     result = await graph.ainvoke(
@@ -140,7 +188,7 @@ async def run_pipeline(req: RunRequest):
     to a couple of minutes.
     """
     try:
-        output = await _run_pipeline(req.task)
+        output = await _run_pipeline(req.task, req.files)
         return RunResponse(final_output=output)
     except Exception as exc:
         raise HTTPException(
@@ -163,7 +211,7 @@ async def run_pipeline_async(req: RunRequest):
 
     async def _background():
         try:
-            output = await _run_pipeline(req.task)
+            output = await _run_pipeline(req.task, req.files)
             async with _task_lock:
                 _task_store[task_id] = {"status": "completed", "final_output": output, "error": None}
         except Exception as exc:
@@ -202,7 +250,7 @@ async def run_pipeline_stream(req: RunRequest):
     """Stream the pipeline using the marker protocol as Server-Sent Events."""
     async def event_source():
         try:
-            async for token in stream_pipeline(req.task):
+            async for token in stream_pipeline(req.task, req.files):
                 token = token.replace('\n','\\n')
                 yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
         except Exception as exc:

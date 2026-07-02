@@ -31,8 +31,10 @@ Examples:
     python api_client.py --url http://localhost:9000 "Plot sin(x) from -pi to pi"
 """
 
+import base64
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -42,6 +44,8 @@ from typing import Any
 
 DEFAULT_URL = "http://localhost:8999"
 POLL_INTERVAL = 2  # seconds between async status checks
+DEFAULT_MAX_FILE_CHARS = 50_000  # ~12.5k tokens by the 4-char/token heuristic
+TOKEN_ESTIMATE_CHARS = 4         # rough chars-per-token for English text
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +76,63 @@ def _request(method: str, path: str, base_url: str, body: dict | None = None) ->
         return {"error": True, "detail": str(exc.reason)}
 
 
+def _read_files(file_paths: list[str], max_chars: int = DEFAULT_MAX_FILE_CHARS) -> list[dict[str, str]]:
+    """Read each file path and return a list of {filename, content, encoding?} dicts.
+
+    Tries UTF-8 text first; falls back to base64-encoding for binary files
+    (PDFs, images, etc.).  Content is truncated to ``max_chars`` characters
+    with a visible notice to avoid burning the LLM context window.
+
+    Prints a warning and skips unreadable files rather than aborting.
+    """
+    files: list[dict[str, str]] = []
+    for path in file_paths:
+        if not os.path.isfile(path):
+            print(f"⚠️  Skipping '{path}' — not a file or doesn't exist.")
+            continue
+        try:
+            # Attempt UTF-8 text first
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            if len(content) > max_chars:
+                est_tokens = len(content) // TOKEN_ESTIMATE_CHARS
+                trunc_tokens = max_chars // TOKEN_ESTIMATE_CHARS
+                print(f"⚠️  {os.path.basename(path)}: {len(content):,} chars "
+                      f"(~{est_tokens:,} tokens) exceeds limit "
+                      f"({max_chars:,} chars / ~{trunc_tokens:,} tokens) — truncating")
+                half = max_chars // 2
+                content = (
+                    content[:half]
+                    + f"\n\n... [TRUNCATED — {len(content) - max_chars:,} chars omitted] ...\n\n"
+                    + content[-half:]
+                )
+            files.append({"filename": os.path.basename(path), "content": content})
+        except (UnicodeDecodeError, UnicodeError):
+            # Binary file — read raw bytes and base64-encode
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                # Truncate raw bytes before encoding (base64 blows up by ~33%)
+                max_raw = (max_chars * 3) // 4  # inverse of base64 expansion
+                if len(raw) > max_raw:
+                    print(f"⚠️  {os.path.basename(path)}: {len(raw):,} raw bytes "
+                          f"exceeds limit — truncating to ~{max_raw:,} bytes")
+                    raw = raw[:max_raw]
+                encoded = base64.b64encode(raw).decode("ascii")
+                files.append({
+                    "filename": os.path.basename(path),
+                    "content": encoded,
+                    "encoding": "base64",
+                })
+                print(f"📎 {os.path.basename(path)} — binary file, base64-encoded "
+                      f"({len(raw)} bytes → {len(encoded)} chars)")
+            except Exception as exc:
+                print(f"⚠️  Could not read binary file '{path}': {exc}")
+        except Exception as exc:
+            print(f"⚠️  Could not read '{path}': {exc}")
+    return files
+
+
 def check_health(base_url: str) -> bool:
     """Return True if the API is reachable and healthy."""
     print(f"🔍 Checking API health at {base_url} ...")
@@ -83,12 +144,18 @@ def check_health(base_url: str) -> bool:
     return False
 
 
-def run_task(task: str, base_url: str) -> str | None:
+def run_task(task: str, base_url: str, files: list[dict] | None = None) -> str | None:
     """Run a task synchronously and return the final output."""
     print(f"🚀 Running task:\n   {task}\n")
+    if files:
+        print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run ...")
 
-    result = _request("POST", "/run", base_url, body={"task": task})
+    body: dict[str, Any] = {"task": task}
+    if files:
+        body["files"] = files
+
+    result = _request("POST", "/run", base_url, body=body)
 
     if result.get("error"):
         print(f"❌ Error: {result.get('detail', 'Unknown error')}")
@@ -97,12 +164,18 @@ def run_task(task: str, base_url: str) -> str | None:
     return result.get("final_output", "")
 
 
-def run_task_async(task: str, base_url: str) -> str | None:
+def run_task_async(task: str, base_url: str, files: list[dict] | None = None) -> str | None:
     """Start an async task and poll until completion."""
     print(f"🚀 Starting async task:\n   {task}\n")
+    if files:
+        print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run-async ...")
 
-    start_result = _request("POST", "/run-async", base_url, body={"task": task})
+    body: dict[str, Any] = {"task": task}
+    if files:
+        body["files"] = files
+
+    start_result = _request("POST", "/run-async", base_url, body=body)
     if start_result.get("error"):
         print(f"❌ Error starting task: {start_result.get('detail', 'Unknown error')}")
         return None
@@ -139,16 +212,21 @@ def run_task_async(task: str, base_url: str) -> str | None:
         print(f"\r   Running{'.' * dots}{' ' * (3 - dots)}", end="", flush=True)
 
 
-def run_task_stream(task: str, base_url: str) -> str | None:
+def run_task_stream(task: str, base_url: str, files: list[dict] | None = None) -> str | None:
     """Run a task via the /run-stream SSE endpoint and print tokens as they arrive.
 
     Returns the full assembled output, or None on error.
     """
     print(f"🚀 Starting stream task:\n   {task}\n")
+    if files:
+        print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run-stream ...\n")
 
     url = f"{base_url.rstrip('/')}/run-stream"
-    data = json.dumps({"task": task}).encode("utf-8")
+    body: dict[str, Any] = {"task": task}
+    if files:
+        body["files"] = files
+    data = json.dumps(body).encode("utf-8")
 
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -211,6 +289,10 @@ Commands:
   :url <URL>     Change the server URL (current: {url})
   :async         Toggle async mode (currently: {async_mode})
   :stream        Toggle stream mode (currently: {stream_mode})
+  :file <PATH>   Attach a file as input context for the next task
+  :files         List currently attached files
+  :clear-files   Remove all attached files
+  :max-chars [N] Show/set max chars per file (current: {max_chars})
   :help, :?      Show this help
   :quit, :q      Exit the client
 
@@ -231,6 +313,8 @@ def interactive_repl(base_url: str) -> None:
 
     async_mode = False
     stream_mode = False
+    attached_files: list[str] = []  # paths of files to send with the next task
+    max_file_chars = DEFAULT_MAX_FILE_CHARS
 
     while True:
         try:
@@ -258,7 +342,7 @@ def interactive_repl(base_url: str) -> None:
                 print("👋 Goodbye!")
                 break
             elif cmd in ("help", "?"):
-                print(HELP_TEXT.format(url=base_url, async_mode=async_mode, stream_mode=stream_mode))
+                print(HELP_TEXT.format(url=base_url, async_mode=async_mode, stream_mode=stream_mode, max_chars=f"{max_file_chars:,}"))
             elif cmd == "health":
                 check_health(base_url)
             elif cmd == "url":
@@ -277,17 +361,50 @@ def interactive_repl(base_url: str) -> None:
                 async_mode = False  # mutually exclusive
                 state = "ON" if stream_mode else "OFF"
                 print(f"✅ Stream mode: {state}")
+            elif cmd == "file":
+                if arg:
+                    attached_files.append(arg)
+                    print(f"📎 Attached: {arg}")
+                else:
+                    print("Usage: :file <PATH>")
+            elif cmd == "files":
+                if attached_files:
+                    print("📎 Attached files:")
+                    for i, f in enumerate(attached_files, 1):
+                        print(f"   {i}. {f}")
+                else:
+                    print("No files attached.")
+            elif cmd in ("clear-files", "cf"):
+                count = len(attached_files)
+                attached_files.clear()
+                print(f"🗑️  Cleared {count} attached file(s).")
+            elif cmd == "max-chars":
+                if arg:
+                    try:
+                        max_file_chars = int(arg)
+                        est_tokens = max_file_chars // TOKEN_ESTIMATE_CHARS
+                        print(f"✅ Max file chars set to {max_file_chars:,} "
+                              f"(~{est_tokens:,} tokens)")
+                    except ValueError:
+                        print(f"❌ Invalid number: {arg}")
+                else:
+                    est_tokens = max_file_chars // TOKEN_ESTIMATE_CHARS
+                    print(f"Max file chars: {max_file_chars:,} "
+                          f"(~{est_tokens:,} tokens)")
             else:
                 print(f"❌ Unknown command: :{cmd}  (type :help for help)")
             continue
 
         # Run the task
+        files = _read_files(attached_files, max_file_chars) if attached_files else None
         if stream_mode:
-            output = run_task_stream(line, base_url)
+            output = run_task_stream(line, base_url, files)
         elif async_mode:
-            output = run_task_async(line, base_url)
+            output = run_task_async(line, base_url, files)
         else:
-            output = run_task(line, base_url)
+            output = run_task(line, base_url, files)
+        # Clear attached files after each task (one-shot behaviour)
+        attached_files.clear()
 
         # if output is not None:
         #     print("\n" + "─" * 60)
@@ -342,6 +459,21 @@ Examples:
         action="store_true",
         help="Run the task via the /run-stream SSE endpoint (streams tokens live)",
     )
+    parser.add_argument(
+        "--file", "-f",
+        dest="files",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Attach a file as input context (can be used multiple times)",
+    )
+    parser.add_argument(
+        "--max-file-chars",
+        type=int,
+        default=DEFAULT_MAX_FILE_CHARS,
+        metavar="N",
+        help=f"Max characters per attached file (default: {DEFAULT_MAX_FILE_CHARS:,})",
+    )
 
     args = parser.parse_args()
 
@@ -356,12 +488,13 @@ Examples:
         return
 
     # Task supplied — run once
+    files = _read_files(args.files, args.max_file_chars) if args.files else None
     if args.stream_mode:
-        output = run_task_stream(args.task, args.url)
+        output = run_task_stream(args.task, args.url, files)
     elif args.async_mode:
-        output = run_task_async(args.task, args.url)
+        output = run_task_async(args.task, args.url, files)
     else:
-        output = run_task(args.task, args.url)
+        output = run_task(args.task, args.url, files)
 
     if output is None:
         sys.exit(1)

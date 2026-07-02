@@ -56,7 +56,8 @@ htmlcov/
 # OS junk
 Desktop.ini
 
-
+scraped_pages/
+artifacts/
 
 testing_main.py
 old_agent.py

@@ -4,6 +4,23 @@ import uuid
 from agent_states import get_current_datetime_str
 
 # ---------------------------------------------------------------------------
+# Server-side safety cap — client should truncate first, but this is a backstop.
+# ---------------------------------------------------------------------------
+_STREAM_MAX_FILE_CHARS = 100_000
+
+
+def _truncate_file_content(filename: str, content: str, max_chars: int) -> str:
+    """Truncate *content* to *max_chars*, keeping head + tail with a notice."""
+    if len(content) <= max_chars:
+        return content
+    half = max_chars // 2
+    return (
+        content[:half]
+        + f"\n\n... [TRUNCATED — {len(content) - max_chars:,} chars omitted] ...\n\n"
+        + content[-half:]
+    )
+
+# ---------------------------------------------------------------------------
 # Monkey-patch: ChatOpenAI._convert_delta_to_message_chunk drops
 # `reasoning_content` from the delta (it only targets the official OpenAI
 # spec — see langchain_openai/chat_models/base.py:5-11).  Recover it so
@@ -60,21 +77,43 @@ def _visible_delta(chunk) -> str:
     return ""
 
 
-async def stream_pipeline(task: str):
+async def stream_pipeline(task: str, files: list | None = None):
     """
     Async generator yielding the old marker protocol:
     <thinking_step>, <think>/<non_think>, token text, TOOL name(args), stop.
 
     Each call uses a unique thread_id so the MemorySaver checkpointer never
     resumes a previous run — every request starts fresh.
-    """
 
+    If ``files`` is provided, each file's content is prepended to the task as
+    context (same format as the non-streaming path).
+    """
+    # Prepend attached files as context, mirroring _build_task_with_files
+    file_blocks = None
+    if files:
+        file_blocks: list[str] = []
+        for f in files:
+            filename = f.filename if hasattr(f, 'filename') else f.get('filename', 'unknown')
+            content = f.content if hasattr(f, 'content') else f.get('content', '')
+            encoding = f.encoding if hasattr(f, 'encoding') else f.get('encoding', None)
+            content = _truncate_file_content(filename, content, _STREAM_MAX_FILE_CHARS)
+            if encoding == "base64":
+                file_blocks.append(
+                    f"### File: {filename} [binary — base64-encoded]\n"
+                    f"```\n{content}\n```"
+                )
+            else:
+                file_blocks.append(f"### File: {filename}\n```\n{content}\n```")
+        # task = "## Attached files (input context)\n\n" + "\n\n".join(file_blocks) + f"\n\n## Task\n{task}"
 
     yotta_results = await call_yotta(task)
 
     clean_findings = parse_yotta_results(yotta_results)
     # clean_findings = ""
     task = f"Query: {task}\n\n## Search results\n{clean_findings}"
+    if file_blocks:
+        task += "\n## Attached files (input context)\n\n"
+        task += "\n\n".join(file_blocks)
 
     # Unique thread_id per invocation — prevents checkpoint collision across calls
     config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}"}}
