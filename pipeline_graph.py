@@ -7,9 +7,15 @@ from agents.sub_agents_nodes import sub_agent_node
 
 
 def should_continue(state: dict) -> str:
+    """Set-based routing: route on which plan steps still need results."""
     plan = state.get("plan", [])
     results = state.get("results", {})
-    if len(results) < len(plan):
+
+    plan_step_ids = {s["step"] for s in plan}
+    done_ids = set(results.keys())
+    remaining = plan_step_ids - done_ids
+
+    if remaining:
         return "sub_agent"
     return "assemble"
 

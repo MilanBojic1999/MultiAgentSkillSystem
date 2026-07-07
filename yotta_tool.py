@@ -29,12 +29,14 @@ def _call_yotta_sync(question: str, answers_returned: int=10, sents_per_answer: 
     headers = {"Content-Type": "application/json", "Authorization": api_key}
 
 
+    response = None
     try:
-        response = requests.post(yotta_api,json=body,headers=headers)
+        response = requests.post(yotta_api, json=body, headers=headers, timeout=30)
+        response.raise_for_status()
         answers = response.json()
 
         answer_list = [{'answer':answer['answer'],'sentence':answer['sentence'],'source':answer['sources'][0]['url']} for answer in answers['answers']]
-        kg_data = answers.get("knowledge_graph",None)
+        kg_data = answers.get("knowledge_graph", None)
 
         kg_website = ""
         if kg_data:
@@ -47,16 +49,21 @@ def _call_yotta_sync(question: str, answers_returned: int=10, sents_per_answer: 
         else:
             kg_data = ""
 
-        sentences = ["{0}{{{1}}}".format(answer['sentence'],answer['source']) for answer in answer_list][:answers_returned]
+        sentences = ["{0}{{{1}}}".format(answer['sentence'], answer['source']) for answer in answer_list][:answers_returned]
         kg_output = "{0}{{{1}}}".format(kg_data, kg_website)
         if len(sentences) == 0:
             sentences = ["No good answer found."]
         sources = '.\n'.join(sentences)
 
         return f"<source>\n{sources}</source>\n<graph>{kg_output}</graph>"
-    except:
+    except requests.RequestException as exc:
         print(traceback.format_exc())
-        print("ERROR: ",question,response)
+        print(f"ERROR (request): question={question!r}, exc={exc}")
+        return ""
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        print(traceback.format_exc())
+        resp_text = response.text if response is not None else "N/A"
+        print(f"ERROR (parse): question={question!r}, exc={exc}, response={resp_text[:500]}")
         return ""
 
 

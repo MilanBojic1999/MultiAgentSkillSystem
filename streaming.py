@@ -109,16 +109,17 @@ async def stream_pipeline(task: str, files: list | None = None):
     yotta_results = await call_yotta(task)
 
     clean_findings = parse_yotta_results(yotta_results)
-    # clean_findings = ""
-    task = f"Query: {task}\n\n## Search results\n{clean_findings}"
+
+    task_with_query = f"Query: {task}"
     if file_blocks:
-        task += "\n## Attached files (input context)\n\n"
-        task += "\n\n".join(file_blocks)
+        task_with_query += "\n## Attached files (input context)\n\n"
+        task_with_query += "\n\n".join(file_blocks)
 
     # Unique thread_id per invocation — prevents checkpoint collision across calls
     config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}"}}
     state_in = {
-        "task": task,
+        "task": task_with_query,
+        "search_results": clean_findings,
         "current_datetime": get_current_datetime_str(),
         "streaming": True,                    # see §5.3 — must reach the LLM constructors
     }

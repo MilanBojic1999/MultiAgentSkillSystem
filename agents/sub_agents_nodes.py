@@ -73,11 +73,11 @@ async def run_sub_agent_async(
     mcp_client = create_mcp_client(agent_name)
 
     llm = ChatOpenAI(
-        model=LLM_MODEL, # Must match the --model flag you gave vLLM
-        openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
-        openai_api_base=LLM_URL, 
-        max_tokens=8048,
-        temperature=0.9,
+        model=LLM_MODEL,
+        openai_api_key=LLM_KEY,
+        openai_api_base=LLM_URL,
+        max_tokens=8192,
+        temperature=0.2,
         streaming=streaming,
     )
 

@@ -24,10 +24,15 @@ from dotenv import load_dotenv
 # Load env before importing pipeline modules (they read os.getenv at import time)
 load_dotenv()
 
-from yotta_graph import graph
+from yotta_graph import builder as yotta_builder
 from agent_states import get_current_datetime_str
 from streaming import stream_pipeline
 from yotta_tool import call_yotta, parse_yotta_results
+
+# Compile without a checkpointer to prevent unbounded MemorySaver growth
+# in the long-running server.  Each request is stateless and uses a unique
+# thread_id — there's no need to persist checkpoints across calls.
+api_graph = yotta_builder.compile()
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -153,16 +158,21 @@ def _build_task_with_files(task: str, files: list[FileInput] | None) -> str:
 
 
 async def _run_pipeline(task: str, files: list[FileInput] | None = None) -> str:
-    """Run the parallel LangGraph pipeline and return the assembled output."""
+    """Run the multi-agent LangGraph pipeline and return the assembled output."""
     task_with_files = _build_task_with_files(task, files)
     # Pre-search with yotta, same as the streaming path
     yotta_results = await call_yotta(task_with_files)
     clean_findings = parse_yotta_results(yotta_results)
-    task_with_results = f"Query: {task_with_files}\n\n## Search results\n{clean_findings}"
 
+    # Pass search results as a dedicated state field instead of embedding
+    # them in the task string, so the writer node doesn't have to parse.
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
-    result = await graph.ainvoke(
-        {"task": task_with_results, "current_datetime": get_current_datetime_str()},
+    result = await api_graph.ainvoke(
+        {
+            "task": f"Query: {task_with_files}",
+            "search_results": clean_findings,
+            "current_datetime": get_current_datetime_str(),
+        },
         config=config,
     )
     return result.get("final_output", "No final output produced.")
