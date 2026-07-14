@@ -162,7 +162,10 @@ def tokenize(expr: str) -> List[Token]:
             i = j
             continue
 
-        if ch in '+-*/^%!':
+        if ch == '*' and i + 1 < len(expr) and expr[i+1] == '*':
+            tokens.append(Token('op', '**'))
+            i += 2
+        elif ch in '+-*/^%!':
             tokens.append(Token('op', ch))
             i += 1
         elif ch == '(':
@@ -236,12 +239,12 @@ class Parser:
 
     def parse_mul_div(self) -> float:
         left = self.parse_unary()
-        while (t := self.peek()) and t.type == 'op' and t.value in '*/^%':
+        while (t := self.peek()) and t.type == 'op' and t.value in ('*', '/', '^', '%', '**'):
             op = self.consume().value
             right = self.parse_unary()
             if op == '*':   result = left * right
             elif op == '/': result = left / right
-            elif op == '^': result = left ** right
+            elif op in ('^', '**'): result = left ** right
             elif op == '%': result = left % right
             self.steps.append(f"  {_fmt(left)} {op} {_fmt(right)} = {_fmt(result)}")
             left = result
@@ -299,7 +302,7 @@ class Parser:
             self.expect('rparen')
             return val
 
-        raise SyntaxError(f"Unexpected token: '{t.value}'")
+        raise SyntaxError(f"Unexpected token: '{t.value}' in tokens {self.tokens[:self.pos]}")
 
 
 # ---------------------------------------------------------------------------
