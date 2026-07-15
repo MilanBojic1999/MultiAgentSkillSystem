@@ -2,23 +2,7 @@
 import json
 import uuid
 from agent_states import get_current_datetime_str
-
-# ---------------------------------------------------------------------------
-# Server-side safety cap — client should truncate first, but this is a backstop.
-# ---------------------------------------------------------------------------
-_STREAM_MAX_FILE_CHARS = 100_000
-
-
-def _truncate_file_content(filename: str, content: str, max_chars: int) -> str:
-    """Truncate *content* to *max_chars*, keeping head + tail with a notice."""
-    if len(content) <= max_chars:
-        return content
-    half = max_chars // 2
-    return (
-        content[:half]
-        + f"\n\n... [TRUNCATED — {len(content) - max_chars:,} chars omitted] ...\n\n"
-        + content[-half:]
-    )
+from pipeline_entry import build_task_string, build_files_state
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: ChatOpenAI._convert_delta_to_message_chunk drops
@@ -85,43 +69,29 @@ async def stream_pipeline(task: str, files: list | None = None):
     Each call uses a unique thread_id so the MemorySaver checkpointer never
     resumes a previous run — every request starts fresh.
 
-    If ``files`` is provided, each file's content is prepended to the task as
-    context (same format as the non-streaming path).
+    If ``files`` is provided, their text content is carried in ``state["files"]``
+    (filename -> content) rather than embedded in the task string — the planner
+    routes filenames to the steps that need them (same as the non-streaming
+    path — see ``pipeline_entry.build_task_string`` / ``build_files_state``).
     """
-    # Prepend attached files as context, mirroring _build_task_with_files
-    file_blocks = None
-    if files:
-        file_blocks: list[str] = []
-        for f in files:
-            filename = f.filename if hasattr(f, 'filename') else f.get('filename', 'unknown')
-            content = f.content if hasattr(f, 'content') else f.get('content', '')
-            encoding = f.encoding if hasattr(f, 'encoding') else f.get('encoding', None)
-            content = _truncate_file_content(filename, content, _STREAM_MAX_FILE_CHARS)
-            if encoding == "base64":
-                file_blocks.append(
-                    f"### File: {filename} [binary — base64-encoded]\n"
-                    f"```\n{content}\n```"
-                )
-            else:
-                file_blocks.append(f"### File: {filename}\n```\n{content}\n```")
-        # task = "## Attached files (input context)\n\n" + "\n\n".join(file_blocks) + f"\n\n## Task\n{task}"
+    # Decode/extract file text first — fail fast on a bad upload before
+    # spending a search call on it.
+    files_state = build_files_state(files)
 
+    # Search on the bare task — file contents never reach the search call.
     yotta_results = await call_yotta(task)
-
     clean_findings = parse_yotta_results(yotta_results)
 
-    task_with_query = f"Query: {task}"
-    if file_blocks:
-        task_with_query += "\n## Attached files (input context)\n\n"
-        task_with_query += "\n\n".join(file_blocks)
+    task_string = build_task_string(task, files)
 
     # Unique thread_id per invocation — prevents checkpoint collision across calls
-    config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}"}}
+    config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}", "recursion_limit": 64}}
     state_in = {
-        "task": task_with_query,
+        "task": task_string,
         "search_results": clean_findings,
         "current_datetime": get_current_datetime_str(),
         "streaming": True,                    # see §5.3 — must reach the LLM constructors
+        "files": files_state,
     }
 
     is_thinking = None                        # None = undecided for this step

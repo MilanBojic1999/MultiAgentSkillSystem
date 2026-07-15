@@ -314,7 +314,7 @@ def get_page(
     timeout: int = DEFAULT_TIMEOUT,
     extra_headers: Optional[dict] = None,
     polite_delay: float = 0.0,
-    text_only: bool = False,
+    text_only: bool = True,
 ) -> str:
     """
     Fetch a page with requests and return a content of the page as a string. 

@@ -1,5 +1,5 @@
 from typing import Annotated
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict, NotRequired
 import operator
 from datetime import datetime
 
@@ -40,10 +40,19 @@ class PlanStep(TypedDict):
     agent: str
     skills_needed: list[str]
     depends_on: list[int]
+    # Filenames (keys into AgentState.files) this step needs the full text of.
+    # Optional — most steps don't touch attached documents.
+    files: NotRequired[list[str]]
 
 class AgentState(TypedDict):
     # Inputs
     task: str
+
+    # Attached documents: filename -> decoded/truncated text content.
+    # Set once at pipeline entry (api_server.py / streaming.py) and never
+    # mutated by nodes — the planner assigns filenames to steps via
+    # PlanStep.files, and run_sub_agent_async injects the matching content.
+    files: dict[str, str]
 
     # Current datetime (human-friendly) — set at pipeline start, available to all nodes
     current_datetime: str
@@ -68,6 +77,10 @@ class AgentState(TypedDict):
     verification_result: str
     verification_notes: str
     verifier_report: str
+
+    # Single routing decision computed by verify_node: "retry" | "replan" | "proceed".
+    # after_verify reads this directly instead of re-parsing verdicts/notes.
+    verification_route: str
 
     replan_count: int
 

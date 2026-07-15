@@ -26,6 +26,12 @@ load_dotenv()
 
 from yotta_graph import builder as yotta_builder
 from agent_states import get_current_datetime_str
+from pipeline_entry import (
+    build_task_string,
+    build_files_state,
+    UnsupportedFileTypeError,
+    EmptyExtractedTextError,
+)
 from streaming import stream_pipeline
 from yotta_tool import call_yotta, parse_yotta_results
 
@@ -124,44 +130,15 @@ app.add_middleware(
 # Pipeline runner (shared by sync and async endpoints)
 # ---------------------------------------------------------------------------
 
-# Server-side safety cap — client should truncate first, but this is a backstop.
-_SERVER_MAX_FILE_CHARS = 100_000
-
-
-def _truncate_file_content(filename: str, content: str, max_chars: int) -> str:
-    """Truncate *content* to *max_chars*, keeping head + tail with a notice."""
-    if len(content) <= max_chars:
-        return content
-    half = max_chars // 2
-    return (
-        content[:half]
-        + f"\n\n... [TRUNCATED — {len(content) - max_chars:,} chars omitted] ...\n\n"
-        + content[-half:]
-    )
-
-
-def _build_task_with_files(task: str, files: list[FileInput] | None) -> str:
-    """Prepend attached file contents to the task string as context."""
-    if not files:
-        return task
-    file_blocks: list[str] = []
-    for f in files:
-        content = _truncate_file_content(f.filename, f.content, _SERVER_MAX_FILE_CHARS)
-        if f.encoding == "base64":
-            file_blocks.append(
-                f"### File: {f.filename} [binary — base64-encoded]\n"
-                f"```\n{content}\n```"
-            )
-        else:
-            file_blocks.append(f"### File: {f.filename}\n```\n{content}\n```")
-    return "## Attached files (input context)\n\n" + "\n\n".join(file_blocks) + f"\n\n## Task\n{task}"
-
 
 async def _run_pipeline(task: str, files: list[FileInput] | None = None) -> str:
     """Run the multi-agent LangGraph pipeline and return the assembled output."""
-    task_with_files = _build_task_with_files(task, files)
-    # Pre-search with yotta, same as the streaming path
-    yotta_results = await call_yotta(task_with_files)
+    # Decode/extract file text first — fail fast on a bad upload before
+    # spending a search call on it.
+    files_state = build_files_state(files)
+    task_string = build_task_string(task, files)
+    # Search on the bare task — not the file-laden string, matching the streaming path.
+    yotta_results = await call_yotta(task)
     clean_findings = parse_yotta_results(yotta_results)
 
     # Pass search results as a dedicated state field instead of embedding
@@ -169,9 +146,10 @@ async def _run_pipeline(task: str, files: list[FileInput] | None = None) -> str:
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
     result = await api_graph.ainvoke(
         {
-            "task": f"Query: {task_with_files}",
+            "task": task_string,
             "search_results": clean_findings,
             "current_datetime": get_current_datetime_str(),
+            "files": files_state,
         },
         config=config,
     )
@@ -200,6 +178,10 @@ async def run_pipeline(req: RunRequest):
     try:
         output = await _run_pipeline(req.task, req.files)
         return RunResponse(final_output=output)
+    except UnsupportedFileTypeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except EmptyExtractedTextError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(
             status_code=500,
