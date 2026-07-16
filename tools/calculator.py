@@ -44,6 +44,12 @@ CONSTANTS: Dict[str, float] = {
 
 
 def _fact(n: float) -> float:
+    if math.isnan(n):
+        return math.nan
+    if math.isinf(n):
+        if n > 0:
+            return math.inf
+        raise ValueError("Factorial of negative number")
     n = round(n)
     if n < 0:
         raise ValueError("Factorial of negative number")
@@ -65,16 +71,28 @@ def _lcm(a: float, b: float) -> float:
 
 def _ncr(n: float, r: float) -> float:
     n, r = round(n), round(r)
-    if r < 0 or r > n:
+    if n < 0 or r < 0 or r > n:
         return 0.0
-    return float(_fact(n) / (_fact(r) * _fact(n - r)))
+    try:
+        return float(math.comb(n, r))
+    except OverflowError:
+        return math.inf
 
 
 def _npr(n: float, r: float) -> float:
     n, r = round(n), round(r)
-    if r < 0 or r > n:
+    if n < 0 or r < 0 or r > n:
         return 0.0
-    return float(_fact(n) / _fact(n - r))
+    try:
+        return float(math.perm(n, r))
+    except OverflowError:
+        return math.inf
+
+
+def _round(x: float, ndigits: Optional[float] = None) -> float:
+    if ndigits is None:
+        return float(round(x))
+    return float(round(x, round(ndigits)))
 
 
 FUNCTIONS: Dict[str, Callable] = {
@@ -97,7 +115,7 @@ FUNCTIONS: Dict[str, Callable] = {
     "tanh":  math.tanh,
     "ceil":  math.ceil,
     "floor": math.floor,
-    "round": round,
+    "round": _round,
     "sign":  lambda x: math.copysign(1, x) if x != 0 else 0.0,
     "max":   max,
     "min":   min,
@@ -135,14 +153,19 @@ def tokenize(expr: str) -> List[Token]:
         # Number (int or float, optional scientific notation)
         if ch.isdigit() or (ch == '.' and i + 1 < len(expr) and expr[i+1].isdigit()):
             j = i
-            while j < len(expr) and (expr[j].isdigit() or expr[j] == '.'):
+            seen_dot = False
+            while j < len(expr) and (expr[j].isdigit() or (expr[j] == '.' and not seen_dot)):
+                if expr[j] == '.':
+                    seen_dot = True
                 j += 1
             if j < len(expr) and expr[j] in ('e', 'E'):
-                j += 1
-                if j < len(expr) and expr[j] in ('+', '-'):
-                    j += 1
-                while j < len(expr) and expr[j].isdigit():
-                    j += 1
+                k = j + 1
+                if k < len(expr) and expr[k] in ('+', '-'):
+                    k += 1
+                if k < len(expr) and expr[k].isdigit():
+                    j = k
+                    while j < len(expr) and expr[j].isdigit():
+                        j += 1
             tokens.append(Token('num', float(expr[i:j])))
             i = j
             continue
@@ -189,8 +212,10 @@ def tokenize(expr: str) -> List[Token]:
 # Grammar:
 #   expr     → add_sub
 #   add_sub  → mul_div  ( ('+' | '-') mul_div )*
-#   mul_div  → unary    ( ('*' | '/' | '^' | '%') unary )*
-#   unary    → '-' primary | '+' primary | primary '!'?
+#   mul_div  → unary    ( ('*' | '/' | '%') unary )*
+#   unary    → ('-' | '+') unary | power
+#   power    → postfix  ( ('^' | '**') unary )?     (right-associative)
+#   postfix  → primary '!'*
 #   primary  → NUMBER | CONST | FUNCTION '(' args ')' | '(' expr ')'
 #   args     → expr (',' expr)*
 
@@ -239,12 +264,11 @@ class Parser:
 
     def parse_mul_div(self) -> float:
         left = self.parse_unary()
-        while (t := self.peek()) and t.type == 'op' and t.value in ('*', '/', '^', '%', '**'):
+        while (t := self.peek()) and t.type == 'op' and t.value in ('*', '/', '%'):
             op = self.consume().value
             right = self.parse_unary()
             if op == '*':   result = left * right
             elif op == '/': result = left / right
-            elif op in ('^', '**'): result = left ** right
             elif op == '%': result = left % right
             self.steps.append(f"  {_fmt(left)} {op} {_fmt(right)} = {_fmt(result)}")
             left = result
@@ -252,18 +276,29 @@ class Parser:
 
     def parse_unary(self) -> float:
         t = self.peek()
-        if t and t.type == 'op' and t.value == '-':
-            self.consume()
-            return -self.parse_primary()
-        if t and t.type == 'op' and t.value == '+':
-            self.consume()
-            return self.parse_primary()
+        if t and t.type == 'op' and t.value in ('-', '+'):
+            op = self.consume().value
+            val = self.parse_unary()
+            return -val if op == '-' else val
+        return self.parse_power()
+
+    def parse_power(self) -> float:
+        left = self.parse_postfix()
+        if (t := self.peek()) and t.type == 'op' and t.value in ('^', '**'):
+            op = self.consume().value
+            right = self.parse_unary()
+            result = left ** right
+            self.steps.append(f"  {_fmt(left)} {op} {_fmt(right)} = {_fmt(result)}")
+            return result
+        return left
+
+    def parse_postfix(self) -> float:
         val = self.parse_primary()
-        if (t := self.peek()) and t.type == 'op' and t.value == '!':
+        while (t := self.peek()) and t.type == 'op' and t.value == '!':
             self.consume()
             result = _fact(val)
             self.steps.append(f"  fact({_fmt(val)}) = {_fmt(result)}")
-            return result
+            val = result
         return val
 
     def parse_primary(self) -> float:
@@ -317,22 +352,7 @@ def _fmt(n: float) -> str:
         return str(int(n))
     return f"{n:.8g}"
 
-@tool
-def calculate(expr: str, verbose: bool = True) -> float:
-    """
-    Parse and evaluate an expression string. Used for calculating mathematical equations. Use this tool over reasoning with numbers. Write expressions in python syntax. Use parentheses to group operations and control order of evaluation. Use functions for more complex calculations.
-
-    Args:
-        expr:    The expression to evaluate, e.g. "2 + 3 * sqrt(10) - e / pi"
-        verbose: If True, print step-by-step breakdown.
-        Operators : + - * / ^ % !
-        Constants : pi, e, phi, tau, sqrt2, ln2, ...
-        Functions : sqrt, sin, cos, log, exp, fact, nCr, ...
-
-    Returns:
-        The numeric result as a float.
-    """
-    
+def _evaluate(expr: str, verbose: bool = True) -> float:
     tokens = tokenize(expr)
     parser = Parser(tokens)
     result = parser.parse()
@@ -346,6 +366,29 @@ def calculate(expr: str, verbose: bool = True) -> float:
         print(f"Result     : {_fmt(result)}\n")
 
     return result
+
+
+@tool
+def calculate(expr: str, verbose: bool = True):
+    """
+    Parse and evaluate a mathematical expression string. Used for calculating mathematical equations. Use this tool over reasoning with numbers. Use parentheses to group operations and control order of evaluation. Use functions for more complex calculations. Note: this is calculator syntax, not Python — '^' (or '**') is exponentiation and '!' is postfix factorial; '//' is not supported.
+
+    Args:
+        expr:    The expression to evaluate, e.g. "2 + 3 * sqrt(10) - e / pi"
+        verbose: If True, print step-by-step breakdown.
+        Operators : + - * / ^ (power) % ! (factorial)
+        Constants : pi, e, phi, tau, sqrt2, ln2, ...
+        Functions : sqrt, sin, cos, log, exp, fact, nCr, ...
+
+    Returns:
+        The numeric result as a float, or an error message string if the
+        expression is invalid.
+    """
+
+    try:
+        return _evaluate(expr, verbose)
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, TypeError) as err:
+        return f"Error: {err}"
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +412,8 @@ def repl():
             print("Bye.")
             break
         try:
-            calculate(expr)
-        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError) as err:
+            _evaluate(expr)
+        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, TypeError) as err:
             print(f"Error: {err}\n")
 
 
@@ -378,8 +421,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         expr = " ".join(sys.argv[1:])
         try:
-            calculate(expr)
-        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError) as err:
+            _evaluate(expr)
+        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, TypeError) as err:
             print(f"Error: {err}")
             sys.exit(1)
     else:
