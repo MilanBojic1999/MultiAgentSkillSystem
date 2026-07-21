@@ -60,7 +60,6 @@ agent_skills/
 ├── agents/
 │   ├── __init__.py              # Exports orchestrator, sub-agents, loads roster from config
 │   ├── agent_config.json        # Unified agent definitions (desc, tools, MCP servers)
-│   ├── agent_rouster.json       # Legacy agent roster (kept for compatibility)
 │   ├── orchestrator_node.py     # Orchestrator: plans task decomposition
 │   └── sub_agents_nodes.py      # Sub-agent execution (sequential + async)
 │
@@ -105,13 +104,20 @@ python -m venv venv
 source venv/bin/activate   # Linux / WSL
 # or: venv\Scripts\activate  (Windows)
 
-# Install dependencies
+# Install the package (editable) with dev dependencies (pytest, ruff)
+pip install -e ".[dev]"
+
+# Alternative: pinned lockfile install (reproducible, e.g. for Docker)
 pip install -r requirements.txt
 ```
 
 ### 3. Configuration
 
-Copy or edit the `.env` file with your API credentials:
+Copy `.env.example` to `.env` and fill in your API credentials:
+
+```bash
+cp .env.example .env
+```
 
 ```bash
 # LLM backend (any OpenAI-compatible API works)
@@ -119,7 +125,11 @@ LLM_URL="https://api.deepseek.com"
 LLM_MODEL="deepseek-v4-flash"
 LLM_KEY="sk-your-api-key-here"
 
-# Path to the unified agent configuration file
+# Orchestrator planner temperature (low = more reliable JSON)
+ORCHESTRATOR_TEMPERATURE=0.1
+
+# Path to the unified agent configuration file (optional — defaults to
+# agents/agent_config.json relative to the repo root if unset)
 CONFIG_PATH="agents/agent_config.json"
 
 # LangSmith tracing (optional — remove or set to false to disable)

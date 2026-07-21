@@ -4,6 +4,7 @@ from langgraph.types import RetryPolicy
 from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
 from agents.sub_agents_nodes import sub_agent_node
+from assemble_node import assemble_node
 
 
 def should_continue(state: dict) -> str:
@@ -12,16 +13,6 @@ def should_continue(state: dict) -> str:
     if len(results) < len(plan):
         return "sub_agent"
     return "assemble"
-
-
-def assemble_node(state: dict) -> dict:
-    plan = state.get("plan", [])
-    results = state.get("results", {})
-    parts = [
-        f"## Step {s['step']}: {s['subtask']}\n{results.get(s['step'], '')}"
-        for s in plan
-    ]
-    return {"final_output": "\n\n".join(parts)}
 
 
 builder = StateGraph(AgentState)

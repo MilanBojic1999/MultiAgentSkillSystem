@@ -34,8 +34,9 @@ def create_mcp_client(agent_name: str) -> MultiServerMCPClient | None:
     Return an MCP client pre-configured with the servers owned by *agent_name*,
     or ``None`` if the agent has no MCP servers.
 
-    The caller MUST use ``async with client:`` around tool usage to keep the
-    MCP transport alive for the duration of the agent call.
+    Servers use the ``streamable_http`` transport, which opens a connection
+    per call (``client.get_tools()``) rather than requiring a long-lived
+    ``async with client:`` block.
     """
     agent_cfg = AGENT_CONFIG.get(agent_name, {})
     server_map: dict[str, str] = agent_cfg.get("mcp_servers", {})

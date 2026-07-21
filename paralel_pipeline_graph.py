@@ -5,6 +5,10 @@ from langgraph.types import RetryPolicy
 from agent_states import AgentState
 from agents.orchestrator_node import orchestrator_agent
 from agents.sub_agents_nodes import run_sub_agent_async
+from assemble_node import assemble_node
+
+from utils.logger import log_event
+
 
 def fan_out_router(state: dict):
     """
@@ -31,25 +35,28 @@ def fan_out_router(state: dict):
 
 
 async def parallel_sub_agent_node(state: dict) -> dict:
-    step_num, output = await run_sub_agent_async(state["step"], state["results"], state.get("current_datetime", ""))
+    try:
+        step_num, output = await run_sub_agent_async(state["step"], state["results"], state.get("current_datetime", ""))
 
-    return {"results": {step_num: output}}
+        return {"results": {step_num: output}}
+    except Exception as e:
+        log_event("sub_agent_step_failed", step=state["step"]["step"], error=str(e))
+        return {"results": {state["step"]["step"]: f"[STEP FAILED] {e}"},
+                "failed_steps": [state["step"]["step"]]}
 
-def assemble_node(state: dict) -> dict:
-    plan = state.get("plan", [])
-    results = state.get("results", {})
-    parts   = [f"## Step {s['step']}: {s['subtask']}\n{results.get(s['step'], '')}"
-               for s in plan]
-    return {"final_output": "\n\n".join(parts)}
+def scheduler_node(state: dict) -> dict:
+    return {}
 
 builder = StateGraph(AgentState)
-builder.add_node("orchestrator", orchestrator_agent)
+builder.add_node("orchestrator", orchestrator_agent, retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
 builder.add_node("parallel_sub_agent",    parallel_sub_agent_node, retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
 builder.add_node("assemble",     assemble_node)
+builder.add_node("scheduler", scheduler_node)
 
 builder.set_entry_point("orchestrator")
-builder.add_conditional_edges("orchestrator", fan_out_router, {"assemble": "assemble", Send: "parallel_sub_agent"})
-builder.add_conditional_edges("parallel_sub_agent", fan_out_router, {"assemble": "assemble", Send: "parallel_sub_agent"})
+builder.add_conditional_edges("orchestrator", "scheduler")
+builder.add_conditional_edges("parallel_sub_agent", "scheduler")
+builder.add_conditional_edges("scheduler", fan_out_router, {"assemble": "assemble", Send: "parallel_sub_agent"})
 builder.add_edge("assemble", END)
 
 memory = MemorySaver()

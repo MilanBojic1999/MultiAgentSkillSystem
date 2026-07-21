@@ -18,11 +18,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_CONFIG_PATH = os.getenv("CONFIG_PATH")
+_DEFAULT_CONFIG_PATH = Path(__file__).parent / "agents" / "agent_config.json"
+_CONFIG_PATH = os.getenv("CONFIG_PATH") or str(_DEFAULT_CONFIG_PATH)
 
 
 def _load_raw_config() -> dict[str, dict[str, Any]]:
     """Read and parse the unified agent-configuration JSON file."""
+    if not Path(_CONFIG_PATH).is_file():
+        raise FileNotFoundError(
+            f"Agent config not found at '{_CONFIG_PATH}'. "
+            f"Set CONFIG_PATH in your .env (see .env.example), or place the "
+            f"config at '{_DEFAULT_CONFIG_PATH}'."
+        )
     with open(_CONFIG_PATH, encoding="utf-8") as fh:
         return json.load(fh)
 

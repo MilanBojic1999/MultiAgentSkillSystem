@@ -1,5 +1,4 @@
 import asyncio
-from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills, load_skills_body
@@ -7,7 +6,7 @@ from tools.agent_tools import AGENT_TOOLS
 from utils.validator import validate_step_output
 from agent_mcp_tools import create_mcp_client
 from dotenv import load_dotenv
-import os
+from llm_factory import create_llm
 from utils.logger import log_event
 
 from agents import AGENT_ROSTER
@@ -16,17 +15,8 @@ from agent_states import get_current_datetime_str
 
 load_dotenv()
 
-LLM_URL = os.getenv("LLM_URL")
-LLM_MODEL = os.getenv("LLM_MODEL")
-LLM_KEY = os.getenv("LLM_KEY")
-
-llm = ChatOpenAI(
-    model=LLM_MODEL, # Must match the --model flag you gave vLLM
-    openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
-    openai_api_base=LLM_URL, 
-    max_tokens=4048,
-    temperature=0.9
-)
+# Sub-agents keep the creative default temperature (Phase 1.3 factory default).
+llm = create_llm()
 
 
 _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
@@ -54,7 +44,6 @@ async def run_sub_agent_async(
 ) -> tuple[int, str]:
     """Run one sub-agent step. Returns (step_number, output_text)."""
     agent_name   = step["agent"]
-    agent_cfg    = next(a_name for a_name in AGENT_ROSTER.keys() if a_name == agent_name)
     step_num     = step["step"]
 
     # Activate only the skills this step needs
@@ -72,7 +61,7 @@ async def run_sub_agent_async(
     dt = current_datetime or get_current_datetime_str()
 
     system_prompt = _build_system_prompt(
-        agent_name, AGENT_ROSTER[agent_cfg], skill_bodies, context, dt
+        agent_name, AGENT_ROSTER[agent_name], skill_bodies, context, dt
     )
 
     # Combine native tools + MCP tools for this agent
@@ -80,8 +69,14 @@ async def run_sub_agent_async(
     mcp_client = create_mcp_client(agent_name)
 
 
-    print(f"Running Step {step_num} with agent '{agent_name}' using skills {requested} and context from steps {step.get('depends_on', [])}\n-----------\n{step["subtask"]}")
-    log_event("run_sub_agent_start", step_num=step_num, agent_name=agent_name, skills=requested, dependencies=step.get("depends_on", []))
+    log_event(
+        "run_sub_agent_start",
+        step_num=step_num,
+        agent_name=agent_name,
+        skills=requested,
+        dependencies=step.get("depends_on", []),
+        subtask=step["subtask"],
+    )
 
 
     if mcp_client is not None:
@@ -103,9 +98,12 @@ async def run_sub_agent_async(
         result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
 
 
-    log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name, tools_used=result["messages"][-1].tool_calls)
-    print(agent_name, "-------------", result["messages"][-1])
-    print("+"*50)
+    tools_used = [
+        call
+        for message in result["messages"]
+        for call in getattr(message, "tool_calls", None) or []
+    ]
+    log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name, tools_used=tools_used)
     output = result["messages"][-1].content
     output = validate_step_output(step_num, agent_name, output)
     return step_num, output
