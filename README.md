@@ -196,6 +196,25 @@ docker compose down
 4. Sub-agents execute using their assigned **tools** and activated **skills**
 5. The **Assembler** merges all step outputs into the final result
 
+## Running the tests
+
+The suite is pure-Python and hermetic — **no network, no `.env`, and no live
+LLM are required.** It stubs the model with a fake chat client and pins dummy
+env vars in `tests/conftest.py`, so it passes on a fresh clone:
+
+```bash
+pip install -e ".[dev]"   # installs pytest + ruff
+pytest                    # runs the full suite
+ruff check tests/         # lint the test code
+```
+
+Tests live in `tests/` (one module per production module). A few tests are
+marked `xfail` — they document behavior that isn't implemented yet (the two
+known bugs in `TESTING_GUIDE.md`, the blocked-forever deadlock guards, and the
+`failed_steps` state field) and flip to passing as those fixes land. Tests that
+would need a live endpoint are marked `@pytest.mark.integration` and excluded by
+default; see `TESTING_GUIDE.md` for the full specification.
+
 ## How It Works
 
 ### Unified Agent Configuration

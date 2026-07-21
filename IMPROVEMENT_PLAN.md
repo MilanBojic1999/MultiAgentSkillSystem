@@ -292,26 +292,68 @@ server, and tests all run from any working directory.
 
 ### 2.3 Tests + CI
 
+> **Full specification: [`TESTING_GUIDE.md`](TESTING_GUIDE.md)** — layout,
+> conftest design, per-module case tables, code sketches, and the CI workflow.
+> This section is the summary; the guide is what a test developer implements
+> from.
+
 **Problem.** Zero tests. The most bug-prone logic (routers, dependency
 scheduling, plan validation, skill parsing) is pure Python that needs no LLM —
-yet the only verification today is a live vLLM endpoint.
+yet the only verification today is a live vLLM endpoint. The cost is already
+visible: the current working tree contains two bugs that any of the tests
+below would have caught immediately (see "Known bugs" in the guide):
 
-**Fix.** `tests/` with pytest:
+1. `paralel_pipeline_graph.py:57-58` passes the *string* `"scheduler"` to
+   `add_conditional_edges`, which requires a callable — the module raises
+   `TypeError` at import (verified on langgraph 1.2.4). Those two edges must
+   be plain `add_edge` calls — which is precisely the 1.1 fix. Line 59 also
+   still uses the `Send` class as a path-map key instead of a plain list.
+2. `agents/orchestrator_node.py:85` calls `validate_plan(plan)` but the
+   signature is `validate_plan(plan, known_agents, known_skills)` — every run
+   raises `TypeError`, masked by the broad `except` into a misleading
+   `"Failed to parse JSON response"`.
 
-- `conftest.py` — set dummy `LLM_*` env defaults (`os.environ.setdefault`)
-  *before* pipeline imports, so module import doesn't require a real endpoint.
-- `test_plan_validator.py` — all cases from 1.2.
-- `test_fan_out_router.py` — given a plan + partial results, asserts which
-  steps are dispatched / when `"assemble"` is returned / that blocked-forever
-  states raise.
-- `test_dispatch_dedup.py` — the 1.1 regression test: real topology + stub
-  worker node that counts invocations; asserts exactly-once execution per step.
-- `test_skill_loader.py` — frontmatter/body parsing against a tmp skills dir.
+**Fix.** `tests/` with pytest, in this priority order (regression tests for
+the two bugs above land *first*, red, with the fixes in the same PRs):
 
-CI: GitHub Actions workflow — `ruff check .` + `pytest` on push/PR.
+- `conftest.py` — dummy `LLM_*` env defaults set **before** any pipeline
+  import (modules construct `ChatOpenAI` clients and load skills/config at
+  import time), CWD pinned to the repo root (`skill_loader.root_dir` is
+  CWD-relative), `create_llm.cache_clear()` fixture. The guide's
+  "import-time side-effect" table documents every landmine.
+- `test_dispatch_dedup.py` — the 1.1 regression: module-imports test (red
+  today, bug 1), exactly-once dispatch on the corrected topology built from
+  stub nodes + the real `fan_out_router`/`scheduler_node` (parametrized over
+  linear, diamond, and wide-fan plans), and the 1.4 failure-containment case
+  (which also flags that `failed_steps` is still missing from `AgentState`).
+- `test_orchestrator_node.py` — `GenericFakeChatModel` monkeypatched over the
+  module-global `llm` (red today, bug 2): valid plan validated and returned,
+  fenced JSON, empty plan, non-JSON, unknown agent, injection-flagged task.
+- `test_plan_validator.py` — all 1.2 acceptance cases: valid/normalized,
+  schema errors, duplicate steps, unknown agent, unknown-skill soft-drop,
+  self/dangling/cyclic `depends_on`, `PlanValidationError` is a `ValueError`.
+- `test_fan_out_router.py` / `test_should_continue.py` — routing as pure
+  functions: layer-by-layer dispatch, `"assemble"` when done; blocked-forever
+  guard encoded as `xfail` until the 1.2 guards land.
+- `test_skill_loader.py`, `test_json_utils.py`, `test_step_output_validator.py`,
+  `test_sanitize.py`, `test_config_loader.py`, `test_llm_factory.py` — pure
+  parsing/validation utilities; `sanitize` tests pin the false-positive
+  boundary, `config_loader` tests use fresh-import machinery.
+
+Conventions: `pytest.raises(..., match=...)` everywhere (error messages are
+contract), `xfail(strict=False)` for desired-but-unimplemented guards, an
+`integration` marker (excluded by default) reserved for future live-endpoint
+tests, `[tool.pytest.ini_options]` in `pyproject.toml`.
+
+CI: `.github/workflows/ci.yml` — checkout, Python 3.13 with pip cache,
+`pip install -e ".[dev]"`, `ruff check .`, `pytest -q` on push/PR. No secrets,
+no services; expect an initial batch of ruff findings, fixed in a dedicated
+commit.
 
 **Acceptance criteria.** `pytest` passes locally without any network access or
-`.env` file; CI is green on the PR that introduces it.
+`.env` file; both known-bug regression tests failed before their fixes and
+pass after; CI is green on the PR that introduces it; README gains a
+"Running the tests" section in the same PR.
 
 ### 2.4 Documentation consolidation + contributor recipes
 

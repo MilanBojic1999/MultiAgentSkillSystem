@@ -24,6 +24,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = ["integration: needs a live LLM endpoint; excluded by default"]
+
 [tool.setuptools]
 py-modules = [
     "agent_mcp_tools",
