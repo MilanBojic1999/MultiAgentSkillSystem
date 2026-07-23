@@ -1,12 +1,13 @@
 """The plan 1.1 regression suite: exactly-once dispatch.
 
-Two failure modes are pinned here:
+Two things are pinned here:
 
-  * Bug 1  — ``paralel_pipeline_graph`` does not import (string path passed to
-             ``add_conditional_edges``). ``test_parallel_graph_module_imports``.
-  * Plan 1.1 — the scheduler must dispatch each step exactly once even when
-             several steps join on a common dependency (the diamond). A
-             regressed topology re-dispatches already-completed steps.
+  * The parallel graph imports and compiles (``test_parallel_graph_module_imports``)
+    — a bad path map / string edge would break this.
+  * The scheduler must dispatch each step exactly once even when several steps
+    join on a common dependency (the diamond). A regressed topology (conditional
+    edge hung off the worker instead of the scheduler) re-dispatches
+    already-completed steps.
 
 The topology built in ``_build_graph`` MUST mirror the wiring in
 ``paralel_pipeline_graph.py`` (plain edges into ``scheduler``; a single
@@ -14,25 +15,23 @@ conditional edge out of it). Until Phase 3 extracts a ``build(...)`` factory,
 this duplication is the price of testability — the two must change together.
 """
 
+import asyncio
 from collections import Counter
 
 import pytest
 from langgraph.graph import END, StateGraph
 
-from agent_states import AgentState
+from agents.agent_states import AgentState
 from assemble_node import assemble_node
 from tests._helpers import import_parallel_or_xfail
 from tests.plans import DIAMOND_PLAN, LINEAR_PLAN, WIDE_PLAN
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="Bug 1: string path on paralel_pipeline_graph.py:57-58 breaks import",
-)
 def test_parallel_graph_module_imports():
-    # Flips to XPASS when the string paths on paralel_pipeline_graph.py:57-58
-    # become plain add_edge calls; make it strict then and drop this marker.
-    import paralel_pipeline_graph  # noqa: F401
+    # Item 1.1: the parallel graph compiles and the root import-shim resolves.
+    import paralel_pipeline_graph
+
+    assert paralel_pipeline_graph.graph is not None
 
 
 def _build_graph(plan, worker):
@@ -74,22 +73,22 @@ def test_each_step_dispatched_exactly_once(plan):
     assert f"out-{last}" in out["final_output"]
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="Bug 1 (import) + AgentState.failed_steps field missing (plan 1.4)",
-)
-def test_failed_step_is_contained_and_recorded(monkeypatch):
-    pg = import_parallel_or_xfail()
+def test_failed_step_is_contained_and_recorded():
+    # Plan 1.4 containment, verified on the real worker node: a failing step is
+    # recorded as a result and flagged in failed_steps (an AgentState channel as
+    # of 3.1) instead of killing the run. The failing step is injected through
+    # the worker factory's run_step seam rather than by patching a module global.
+    from agents.sub_agents_nodes import make_parallel_sub_agent_node
 
     async def fake_run(step, results, current_datetime=""):
         if step["step"] == 2:
             raise RuntimeError("boom")
         return step["step"], f"out-{step['step']}"
 
-    monkeypatch.setattr(pg, "run_sub_agent_async", fake_run)
-
-    graph = _build_graph(DIAMOND_PLAN, pg.parallel_sub_agent_node)
-    out = graph.invoke({"task": "t", "current_datetime": ""})
+    worker = make_parallel_sub_agent_node(run_step=fake_run)
+    graph = _build_graph(DIAMOND_PLAN, worker)
+    # The real worker node is async, so the graph must be driven with ainvoke.
+    out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}))
 
     assert out["final_output"]  # run still completes
     assert "[STEP FAILED]" in out["final_output"]

@@ -10,8 +10,7 @@ from llm_factory import create_llm
 from utils.logger import log_event
 
 from agents import AGENT_ROSTER
-from agent_states import get_current_datetime_str
-
+from agents.agent_states import get_current_datetime_str, AgentState, WorkerState
 
 load_dotenv()
 
@@ -109,22 +108,64 @@ async def run_sub_agent_async(
     return step_num, output
 
 
-def sub_agent_node(state: dict) -> dict:
-    """
-    Sequential node: executes the next uncompleted step in the plan.
-    """
 
-    plan    = state["plan"]
-    results = state.get("results", {})
-    current_datetime = state.get("current_datetime", "")
-    # Find the next step whose dependencies are all resolved
-    for step in plan:
-        if step["step"] in results:
-            continue
-        deps_met = all(d in results for d in step.get("depends_on", []))
-        if deps_met:
-            step_num, output = asyncio.run(run_sub_agent_async(step, results, current_datetime))
+def make_sub_agent_node(run_step=None):
+    """Factory for the sequential worker node.
 
+    ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
+    coroutine ``(step, results, current_datetime) -> (step_num, output)``.
+    """
+    run_step = run_step or run_sub_agent_async
+
+    async def sub_agent_node(state: AgentState) -> dict:
+        """
+        Sequential node: executes the next uncompleted step in the plan.
+        """
+
+        plan    = state["plan"]
+        results = state.get("results", {})
+        current_datetime = state.get("current_datetime", "")
+        # Find the next step whose dependencies are all resolved
+        for step in plan:
+            if step["step"] in results:
+                continue
+            deps_met = all(d in results for d in step.get("depends_on", []))
+            if deps_met:
+                step_num, output = asyncio.run(run_step(step, results, current_datetime))
+
+                return {"results": {step_num: output}}
+
+        return {}
+
+    return sub_agent_node
+
+
+def make_parallel_sub_agent_node(run_step=None):
+    """Factory for the parallel worker node (one ``Send`` task per ready step).
+
+    ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
+    coroutine ``(step, results, current_datetime) -> (step_num, output)``.
+    Failure is contained here (Phase 1.4): an exhausted step is recorded as a
+    result and flagged in ``failed_steps`` instead of killing the whole graph.
+    """
+    run_step = run_step or run_sub_agent_async
+
+    async def parallel_sub_agent_node(state: WorkerState) -> dict:
+        try:
+            step_num, output = await run_step(
+                state["step"], state["results"], state.get("current_datetime", "")
+            )
             return {"results": {step_num: output}}
+        except Exception as e:
+            log_event("sub_agent_step_failed", step=state["step"]["step"], error=str(e))
+            return {"results": {state["step"]["step"]: f"[STEP FAILED] {e}"},
+                    "failed_steps": [state["step"]["step"]]}
 
-    return {}
+    return parallel_sub_agent_node
+
+
+# Import-compat shims: default env-configured instances. Callers (graphs,
+# agents/__init__) keep importing these names; delete once every caller builds
+# its own via the factories above. (Phase 3.1)
+sub_agent_node = make_sub_agent_node()
+parallel_sub_agent_node = make_parallel_sub_agent_node()

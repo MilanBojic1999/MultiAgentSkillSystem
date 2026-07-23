@@ -11,14 +11,10 @@ from llm_factory import create_llm
 import re
 
 from agents import AGENT_ROSTER
-from agent_states import get_current_datetime_str
+from agents.agent_states import get_current_datetime_str
 
 
 load_dotenv()
-
-# The orchestrator only emits strict JSON, so it runs at low temperature —
-# creative sampling here is the main source of malformed plans.
-llm = create_llm(temperature=float(os.getenv("ORCHESTRATOR_TEMPERATURE", "0.1")))
 
 
 SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
@@ -55,35 +51,51 @@ Current datetime: {current_datetime}
 }}
 """.strip()
 
-def orchestrator_agent(state: dict):
-    user_task = state["task"]
-    current_datetime = state.get("current_datetime") or get_current_datetime_str()
-    skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items()])
-    agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()])
 
-    system_prompt = ORCHESTRATOR_SYSTEM.format(
-        agent_roster=agent_roster_str,
-        skill_index=skill_summery,
-        current_datetime=current_datetime,
-    )
-    user_task = sanitize_content(user_task, "user")
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_task),
-    ]
-    
-    log_event("orchestrator_agent_start", user_task=user_task)
+def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
+    # The orchestrator only emits strict JSON, so it runs at low temperature —
+    # creative sampling here is the main source of malformed plans.
+    llm = llm or create_llm(temperature=float(os.getenv("ORCHESTRATOR_TEMPERATURE", "0.1")))
+    roster = agent_roster or AGENT_ROSTER
+    index = skill_index or SKILL_INDEX
 
-    response = llm.invoke(messages)
-    try:
-        plan_json = extract_json(response.content)
-        plan = plan_json.get("plan", [])
-        if not isinstance(plan, list) or len(plan) == 0:
-            raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
-        log_event("orchestrator_agent_plan", pipeline_plan=plan)
+    def orchestrator_agent(state: dict):
+        user_task = state["task"]
+        current_datetime = state.get("current_datetime") or get_current_datetime_str()
+        skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in index.items()])
+        agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in roster.items()])
 
-        plan = validate_plan(plan)
+        system_prompt = ORCHESTRATOR_SYSTEM.format(
+            agent_roster=agent_roster_str,
+            skill_index=skill_summery,
+            current_datetime=current_datetime,
+        )
+        user_task = sanitize_content(user_task, "user")
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_task),
+        ]
+        
+        log_event("orchestrator_agent_start", user_task=user_task)
 
-        return {"plan": plan, "results": {}, "current_step": 0}
-    except Exception as e:
-        raise ValueError(f"Failed to parse JSON response: {e}")
+        response = llm.invoke(messages)
+        try:
+            plan_json = extract_json(response.content)
+            plan = plan_json.get("plan", [])
+            if not isinstance(plan, list) or len(plan) == 0:
+                raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
+            log_event("orchestrator_agent_plan", pipeline_plan=plan)
+
+            plan = validate_plan(plan, set(roster), set(index))
+
+            return {"plan": plan, "results": {}, "current_step": 0}
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON response: {e}")
+
+    return orchestrator_agent
+
+
+# Import-compat shim: the default env-configured instance. Callers (graphs,
+# agents/__init__) keep importing `orchestrator_agent`; delete once every
+# caller builds its own via make_orchestrator_agent(). (Phase 3.1)
+orchestrator_agent = make_orchestrator_agent()

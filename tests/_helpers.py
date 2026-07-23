@@ -18,18 +18,15 @@ def fake_llm(payload) -> GenericFakeChatModel:
 
 
 def import_parallel_or_xfail():
-    """Import ``paralel_pipeline_graph`` or xfail the calling test.
+    """Return the parallel-graph module, or xfail if it cannot be imported.
 
-    The module builds *and compiles* its graph at import time, and that wiring
-    is currently broken (Bug 1 in docs/history/TESTING_GUIDE.md: string path passed to
-    ``add_conditional_edges``). The pure functions we want to test are defined
-    before the failing lines, but a failed import removes the module from
-    ``sys.modules`` entirely — so there is no way to reach them until Bug 1 is
-    fixed. Calling this marks the test xfail imperatively; once the wiring is
-    corrected the import succeeds and the real assertions run.
+    Since item 1.1 the module imports and compiles cleanly, so this is normally
+    a passthrough — the dedicated ``test_parallel_graph_module_imports`` is what
+    guards import regressions loudly. The xfail branch remains only as a safety
+    net for tests that assert on the pure router/scheduler functions.
     """
     try:
         import paralel_pipeline_graph as pg
-    except Exception as e:  # pragma: no cover - path exercised only while red
-        pytest.xfail(f"Bug 1: paralel_pipeline_graph does not import: {e}")
+    except Exception as e:  # pragma: no cover - safety net only
+        pytest.xfail(f"paralel_pipeline_graph does not import: {e}")
     return pg

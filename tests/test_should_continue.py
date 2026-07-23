@@ -7,7 +7,7 @@ recursion limit.
 
 import pytest
 
-from pipeline_graph import should_continue
+from graphs.sequential_pipeline_graph import should_continue
 from tests.plans import LINEAR_PLAN, step
 
 
