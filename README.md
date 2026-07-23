@@ -49,13 +49,21 @@ agent_skills/
 ├── api_client.py                # CLI client for the API (zero dependencies)
 ├── agent_states.py              # Shared state definition (TypedDict)
 ├── agent_mcp_tools.py           # MCP client factory (reads config from agent_config.json)
+├── assemble_node.py             # Shared assemble node (merges step outputs)
+├── llm_factory.py               # create_llm(...) — the single ChatOpenAI construction site
 ├── skill_loader.py              # SKILL.md file loader (YAML frontmatter + body)
 ├── config_loader.py             # Unified agent-config loader + validator
-├── requirements.txt             # Python dependencies
-├── .env                         # LLM config, LangSmith tracing, config path
+├── pyproject.toml               # Packaging metadata + dev deps + pytest config
+├── requirements.txt             # Pinned lockfile-style dependencies (Docker)
+├── .env.example                 # Documented template — copy to .env
 ├── Dockerfile                   # Container image definition
 ├── docker-compose.yml           # Docker Compose service definition
 ├── .dockerignore                # Docker build exclusions
+│
+├── docs/
+│   └── history/                 # Roadmap, test spec, and stale design-history docs
+│
+├── tests/                       # Hermetic pytest suite (no network / LLM needed)
 │
 ├── agents/
 │   ├── __init__.py              # Exports orchestrator, sub-agents, loads roster from config
@@ -78,6 +86,8 @@ agent_skills/
 │
 ├── utils/
 │   ├── logger.py                # JSON-structured logging
+│   ├── json_utils.py            # JSON extraction from LLM output
+│   ├── plan_validator.py        # Plan schema + semantic validation
 │   ├── senitize.py              # Prompt injection detection
 │   └── validator.py             # Sub-agent output validation
 │
@@ -210,10 +220,107 @@ ruff check tests/         # lint the test code
 
 Tests live in `tests/` (one module per production module). A few tests are
 marked `xfail` — they document behavior that isn't implemented yet (the two
-known bugs in `TESTING_GUIDE.md`, the blocked-forever deadlock guards, and the
-`failed_steps` state field) and flip to passing as those fixes land. Tests that
-would need a live endpoint are marked `@pytest.mark.integration` and excluded by
-default; see `TESTING_GUIDE.md` for the full specification.
+known bugs in [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md),
+the blocked-forever deadlock guards, and the `failed_steps` state field) and
+flip to passing as those fixes land. Tests that would need a live endpoint are
+marked `@pytest.mark.integration` and excluded by default; see
+[`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) for the full
+specification.
+
+## Contributor Recipes
+
+The four most common ways to extend the system. The first three are pure
+config/data changes — no pipeline code is touched.
+
+### Recipe 1 — Add a tool
+
+1. Create `tools/<name>.py` containing a LangChain `@tool`-decorated function:
+
+   ```python
+   from langchain_core.tools import tool
+
+   @tool
+   def word_count(text: str) -> int:
+       """Count the words in a piece of text."""
+       return len(text.split())
+   ```
+
+2. Assign it in `agents/agent_config.json` — add `"word_count"` to the
+   `"tools"` list of each agent that should have it.
+
+That's it. `tools/__init__.py` scans the directory at import time and collects
+every `@tool` function into `TOOL_REGISTRY` — no imports, exports, or
+registration code.
+
+### Recipe 2 — Add an agent
+
+Add one entry to `agents/agent_config.json` — no code:
+
+```json
+"coder": {
+    "description": "Software engineer skilled in writing and reviewing code.",
+    "tools": ["run_bash"],
+    "mcp_servers": {}
+}
+```
+
+The orchestrator discovers new agents automatically on the next run. Write the
+`description` for the planner, not for humans — it is the only signal the
+orchestrator has when deciding which agent gets a step. `mcp_servers` maps
+server name → URL; each MCP server must be owned by exactly one agent
+(`config_loader.py` enforces this at startup).
+
+### Recipe 3 — Add a skill
+
+Create `skills/<skill-name>/SKILL.md` with YAML frontmatter and a body:
+
+```markdown
+---
+name: my-skill
+description: >
+  What this skill does and when to use it. Shown to the orchestrator
+  so it knows when to activate the skill for a step.
+---
+
+Detailed guidance, rules, and examples. This body is injected into the
+sub-agent's system prompt when the skill is activated.
+```
+
+Discovered automatically by `skill_loader.py` — no registration.
+
+### Recipe 4 — Add a graph
+
+There is no graph factory yet (that is Phase 3 of the
+[improvement plan](docs/history/IMPROVEMENT_PLAN.md)), so a new topology is
+currently a copy-and-register job:
+
+1. **Copy** `paralel_pipeline_graph.py` to `my_graph.py` and change the
+   topology. All graphs share the same building blocks:
+
+   | Building block | Source |
+   |---|---|
+   | `AgentState` — shared state TypedDict | `agent_states.py` |
+   | `orchestrator_agent` — task → JSON plan | `agents/orchestrator_node.py` |
+   | `run_sub_agent_async` / `sub_agent_node` — run one plan step | `agents/sub_agents_nodes.py` |
+   | `assemble_node` — merge step outputs into `final_output` | `assemble_node.py` |
+
+2. **Register** it: `run_pipeline.py` and `api_server.py` both do
+   `from paralel_pipeline_graph import graph` — point that import at your
+   module instead.
+
+Topology rules (the hard-won lessons behind items 1.1–1.2 of the improvement
+plan):
+
+- Route workers back through a no-op **scheduler** node with plain `add_edge`
+  calls, and hang the *only* conditional edge off the scheduler. Conditional
+  edges are evaluated once per completed task and `Send` dispatches are not
+  deduplicated — a conditional edge attached directly to the worker
+  double-dispatches dependent steps.
+- Pass `add_conditional_edges` a callable router plus a plain **list** of
+  target names (`["assemble", "parallel_sub_agent"]`) — never a dict keyed on
+  the `Send` class, and never a node-name string in place of the router.
+- New state fields go in `AgentState` (`agent_states.py`); fields written by
+  parallel branches need a reducer annotation (see `results`) to merge.
 
 ## How It Works
 
@@ -252,18 +359,7 @@ Each agent entry has three fields:
 
 The `config_loader.py` module loads this file at import time and validates that no MCP server is claimed by more than one agent (each MCP server must have exactly one owner).
 
-**Adding a new agent:**
-
-1. Add an entry to `agents/agent_config.json`:
-   ```json
-   "coder": {
-       "description": "Software engineer skilled in writing and reviewing code.",
-       "tools": ["run_bash"],
-       "mcp_servers": {}
-   }
-   ```
-
-2. That's it — the orchestrator discovers new agents automatically on the next run. No other code changes needed.
+To add a new agent, see [Recipe 2](#recipe-2--add-an-agent).
 
 ### Skills
 
@@ -285,11 +381,7 @@ These instructions are injected into the sub-agent's system prompt.
 Write detailed guidance, rules, and examples here.
 ```
 
-**Adding a new skill:**
-
-1. Create a directory: `skills/my-new-skill/`
-2. Create `SKILL.md` inside it with the YAML frontmatter and body
-3. That's it — the skill is discovered automatically via `skill_loader.py`
+To add a new skill, see [Recipe 3](#recipe-3--add-a-skill).
 
 **Available skills:**
 
@@ -334,178 +426,8 @@ START → orchestrator → router → [sub_agent(s)] → router → assembler �
 - `pipeline_graph.py` runs one step at a time, in dependency order
 - `paralel_pipeline_graph.py` runs all ready steps concurrently via LangGraph's `Send` API (used by default)
 
-### Creating a Custom Graph
-
-The two pipeline graphs (`pipeline_graph.py` and `paralel_pipeline_graph.py`) serve as templates — you can mix their patterns or add entirely new nodes to build your own workflow. All graphs share the same building blocks:
-
-| Building block | Source | What it provides |
-|---|---|---|
-| `AgentState` | `agent_states.py` | Shared state TypedDict — add your own fields here |
-| `orchestrator_agent` | `agents/orchestrator_node.py` | Node function: decomposes a task into a JSON plan |
-| `run_sub_agent_async` | `agents/sub_agents_nodes.py` | Async function: runs one plan step with tools + skills |
-| `sub_agent_node` | `agents/sub_agents_nodes.py` | Sync wrapper: calls `run_sub_agent_async` for one step |
-| `StateGraph`, `END`, `Send` | `langgraph.graph` | Graph builder, terminal sentinel, and parallel fan-out |
-| `MemorySaver` | `langgraph.checkpoint.memory` | In-memory checkpointing (swap for `SqliteSaver` in production) |
-| `RetryPolicy` | `langgraph.types` | Auto-retry on node failure |
-
-#### Pattern 1: Sequential pipeline (`pipeline_graph.py`)
-
-The simplest graph — one step at a time, in dependency order.
-
-```
-  START → orchestrator → sub_agent → (loop: more steps?) → assemble → END
-```
-
-**Step-by-step construction:**
-
-```python
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import RetryPolicy
-from agent_states import AgentState
-from agents.orchestrator_node import orchestrator_agent
-from agents.sub_agents_nodes import sub_agent_node
-
-# 1. Define a router — decides "keep going" or "wrap up"
-def should_continue(state: dict) -> str:
-    plan = state.get("plan", [])
-    results = state.get("results", {})
-    if len(results) < len(plan):
-        return "sub_agent"        # more steps to do
-    return "assemble"             # all steps done
-
-# 2. Define an assembler — merges step outputs into final answer
-def assemble_node(state: dict) -> dict:
-    plan = state.get("plan", [])
-    results = state.get("results", {})
-    parts = [
-        f"## Step {s['step']}: {s['subtask']}\n{results.get(s['step'], '')}"
-        for s in plan
-    ]
-    return {"final_output": "\n\n".join(parts)}
-
-# 3. Build the graph
-builder = StateGraph(AgentState)
-builder.add_node("orchestrator", orchestrator_agent)
-builder.add_node("sub_agent", sub_agent_node,
-                 retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
-builder.add_node("assemble", assemble_node)
-
-# 4. Wire edges
-builder.set_entry_point("orchestrator")
-builder.add_conditional_edges("orchestrator", should_continue)
-builder.add_conditional_edges("sub_agent", should_continue)
-builder.add_edge("assemble", END)
-
-# 5. Compile with persistence
-graph = builder.compile(checkpointer=MemorySaver())
-```
-
-#### Pattern 2: Parallel pipeline with fan-out (`paralel_pipeline_graph.py`)
-
-This is the **default** pattern used by `run_pipeline.py` and `api_server.py`. Independent steps run concurrently via LangGraph's `Send` API — steps with satisfied dependencies all dispatch at once.
-
-```
-  START → orchestrator → router ──Send──→ parallel_sub_agent ─┐
-                            ──Send──→ parallel_sub_agent ─┤  (fan back to router)
-                            ──Send──→ parallel_sub_agent ─┘
-                            ──→ assemble (when all done) → END
-```
-
-**Key differences from the sequential pattern:**
-
-```python
-from langgraph.types import Send
-from agents.sub_agents_nodes import run_sub_agent_async
-
-# 1. Router uses Send to fan out ALL ready steps at once
-def fan_out_router(state: dict):
-    plan    = state["plan"]
-    results = state.get("results", {})
-    current_datetime = state.get("current_datetime", "")
-
-    # Find every step whose dependencies are all satisfied
-    ready = [
-        s for s in plan
-        if s["step"] not in results
-        and all(d in results for d in s.get("depends_on", []))
-    ]
-
-    if not ready:
-        return "assemble"          # all done
-
-    # Send each ready step in parallel — LangGraph merges results
-    return [
-        Send("parallel_sub_agent",
-             {"step": s, "results": results, "current_datetime": current_datetime})
-        for s in ready
-    ]
-
-# 2. Sub-agent node is async and receives a single step dict
-async def parallel_sub_agent_node(state: dict) -> dict:
-    step_num, output = await run_sub_agent_async(
-        state["step"], state["results"], state.get("current_datetime", "")
-    )
-    return {"results": {step_num: output}}
-
-# 3. The conditional-edge map has an extra key for Send
-builder = StateGraph(AgentState)
-builder.add_node("orchestrator", orchestrator_agent)
-builder.add_node("parallel_sub_agent", parallel_sub_agent_node,
-                 retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
-builder.add_node("assemble", assemble_node)
-
-builder.set_entry_point("orchestrator")
-builder.add_conditional_edges(
-    "orchestrator", fan_out_router,
-    {"assemble": "assemble", Send: "parallel_sub_agent"}   # ← note the extra Send key
-)
-builder.add_conditional_edges(
-    "parallel_sub_agent", fan_out_router,
-    {"assemble": "assemble", Send: "parallel_sub_agent"}
-)
-builder.add_edge("assemble", END)
-
-graph = builder.compile(checkpointer=MemorySaver())
-```
-
-#### Writing a runner for your graph
-
-Once your graph is built (in a `.py` file like `paralel_pipeline_graph.py`), create a runner that invokes it:
-
-```python
-# my_runner.py
-import sys
-import asyncio
-from my_custom_graph import graph          # your compiled graph
-from agent_states import get_current_datetime_str
-
-async def run_async(task: str) -> str:
-    config = {"configurable": {"thread_id": "my-run-1"}}
-    result = await graph.ainvoke(
-        {"task": task, "current_datetime": get_current_datetime_str()},
-        config=config,
-    )
-    return result.get("final_output", "No final output produced.")
-
-if __name__ == "__main__":
-    task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Default task here"
-    output = asyncio.run(run_async(task))
-    print(output)
-```
-
-#### What you can customize
-
-| Customization | Where to change it |
-|---|---|
-| **Add new state fields** | Extend `AgentState` in `agent_states.py` — new keys flow through all nodes automatically |
-| **Add a new node** | Write a node function `def my_node(state: dict) -> dict:` and call `builder.add_node("my_name", my_node)` |
-| **Change routing logic** | Edit the router function (`should_continue` / `fan_out_router`) — return a node name, `"assemble"`, or a `Send` list |
-| **Custom assemble step** | Replace `assemble_node` with your own — e.g., call an LLM to synthesize results instead of concatenating |
-| **Add pre-processing** | Insert a node between `START` and `orchestrator` — e.g., validate input, expand shorthand, load files |
-| **Add post-processing** | Insert a node between `assemble` and `END` — e.g., format output, write to a file, send a notification |
-| **Change checkpointing** | Replace `MemorySaver` with `SqliteSaver.from_conn_string("checkpoints.db")` for persistent state across restarts |
-| **Run via FastAPI** | Import your `graph` into `api_server.py` (replace the existing import) — all endpoints work unchanged |
+To build your own topology from these parts, see
+[Recipe 4](#recipe-4--add-a-graph).
 
 ### Tools
 
@@ -529,12 +451,7 @@ Tools are LangChain `@tool`-decorated Python functions that sub-agents can call.
 }
 ```
 
-**Adding a new tool:**
-
-1. Create a new `.py` file in `tools/` (e.g., `tools/web_search.py`)
-2. Define a function decorated with `@tool` from LangChain inside it
-3. Assign the tool name to agents in `agents/agent_config.json` under their `"tools"` list
-4. That's it — the tool is discovered automatically at import time. No other registration needed.
+To add a new tool, see [Recipe 1](#recipe-1--add-a-tool).
 
 ### MCP Integration
 
@@ -583,6 +500,10 @@ The API uses Pydantic models for request/response validation and includes CORS m
 | `LLM_MODEL` | Model name to use | `deepseek-v4-flash` |
 | `LLM_KEY` | API key for the LLM service | (required) |
 | `CONFIG_PATH` | Path to the unified agent config JSON | `agents/agent_config.json` |
+| `LOG_LEVEL` | Logging level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) | `INFO` |
+| `LOG_FILE` | Log file path (empty string disables file logging) | `langgraph_smart_reasoning.log` |
+| `LOG_CONSOLE` | Also emit log events to stderr (`true`/`false`) | `false` |
+| `DEBUG` | Include full tracebacks in API error responses | `false` |
 | `LANGSMITH_TRACING` | Enable LangSmith tracing | `true` |
 | `LANGSMITH_ENDPOINT` | LangSmith API endpoint | `https://api.smith.langchain.com` |
 | `LANGSMITH_API_KEY` | LangSmith API key | (optional) |
@@ -666,12 +587,46 @@ The **Orchestrator** produces:
 
 **Final output** — all three step results assembled into one cohesive document.
 
+## Documentation
+
+This README is the single entry point; everything else lives in
+`docs/history/`:
+
+| Document | What it is |
+|---|---|
+| [`docs/history/IMPROVEMENT_PLAN.md`](docs/history/IMPROVEMENT_PLAN.md) | **Active roadmap** — phased plan with acceptance criteria per item |
+| [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) | **Active test-suite specification** — implemented by `tests/` |
+| `docs/history/multi-agent-pipeline-skills-guide.md` | Design history — original implementation plan (stale) |
+| `docs/history/langgraph-multi-agent-skills-plan.md` | Design history — LangGraph adaptation plan (stale) |
+| `docs/history/codebase-review-fixes.md` | Design history — June 2026 code review (stale) |
+
+When you add a feature, update the relevant [recipe](#contributor-recipes) in
+the same PR — documentation drift is how this repo once ended up with four
+overlapping, contradictory planning documents.
+
 ## Known Issues
 
-1. **Logging**: `utils/logger.py` calls `logging.basicConfig` after `getLogger`, which means the file handler may not be attached before the first log call.
-2. **MCP client**: Ensure the MCP server is reachable before running agents that depend on it; the pipeline will fail if an MCP-dependent agent is dispatched and the server is down.
-3. **Skill body parsing**: `skill_loader.py` uses `maxsplit=2` when splitting on `---` to handle body content containing dash sequences. Ensure SKILL.md files follow the standard `---\n(YAML frontmatter)\n---\n(body)` format.
-4. **Parallel pipeline**: The parallel pipeline (`paralel_pipeline_graph.py`) is the default in both `run_pipeline.py` and `api_server.py`. The sequential pipeline (`pipeline_graph.py`) exists for reference but is not wired to a runner.
+Two open bugs are tracked in
+[`docs/history/IMPROVEMENT_PLAN.md`](docs/history/IMPROVEMENT_PLAN.md)
+(item 2.3, "Known bugs"), each with a red `xfail` regression test in `tests/`
+that flips to passing when the fix lands:
+
+1. **The parallel graph fails at import** — `paralel_pipeline_graph.py` passes
+   the *string* `"scheduler"` to `add_conditional_edges`, which requires a
+   callable. Those two edges must be plain `add_edge` calls (item 1.1 of the
+   plan), so `run_pipeline.py` and `api_server.py` are currently broken until
+   that fix lands.
+2. **Plan validation never runs** — `agents/orchestrator_node.py` calls
+   `validate_plan(plan)`, but the signature is
+   `validate_plan(plan, known_agents, known_skills)`. The resulting
+   `TypeError` is swallowed by a broad `except` and misreported as
+   `"Failed to parse JSON response"`.
+
+Smaller caveats:
+
+- **MCP client**: Ensure the MCP server is reachable before running agents that depend on it; the pipeline will fail if an MCP-dependent agent is dispatched and the server is down.
+- **Skill body parsing**: `skill_loader.py` uses `maxsplit=2` when splitting on `---` to handle body content containing dash sequences. Ensure SKILL.md files follow the standard `---\n(YAML frontmatter)\n---\n(body)` format.
+- **Sequential pipeline**: `pipeline_graph.py` exists for reference but is not wired to a runner; the parallel pipeline is the default everywhere.
 
 ## License
 

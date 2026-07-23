@@ -15,7 +15,7 @@ jobs:
       - run: pip install -e ".[dev]"
       # Lint the test code only for now. Repo-wide `ruff check .` surfaces a
       # batch of pre-existing findings and is deferred to its own cleanup
-      # commit (see TESTING_GUIDE.md → CI workflow), so it does not gate this
+      # commit (see docs/history/TESTING_GUIDE.md → CI workflow), so it does not gate this
       # suite's PR.
       - run: ruff check tests/
       - run: pytest -q

@@ -21,7 +21,7 @@ def import_parallel_or_xfail():
     """Import ``paralel_pipeline_graph`` or xfail the calling test.
 
     The module builds *and compiles* its graph at import time, and that wiring
-    is currently broken (Bug 1 in TESTING_GUIDE.md: string path passed to
+    is currently broken (Bug 1 in docs/history/TESTING_GUIDE.md: string path passed to
     ``add_conditional_edges``). The pure functions we want to test are defined
     before the failing lines, but a failed import removes the module from
     ``sys.modules`` entirely — so there is no way to reach them until Bug 1 is

@@ -2,7 +2,7 @@
 
 The env vars must be set *before* the first pipeline import, and the CWD must
 be the repo root *before* any module calls ``load_skills()``. Both are
-import-time concerns (see ``TESTING_GUIDE.md`` → "The import-time side-effect
+import-time concerns (see ``docs/history/TESTING_GUIDE.md`` → "The import-time side-effect
 problem"), so both happen here at module top level, not inside fixtures.
 """
 

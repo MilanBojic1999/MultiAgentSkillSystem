@@ -63,3 +63,6 @@ old_agent.py
 
 artifacts/
 scraped_pages/
+
+docs/history/
+CLAUDE.md

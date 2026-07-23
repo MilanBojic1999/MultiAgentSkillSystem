@@ -9,6 +9,7 @@ Endpoints:
 """
 
 import asyncio
+import os
 import uuid
 import traceback
 from contextlib import asynccontextmanager
@@ -25,6 +26,11 @@ load_dotenv()
 
 from paralel_pipeline_graph import graph
 from agent_states import get_current_datetime_str
+from utils.logger import log_event
+
+# When true, API error responses include the full traceback; otherwise clients
+# get a generic message + id and the traceback stays in the server log.
+DEBUG = os.getenv("DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +142,15 @@ async def run_pipeline(req: RunRequest):
         output = await _run_pipeline(req.task)
         return RunResponse(final_output=output)
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Pipeline failed: {exc}\n\n{traceback.format_exc()}",
+        error_id = uuid.uuid4().hex[:12]
+        log_event("api_run_failed", error_id=error_id, error=str(exc),
+                  traceback=traceback.format_exc())
+        detail = (
+            f"Pipeline failed: {exc}\n\n{traceback.format_exc()}"
+            if DEBUG
+            else f"Pipeline failed. See server logs (error id: {error_id})."
         )
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @app.post("/run-async", response_model=AsyncRunResponse, status_code=202)
@@ -160,11 +171,18 @@ async def run_pipeline_async(req: RunRequest):
             async with _task_lock:
                 _task_store[task_id] = {"status": "completed", "final_output": output, "error": None}
         except Exception as exc:
+            log_event("api_async_task_failed", task_id=task_id, error=str(exc),
+                      traceback=traceback.format_exc())
+            error = (
+                f"{exc}\n{traceback.format_exc()}"
+                if DEBUG
+                else f"Pipeline failed. See server logs (task id: {task_id})."
+            )
             async with _task_lock:
                 _task_store[task_id] = {
                     "status": "failed",
                     "final_output": None,
-                    "error": f"{exc}\n{traceback.format_exc()}",
+                    "error": error,
                 }
 
     asyncio.create_task(_background())
