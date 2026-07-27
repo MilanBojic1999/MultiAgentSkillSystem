@@ -21,12 +21,12 @@ def import_parallel_or_xfail():
     """Return the parallel-graph module, or xfail if it cannot be imported.
 
     Since item 1.1 the module imports and compiles cleanly, so this is normally
-    a passthrough — the dedicated ``test_parallel_graph_module_imports`` is what
+    a passthrough — the dedicated ``test_parallel_graph_module_builds`` is what
     guards import regressions loudly. The xfail branch remains only as a safety
     net for tests that assert on the pure router/scheduler functions.
     """
     try:
-        import paralel_pipeline_graph as pg
+        from graphs import parallel_pipeline_graph as pg
     except Exception as e:  # pragma: no cover - safety net only
-        pytest.xfail(f"paralel_pipeline_graph does not import: {e}")
+        pytest.xfail(f"graphs.parallel_pipeline_graph does not import: {e}")
     return pg

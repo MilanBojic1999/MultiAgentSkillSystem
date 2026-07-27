@@ -1,9 +1,12 @@
-"""pipeline_graph.should_continue and sub_agent_node's dead-state contract.
+"""graphs.sequential_pipeline_graph.should_continue and the worker's dead-state
+contract.
 
 We assert on the two pure functions directly rather than invoking the compiled
 sequential graph — the blocked-forever case would otherwise loop until the
 recursion limit.
 """
+
+import asyncio
 
 import pytest
 
@@ -26,11 +29,13 @@ def test_complete_results_route_to_assemble():
 )
 def test_blocked_forever_sub_agent_node_raises():
     # No step is ready (step 1 depends on an absent step) and results are
-    # incomplete: today sub_agent_node returns {}, which makes should_continue
-    # loop until the recursion limit. The desired contract is a RuntimeError.
-    # Only reachable because no step is ready — so no live LLM call happens.
-    from agents.sub_agents_nodes import sub_agent_node
+    # incomplete: today the worker returns {}, which makes should_continue loop
+    # until the recursion limit. The desired contract is a RuntimeError.
+    # Only reachable because no step is ready — so run_step is never called and
+    # no live LLM call happens.
+    from agents.sub_agents_nodes import make_sub_agent_node
 
+    node = make_sub_agent_node()
     state = {"plan": [step(1, deps=[99])], "results": {}, "current_datetime": ""}
     with pytest.raises(RuntimeError):
-        sub_agent_node(state)
+        asyncio.run(node(state))

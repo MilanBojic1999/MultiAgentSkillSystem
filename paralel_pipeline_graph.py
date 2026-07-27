@@ -1,14 +1,19 @@
-"""Import-compat shim (Phase 1.5 transition).
+"""Import-compat shim (Phase 1.5 / 3.3 transition).
 
-The parallel graph now lives in ``graphs/paralel_pipeline_graph.py``. This
-root module re-exports it so existing importers — ``api_server``,
-``run_pipeline``, and the tests — keep working while callers migrate to the
-``graphs`` package (Phase 3.3). Remove once nothing imports the root path.
+The parallel graph now lives in ``graphs/parallel_pipeline_graph.py`` (note the
+fixed spelling) and is reached through the registry::
+
+    from graphs import build_graph
+    graph = build_graph("parallel")
+
+This root module re-exports the graph's public names under the old misspelled
+path so external importers keep working for one release. The pre-compiled
+module-level ``graph`` singleton is gone: graphs are compiled by ``build()``,
+which lets callers pass their own checkpointer.
 """
 
-from graphs.paralel_pipeline_graph import (  # noqa: F401
-    graph,
+from graphs.parallel_pipeline_graph import (  # noqa: F401
+    build,
     fan_out_router,
     scheduler_node,
-    parallel_sub_agent_node,
 )

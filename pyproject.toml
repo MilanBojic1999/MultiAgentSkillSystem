@@ -32,15 +32,13 @@ markers = ["integration: needs a live LLM endpoint; excluded by default"]
 [tool.setuptools]
 py-modules = [
     "agent_mcp_tools",
-    "agent_states",
     "api_client",
     "api_server",
     "assemble_node",
     "config_loader",
     "llm_factory",
-    "paralel_pipeline_graph",
-    "pipeline_graph",
+    "paralel_pipeline_graph",  # import-compat shim for the old root path
     "run_pipeline",
     "skill_loader",
 ]
-packages = ["agents", "tools", "utils"]
+packages = ["agents", "graphs", "tools", "utils"]

@@ -32,22 +32,24 @@ User Task
 └─────────────────────┘
 ```
 
-Two pipeline implementations are provided:
-- **`pipeline_graph.py`** — Sequential execution (one step at a time)
-- **`paralel_pipeline_graph.py`** — Parallel execution (independent steps run concurrently via LangGraph's `Send` API)
+Graphs live in `graphs/` and register themselves — any module there that defines
+a `build()` function is a graph, and its registry name is the file name minus a
+trailing `_pipeline_graph` / `_graph` suffix. Two ship today:
 
-The default runner (`run_pipeline.py`) uses the parallel pipeline.
+- **`graphs/parallel_pipeline_graph.py`** → `parallel` — independent steps run concurrently via LangGraph's `Send` API
+- **`graphs/sequential_pipeline_graph.py`** → `sequential` — one step at a time
+
+Pick one with `python run_pipeline.py --graph sequential ...` or the `"graph"`
+field of an API request; `parallel` is the default. `python run_pipeline.py
+--list-graphs` (or `GET /graphs`) shows what the registry found.
 
 ## Directory Structure
 
 ```
 agent_skills/
-├── run_pipeline.py              # CLI entry point (uses parallel pipeline)
-├── pipeline_graph.py            # Sequential LangGraph pipeline
-├── paralel_pipeline_graph.py    # Parallel LangGraph pipeline (Send API fan-out)
+├── run_pipeline.py              # CLI entry point (--graph selects the pipeline)
 ├── api_server.py                # FastAPI REST API server
 ├── api_client.py                # CLI client for the API (zero dependencies)
-├── agent_states.py              # Shared state definition (TypedDict)
 ├── agent_mcp_tools.py           # MCP client factory (reads config from agent_config.json)
 ├── assemble_node.py             # Shared assemble node (merges step outputs)
 ├── llm_factory.py               # create_llm(...) — the single ChatOpenAI construction site
@@ -64,6 +66,11 @@ agent_skills/
 │   └── history/                 # Roadmap, test spec, and stale design-history docs
 │
 ├── tests/                       # Hermetic pytest suite (no network / LLM needed)
+│
+├── graphs/
+│   ├── __init__.py              # Auto-discovering graph registry (build_graph, available_graphs)
+│   ├── parallel_pipeline_graph.py   # "parallel" — Send-API fan-out (default)
+│   └── sequential_pipeline_graph.py # "sequential" — one step at a time
 │
 ├── agents/
 │   ├── __init__.py              # Exports orchestrator, sub-agents, loads roster from config
@@ -161,6 +168,10 @@ python run_pipeline.py
 
 # Run with your own task
 python run_pipeline.py "Explain the Fourier transform, plot sin(x) and cos(x), then write a summary"
+
+# Pick a different graph (see what's available first)
+python run_pipeline.py --list-graphs
+python run_pipeline.py --graph sequential "Summarise the history of calculus"
 ```
 
 **Option B — FastAPI server + client:**
@@ -178,6 +189,10 @@ python api_client.py --health
 
 # Async mode (start + poll until done)
 python api_client.py --async "Research the history of machine learning"
+
+# List the server's graphs, then run one of them
+python api_client.py --list-graphs
+python api_client.py --graph sequential "Summarise the history of calculus"
 ```
 
 **Option C — Docker:**
@@ -290,23 +305,53 @@ Discovered automatically by `skill_loader.py` — no registration.
 
 ### Recipe 4 — Add a graph
 
-There is no graph factory yet (that is Phase 3 of the
-[improvement plan](docs/history/IMPROVEMENT_PLAN.md)), so a new topology is
-currently a copy-and-register job:
+Drop one file in `graphs/`. There is nothing to register: the registry scans the
+directory, and any module defining a `build()` function is a graph.
 
-1. **Copy** `paralel_pipeline_graph.py` to `my_graph.py` and change the
-   topology. All graphs share the same building blocks:
+1. **Copy** `graphs/parallel_pipeline_graph.py` to
+   `graphs/my_topology_graph.py` and change the topology. Each graph owns its
+   own glue (scheduler, routers, assemble); only these building blocks are
+   shared:
 
    | Building block | Source |
    |---|---|
-   | `AgentState` — shared state TypedDict | `agent_states.py` |
-   | `orchestrator_agent` — task → JSON plan | `agents/orchestrator_node.py` |
-   | `run_sub_agent_async` / `sub_agent_node` — run one plan step | `agents/sub_agents_nodes.py` |
+   | `AgentState` / `WorkerState` — shared state TypedDicts | `agents/agent_states.py` |
+   | `make_orchestrator_agent()` — task → JSON plan | `agents/orchestrator_node.py` |
+   | `make_parallel_sub_agent_node()` / `make_sub_agent_node()` — run one plan step | `agents/sub_agents_nodes.py` |
    | `assemble_node` — merge step outputs into `final_output` | `assemble_node.py` |
 
-2. **Register** it: `run_pipeline.py` and `api_server.py` both do
-   `from paralel_pipeline_graph import graph` — point that import at your
-   module instead.
+2. **Expose a `build()`** with this signature — every argument defaults to the
+   production wiring, so `build()` works with no arguments and tests can inject
+   fakes:
+
+   ```python
+   GRAPH_DESCRIPTION = "One line shown by --list-graphs and GET /graphs"
+
+   def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
+       orchestrator = orchestrator or make_orchestrator_agent()
+       sub_agent = sub_agent or make_parallel_sub_agent_node()
+       ...
+       return builder.compile(checkpointer=checkpointer or MemorySaver())
+   ```
+
+3. **Run it**: `python run_pipeline.py --graph my_topology "..."` or
+   `{"task": "...", "graph": "my_topology"}` against the API. The name is the
+   file name minus its `_pipeline_graph` / `_graph` / `_pipeline` suffix;
+   set `GRAPH_NAME = "..."` in the module to override it. Modules whose name
+   starts with `_` are skipped, so shared helpers can live in `graphs/` too.
+
+Programmatic access:
+
+```python
+from graphs import available_graphs, build_graph, graph_descriptions
+
+available_graphs()                       # ['parallel', 'sequential', 'my_topology']
+graph = build_graph("my_topology", checkpointer=my_saver)
+```
+
+Discovery is lazy — `build_graph("parallel")` imports exactly one graph module,
+and a graph file that fails to import only breaks callers asking for *that*
+graph (listings report it instead of crashing).
 
 Topology rules (the hard-won lessons behind items 1.1–1.2 of the improvement
 plan):
@@ -423,8 +468,8 @@ START → orchestrator → router → [sub_agent(s)] → router → assembler �
 4. **Assembler** — Concatenates all step outputs into the final answer
 
 **Sequential vs Parallel:**
-- `pipeline_graph.py` runs one step at a time, in dependency order
-- `paralel_pipeline_graph.py` runs all ready steps concurrently via LangGraph's `Send` API (used by default)
+- `graphs/sequential_pipeline_graph.py` (`--graph sequential`) runs one step at a time, in dependency order
+- `graphs/parallel_pipeline_graph.py` (`--graph parallel`, the default) runs all ready steps concurrently via LangGraph's `Send` API
 
 To build your own topology from these parts, see
 [Recipe 4](#recipe-4--add-a-graph).
@@ -478,8 +523,9 @@ Each MCP server must have a single owning agent for security — `config_loader.
 | Endpoint | Method | Description |
 |---|---|---|
 | `/health` | GET | Health check — returns `{"status": "ok"}` |
-| `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "..."}` |
-| `/run-async` | POST | Start a pipeline run in the background. Returns a `task_id` immediately (HTTP 202) |
+| `/graphs` | GET | List the graphs discovered in `graphs/`, with descriptions and which is the default |
+| `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional |
+| `/run-async` | POST | Start a pipeline run in the background (same body). Returns a `task_id` immediately (HTTP 202) |
 | `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`), or `"failed"` (with `error`) |
 
 The API uses Pydantic models for request/response validation and includes CORS middleware (open by default — tighten in production). A zero-dependency CLI client (`api_client.py`) is provided for interacting with the API from the terminal.
@@ -594,7 +640,7 @@ This README is the single entry point; everything else lives in
 
 | Document | What it is |
 |---|---|
-| [`docs/history/IMPROVEMENT_PLAN.md`](docs/history/IMPROVEMENT_PLAN.md) | **Active roadmap** — phased plan with acceptance criteria per item |
+| [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) | **Active roadmap** — phased plan with acceptance criteria per item |
 | [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) | **Active test-suite specification** — implemented by `tests/` |
 | `docs/history/multi-agent-pipeline-skills-guide.md` | Design history — original implementation plan (stale) |
 | `docs/history/langgraph-multi-agent-skills-plan.md` | Design history — LangGraph adaptation plan (stale) |
@@ -606,27 +652,18 @@ overlapping, contradictory planning documents.
 
 ## Known Issues
 
-Two open bugs are tracked in
-[`docs/history/IMPROVEMENT_PLAN.md`](docs/history/IMPROVEMENT_PLAN.md)
-(item 2.3, "Known bugs"), each with a red `xfail` regression test in `tests/`
-that flips to passing when the fix lands:
+Remaining work is tracked in
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). The two
+bugs that section once listed (the parallel graph failing at import, and
+`validate_plan` being called with the wrong arity) are fixed; their regression
+tests in `tests/` are green.
 
-1. **The parallel graph fails at import** — `paralel_pipeline_graph.py` passes
-   the *string* `"scheduler"` to `add_conditional_edges`, which requires a
-   callable. Those two edges must be plain `add_edge` calls (item 1.1 of the
-   plan), so `run_pipeline.py` and `api_server.py` are currently broken until
-   that fix lands.
-2. **Plan validation never runs** — `agents/orchestrator_node.py` calls
-   `validate_plan(plan)`, but the signature is
-   `validate_plan(plan, known_agents, known_skills)`. The resulting
-   `TypeError` is swallowed by a broad `except` and misreported as
-   `"Failed to parse JSON response"`.
-
-Smaller caveats:
+Caveats:
 
 - **MCP client**: Ensure the MCP server is reachable before running agents that depend on it; the pipeline will fail if an MCP-dependent agent is dispatched and the server is down.
 - **Skill body parsing**: `skill_loader.py` uses `maxsplit=2` when splitting on `---` to handle body content containing dash sequences. Ensure SKILL.md files follow the standard `---\n(YAML frontmatter)\n---\n(body)` format.
-- **Sequential pipeline**: `pipeline_graph.py` exists for reference but is not wired to a runner; the parallel pipeline is the default everywhere.
+- **Sequential pipeline**: `graphs/sequential_pipeline_graph.py` is a reference topology — it re-evaluates its router after every step and has no scheduler barrier. `parallel` is the default everywhere.
+- **Old import path**: the root `paralel_pipeline_graph.py` (misspelled) is an import-compat shim for one release and no longer exposes a pre-compiled `graph` singleton — use `build_graph("parallel")`.
 
 ## License
 

@@ -1,7 +1,7 @@
-"""paralel_pipeline_graph.fan_out_router — routing as a pure function.
+"""graphs.parallel_pipeline_graph.fan_out_router — routing as a pure function.
 
-Every test here xfails until Bug 1 (the module fails to import) is fixed; see
-tests/_helpers.import_parallel_or_xfail.
+The module-import guard in tests/_helpers.import_parallel_or_xfail is now a
+passthrough (Bug 1 is fixed); it stays only as a safety net.
 """
 
 import pytest

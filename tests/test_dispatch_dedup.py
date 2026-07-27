@@ -9,50 +9,46 @@ Two things are pinned here:
     edge hung off the worker instead of the scheduler) re-dispatches
     already-completed steps.
 
-The topology built in ``_build_graph`` MUST mirror the wiring in
-``paralel_pipeline_graph.py`` (plain edges into ``scheduler``; a single
-conditional edge out of it). Until Phase 3 extracts a ``build(...)`` factory,
-this duplication is the price of testability — the two must change together.
+Since Phase 3.3 these run against the graph's real ``build(...)`` factory with
+fake nodes injected, so the production topology itself is what gets exercised —
+no mirrored wiring to keep in sync.
 """
 
 import asyncio
 from collections import Counter
 
 import pytest
-from langgraph.graph import END, StateGraph
 
-from agents.agent_states import AgentState
-from assemble_node import assemble_node
 from tests._helpers import import_parallel_or_xfail
 from tests.plans import DIAMOND_PLAN, LINEAR_PLAN, WIDE_PLAN
 
+# The compiled graphs keep their default MemorySaver, which needs a thread id.
+CONFIG = {"configurable": {"thread_id": "test-dispatch"}}
 
-def test_parallel_graph_module_imports():
-    # Item 1.1: the parallel graph compiles and the root import-shim resolves.
+
+def test_parallel_graph_module_builds():
+    # Item 1.1: the parallel graph's build() compiles with the production wiring.
+    from graphs.parallel_pipeline_graph import build
+
+    assert build() is not None
+
+
+def test_root_import_shim_still_resolves():
+    # Item 1.5: the misspelled root path keeps working for one more release.
     import paralel_pipeline_graph
+    from graphs import parallel_pipeline_graph
 
-    assert paralel_pipeline_graph.graph is not None
+    assert paralel_pipeline_graph.build is parallel_pipeline_graph.build
 
 
 def _build_graph(plan, worker):
+    """The real parallel graph, with the two LLM-bearing nodes faked out."""
     pg = import_parallel_or_xfail()
 
     def stub_orchestrator(state):
         return {"plan": plan, "results": {}, "current_step": 0}
 
-    builder = StateGraph(AgentState)
-    builder.add_node("orchestrator", stub_orchestrator)
-    builder.add_node("scheduler", pg.scheduler_node)
-    builder.add_node("parallel_sub_agent", worker)
-    builder.add_node("assemble", assemble_node)
-    builder.set_entry_point("orchestrator")
-    builder.add_edge("orchestrator", "scheduler")
-    builder.add_conditional_edges(
-        "scheduler", pg.fan_out_router, ["assemble", "parallel_sub_agent"]
-    )
-    builder.add_edge("parallel_sub_agent", "scheduler")
-    builder.add_edge("assemble", END)
-    return builder.compile()
+    return pg.build(orchestrator=stub_orchestrator, sub_agent=worker)
 
 
 @pytest.mark.parametrize("plan", [DIAMOND_PLAN, LINEAR_PLAN, WIDE_PLAN])
@@ -65,7 +61,7 @@ def test_each_step_dispatched_exactly_once(plan):
         return {"results": {n: f"out-{n}"}}
 
     graph = _build_graph(plan, stub_worker)
-    out = graph.invoke({"task": "t", "current_datetime": ""})
+    out = graph.invoke({"task": "t", "current_datetime": ""}, config=CONFIG)
 
     expected = {s["step"]: 1 for s in plan}
     assert calls == expected                      # the 1.1 bug over-counts join steps
@@ -88,7 +84,7 @@ def test_failed_step_is_contained_and_recorded():
     worker = make_parallel_sub_agent_node(run_step=fake_run)
     graph = _build_graph(DIAMOND_PLAN, worker)
     # The real worker node is async, so the graph must be driven with ainvoke.
-    out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}))
+    out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}, config=CONFIG))
 
     assert out["final_output"]  # run still completes
     assert "[STEP FAILED]" in out["final_output"]

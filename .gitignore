@@ -40,6 +40,9 @@ agent_output.txt
 *.ipynb
 
 # Testing
+# Throwaway graph modules written into graphs/ by tests/test_graph_registry.py;
+# only present if a run crashed before its fixture cleaned up.
+graphs/zz_probe*_graph.py
 .pytest_cache/
 .coverage
 htmlcov/

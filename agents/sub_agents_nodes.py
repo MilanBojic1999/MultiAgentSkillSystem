@@ -1,4 +1,5 @@
 import asyncio
+from functools import partial
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills, load_skills_body
@@ -10,13 +11,9 @@ from llm_factory import create_llm
 from utils.logger import log_event
 
 from agents import AGENT_ROSTER
-from agents.agent_states import get_current_datetime_str, AgentState, WorkerState
+from agents.agent_states import get_current_datetime_str, WorkerState
 
 load_dotenv()
-
-# Sub-agents keep the creative default temperature (Phase 1.3 factory default).
-llm = create_llm()
-
 
 _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
 
@@ -40,8 +37,16 @@ async def run_sub_agent_async(
     step: dict,
     results: dict,
     current_datetime: str = "",
+    llm=None,
 ) -> tuple[int, str]:
-    """Run one sub-agent step. Returns (step_number, output_text)."""
+    """Run one sub-agent step. Returns (step_number, output_text).
+
+    ``llm`` defaults to the env-configured client at the creative default
+    temperature (Phase 1.3). It is resolved here rather than at import so that
+    importing this module needs no LLM configuration; ``create_llm`` is
+    lru_cached, so repeat calls are a dict lookup.
+    """
+    llm          = llm or create_llm()
     agent_name   = step["agent"]
     step_num     = step["step"]
 
@@ -109,15 +114,23 @@ async def run_sub_agent_async(
 
 
 
-def make_sub_agent_node(run_step=None):
+def _resolve_run_step(run_step, llm):
+    """``run_step`` wins; otherwise run the real step, optionally on a given LLM."""
+    if run_step is not None:
+        return run_step
+    return partial(run_sub_agent_async, llm=llm) if llm is not None else run_sub_agent_async
+
+
+def make_sub_agent_node(run_step=None, llm=None):
     """Factory for the sequential worker node.
 
     ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
     coroutine ``(step, results, current_datetime) -> (step_num, output)``.
+    ``llm`` overrides the client that default ``run_step`` uses.
     """
-    run_step = run_step or run_sub_agent_async
+    run_step = _resolve_run_step(run_step, llm)
 
-    async def sub_agent_node(state: AgentState) -> dict:
+    async def sub_agent_node(state: WorkerState) -> dict:
         """
         Sequential node: executes the next uncompleted step in the plan.
         """
@@ -140,15 +153,16 @@ def make_sub_agent_node(run_step=None):
     return sub_agent_node
 
 
-def make_parallel_sub_agent_node(run_step=None):
+def make_parallel_sub_agent_node(run_step=None, llm=None):
     """Factory for the parallel worker node (one ``Send`` task per ready step).
 
     ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
     coroutine ``(step, results, current_datetime) -> (step_num, output)``.
+    ``llm`` overrides the client that default ``run_step`` uses.
     Failure is contained here (Phase 1.4): an exhausted step is recorded as a
     result and flagged in ``failed_steps`` instead of killing the whole graph.
     """
-    run_step = run_step or run_sub_agent_async
+    run_step = _resolve_run_step(run_step, llm)
 
     async def parallel_sub_agent_node(state: WorkerState) -> dict:
         try:
@@ -162,10 +176,3 @@ def make_parallel_sub_agent_node(run_step=None):
                     "failed_steps": [state["step"]["step"]]}
 
     return parallel_sub_agent_node
-
-
-# Import-compat shims: default env-configured instances. Callers (graphs,
-# agents/__init__) keep importing these names; delete once every caller builds
-# its own via the factories above. (Phase 3.1)
-sub_agent_node = make_sub_agent_node()
-parallel_sub_agent_node = make_parallel_sub_agent_node()

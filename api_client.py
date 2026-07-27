@@ -75,12 +75,26 @@ def check_health(base_url: str) -> bool:
     return False
 
 
-def run_task(task: str, base_url: str) -> str | None:
+def list_graphs(base_url: str) -> bool:
+    """Print the graphs the server discovered in its graphs/ directory."""
+    result = _request("GET", "/graphs", base_url)
+    if result.get("error"):
+        print(f"❌ Error listing graphs: {result.get('detail', 'Unknown error')}")
+        return False
+
+    for entry in result.get("graphs", []):
+        marker = " (default)" if entry.get("default") else ""
+        description = entry.get("description") or ""
+        print(f"  {entry['name']}{marker}" + (f" — {description}" if description else ""))
+    return True
+
+
+def run_task(task: str, base_url: str, graph: str | None = None) -> str | None:
     """Run a task synchronously and return the final output."""
     print(f"🚀 Running task:\n   {task}\n")
     print(f"📡 POST {base_url}/run ...")
 
-    result = _request("POST", "/run", base_url, body={"task": task})
+    result = _request("POST", "/run", base_url, body=_run_body(task, graph))
 
     if result.get("error"):
         print(f"❌ Error: {result.get('detail', 'Unknown error')}")
@@ -89,12 +103,20 @@ def run_task(task: str, base_url: str) -> str | None:
     return result.get("final_output", "")
 
 
-def run_task_async(task: str, base_url: str) -> str | None:
+def _run_body(task: str, graph: str | None) -> dict[str, Any]:
+    """Request body for /run and /run-async; omit `graph` to take the server default."""
+    body: dict[str, Any] = {"task": task}
+    if graph:
+        body["graph"] = graph
+    return body
+
+
+def run_task_async(task: str, base_url: str, graph: str | None = None) -> str | None:
     """Start an async task and poll until completion."""
     print(f"🚀 Starting async task:\n   {task}\n")
     print(f"📡 POST {base_url}/run-async ...")
 
-    start_result = _request("POST", "/run-async", base_url, body={"task": task})
+    start_result = _request("POST", "/run-async", base_url, body=_run_body(task, graph))
     if start_result.get("error"):
         print(f"❌ Error starting task: {start_result.get('detail', 'Unknown error')}")
         return None
@@ -164,6 +186,15 @@ Examples:
         help="Check if the API server is healthy and exit",
     )
     parser.add_argument(
+        "--graph", "-g",
+        help="Which graph the server should run (default: the server's own default)",
+    )
+    parser.add_argument(
+        "--list-graphs",
+        action="store_true",
+        help="List the graphs available on the server and exit",
+    )
+    parser.add_argument(
         "--async",
         dest="async_mode",
         action="store_true",
@@ -177,15 +208,19 @@ Examples:
         ok = check_health(args.url)
         sys.exit(0 if ok else 1)
 
+    # --list-graphs mode
+    if args.list_graphs:
+        sys.exit(0 if list_graphs(args.url) else 1)
+
     # Task required for run modes
     if not args.task:
         parser.error("A task string is required (unless using --health).")
 
     # Run
     if args.async_mode:
-        output = run_task_async(args.task, args.url)
+        output = run_task_async(args.task, args.url, args.graph)
     else:
-        output = run_task(args.task, args.url)
+        output = run_task(args.task, args.url, args.graph)
 
     if output is None:
         sys.exit(1)

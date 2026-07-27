@@ -13,9 +13,9 @@ jobs:
           python-version: "3.13"   # match the dev venv
           cache: pip
       - run: pip install -e ".[dev]"
-      # Lint the test code only for now. Repo-wide `ruff check .` surfaces a
-      # batch of pre-existing findings and is deferred to its own cleanup
-      # commit (see docs/history/TESTING_GUIDE.md → CI workflow), so it does not gate this
-      # suite's PR.
-      - run: ruff check tests/
+      # Lint the test code and the graph package (both are new code). Repo-wide
+      # `ruff check .` surfaces a batch of pre-existing findings and is deferred
+      # to its own cleanup commit (see docs/history/TESTING_GUIDE.md → CI
+      # workflow), so it does not gate this suite's PR.
+      - run: ruff check tests/ graphs/
       - run: pytest -q

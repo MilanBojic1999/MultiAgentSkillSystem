@@ -93,9 +93,3 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
             raise ValueError(f"Failed to parse JSON response: {e}")
 
     return orchestrator_agent
-
-
-# Import-compat shim: the default env-configured instance. Callers (graphs,
-# agents/__init__) keep importing `orchestrator_agent`; delete once every
-# caller builds its own via make_orchestrator_agent(). (Phase 3.1)
-orchestrator_agent = make_orchestrator_agent()
