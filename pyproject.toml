@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-skills-pipeline"
+version = "0.1.0"
+description = "Plan-and-execute multi-agent pipeline built on LangGraph"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=1.2.4",
+    "langchain-core>=1.4.0",
+    "langchain-openai>=1.2.2",
+    "langchain-mcp-adapters>=0.2.2",
+    "fastapi>=0.137.1",
+    "uvicorn>=0.49.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "PyYAML>=6.0.3",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = ["integration: needs a live LLM endpoint; excluded by default"]
+
+[tool.setuptools]
+py-modules = [
+    "agent_mcp_tools",
+    "api_client",
+    "api_server",
+    "assemble_node",
+    "config_loader",
+    "llm_factory",
+    "paralel_pipeline_graph",  # import-compat shim for the old root path
+    "run_pipeline",
+    "skill_loader",
+]
+packages = ["agents", "graphs", "tools", "utils"]

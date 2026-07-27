@@ -1,55 +1,20 @@
 import json
 import os
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills
 from dotenv import load_dotenv
 from utils.logger import log_event
 from utils.senitize import sanitize_content
+from utils.json_utils import extract_json
+from utils.plan_validator import validate_plan
+from llm_factory import create_llm
 import re
 
 from agents import AGENT_ROSTER
-from agent_states import get_current_datetime_str
+from agents.agent_states import get_current_datetime_str
 
 
 load_dotenv()
-
-LLM_URL = os.getenv("LLM_URL")
-LLM_MODEL = os.getenv("LLM_MODEL")
-LLM_KEY = os.getenv("LLM_KEY")
-
-llm = ChatOpenAI(
-    model=LLM_MODEL, # Must match the --model flag you gave vLLM
-    openai_api_key=LLM_KEY,                  # vLLM doesn't require a key by default
-    openai_api_base=LLM_URL, 
-    max_tokens=4048,
-    temperature=0.9
-)
-
-
-def _extract_json(text: str) -> dict:
-    """
-    Extract JSON from LLM response, handling common failure modes:
-    - Markdown code fences (```json ... ```)
-    - Leading/trailing prose
-    """
-    # Try direct parse first (best case)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code fence
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        return json.loads(fence_match.group(1))
-
-    # Try to find the outermost JSON object
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        return json.loads(brace_match.group(0))
-
-    raise ValueError(f"Could not extract JSON from response: {text[:500]}...")
 
 
 SKILL_INDEX, SKILLS_DICTIONARY_PAIRS = load_skills()
@@ -86,33 +51,45 @@ Current datetime: {current_datetime}
 }}
 """.strip()
 
-def orchestrator_agent(state: dict):
-    user_task = state["task"]
-    current_datetime = state.get("current_datetime") or get_current_datetime_str()
-    skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items()])
-    agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items()])
 
-    system_prompt = ORCHESTRATOR_SYSTEM.format(
-        agent_roster=agent_roster_str,
-        skill_index=skill_summery,
-        current_datetime=current_datetime,
-    )
-    user_task = sanitize_content(user_task, "user")
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_task),
-    ]
-    
-    log_event("orchestrator_agent_start", user_task=user_task)
+def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
+    # The orchestrator only emits strict JSON, so it runs at low temperature —
+    # creative sampling here is the main source of malformed plans.
+    llm = llm or create_llm(temperature=float(os.getenv("ORCHESTRATOR_TEMPERATURE", "0.1")))
+    roster = agent_roster or AGENT_ROSTER
+    index = skill_index or SKILL_INDEX
 
-    response = llm.invoke(messages)
-    try:
-        plan_json = _extract_json(response.content)
-        plan = plan_json.get("plan", [])
-        if not isinstance(plan, list) or len(plan) == 0:
-            raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
-        log_event("orchestrator_agent_plan", pipeline_plan=plan)
+    def orchestrator_agent(state: dict):
+        user_task = state["task"]
+        current_datetime = state.get("current_datetime") or get_current_datetime_str()
+        skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in index.items()])
+        agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in roster.items()])
 
-        return {"plan": plan, "results": {}, "current_step": 0}
-    except Exception as e:
-        raise ValueError(f"Failed to parse JSON response: {e}")
+        system_prompt = ORCHESTRATOR_SYSTEM.format(
+            agent_roster=agent_roster_str,
+            skill_index=skill_summery,
+            current_datetime=current_datetime,
+        )
+        user_task = sanitize_content(user_task, "user")
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_task),
+        ]
+        
+        log_event("orchestrator_agent_start", user_task=user_task)
+
+        response = llm.invoke(messages)
+        try:
+            plan_json = extract_json(response.content)
+            plan = plan_json.get("plan", [])
+            if not isinstance(plan, list) or len(plan) == 0:
+                raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
+            log_event("orchestrator_agent_plan", pipeline_plan=plan)
+
+            plan = validate_plan(plan, set(roster), set(index))
+
+            return {"plan": plan, "results": {}, "current_step": 0}
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON response: {e}")
+
+    return orchestrator_agent
