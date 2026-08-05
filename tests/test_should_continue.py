@@ -1,18 +1,90 @@
-"""graphs.sequential_pipeline_graph.should_continue and the worker's dead-state
-contract.
+"""Tests for ``sequential_router`` (the active ``Send``-based router) and the
+legacy ``should_continue`` (kept for backward compatibility).
 
-We assert on the two pure functions directly rather than invoking the compiled
-sequential graph — the blocked-forever case would otherwise loop until the
-recursion limit.
+The new ``sequential_router`` dispatches a single ``Send`` with a
+``WorkerState`` payload — mirroring the parallel graph's ``fan_out_router``
+but sending only one step per dispatch.
 """
 
 import asyncio
 
 import pytest
+from langgraph.types import Send
 
-from graphs.sequential_pipeline_graph import should_continue
-from tests.plans import LINEAR_PLAN, step
+from graphs.sequential_pipeline_graph import sequential_router, should_continue
+from tests.plans import LINEAR_PLAN, DIAMOND_PLAN, step
 
+
+# ---------------------------------------------------------------------------
+# sequential_router (active, Send-based)
+# ---------------------------------------------------------------------------
+
+def _route(results, plan=None, current_datetime="now"):
+    return sequential_router(
+        {"plan": plan or DIAMOND_PLAN, "results": results, "current_datetime": current_datetime}
+    )
+
+
+def test_first_ready_step_dispatched():
+    """With no results, the first step (step 1) is dispatched."""
+    out = _route({})
+    assert isinstance(out, Send)
+    assert out.node == "sub_agent"
+    assert out.arg["step"]["step"] == 1
+
+
+def test_second_step_dispatched_after_first_completes():
+    """After step 1 completes, the next ready step is dispatched."""
+    out = _route({1: "a"})
+    assert isinstance(out, Send)
+    assert out.arg["step"]["step"] == 2
+
+
+def test_join_step_dispatched_when_all_deps_met():
+    """In a diamond plan, step 3 only dispatches after both 1 and 2 complete."""
+    out = _route({1: "a", 2: "b"})
+    assert isinstance(out, Send)
+    assert out.arg["step"]["step"] == 3
+
+
+def test_all_done_routes_to_assemble():
+    assert _route({1: "a", 2: "b", 3: "c"}) == "assemble"
+
+
+def test_send_payload_carries_expected_keys():
+    out = _route({})
+    payload = out.arg
+    assert set(payload) >= {"step", "results", "current_datetime"}
+
+
+def test_linear_plan_dispatches_in_order():
+    """Linear plan [1→2→3]: step 2 only dispatched after step 1."""
+    out = _route({}, plan=LINEAR_PLAN)
+    assert out.arg["step"]["step"] == 1
+    out = _route({1: "a"}, plan=LINEAR_PLAN)
+    assert out.arg["step"]["step"] == 2
+    out = _route({1: "a", 2: "b"}, plan=LINEAR_PLAN)
+    assert out.arg["step"]["step"] == 3
+
+
+def test_partial_deps_only_dispatches_unblocked():
+    """Step with unmet dependency is skipped; first unblocked step wins."""
+    out = _route({1: "a"})  # diamond: step 2 has no deps, step 3 blocked on 2
+    assert out.arg["step"]["step"] == 2
+
+
+def test_unsatisfiable_plan_raises_runtime_error():
+    """A step depending on a step that doesn't exist should raise."""
+    blocked = [step(1), step(2, deps=[99])]
+    with pytest.raises(RuntimeError, match="permanently blocked"):
+        sequential_router(
+            {"plan": blocked, "results": {1: "a"}, "current_datetime": ""}
+        )
+
+
+# ---------------------------------------------------------------------------
+# legacy should_continue (kept for backward compat)
+# ---------------------------------------------------------------------------
 
 def test_incomplete_results_continue_to_sub_agent():
     assert should_continue({"plan": LINEAR_PLAN, "results": {1: "a"}}) == "sub_agent"
@@ -23,19 +95,20 @@ def test_complete_results_route_to_assemble():
     assert should_continue({"plan": LINEAR_PLAN, "results": results}) == "assemble"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="plan 1.2 blocked-forever guard not yet implemented; sub_agent_node returns {}",
-)
 def test_blocked_forever_sub_agent_node_raises():
-    # No step is ready (step 1 depends on an absent step) and results are
-    # incomplete: today the worker returns {}, which makes should_continue loop
-    # until the recursion limit. The desired contract is a RuntimeError.
-    # Only reachable because no step is ready — so run_step is never called and
-    # no live LLM call happens.
+    """Tests make_sub_agent_node (the old sequential node) directly.
+
+    The node receives a step whose dependencies can never be satisfied
+    (referencing a non-existent step 99). The blocked-forever guard should
+    raise RuntimeError instead of returning an empty dict.
+    """
     from agents.sub_agents_nodes import make_sub_agent_node
 
     node = make_sub_agent_node()
-    state = {"plan": [step(1, deps=[99])], "results": {}, "current_datetime": ""}
-    with pytest.raises(RuntimeError):
+    state = {
+        "step": step(1, deps=[99]),
+        "results": {},
+        "current_datetime": "",
+    }
+    with pytest.raises(RuntimeError, match="cannot execute"):
         asyncio.run(node(state))

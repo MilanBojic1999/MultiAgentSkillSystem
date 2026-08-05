@@ -89,3 +89,60 @@ def test_failed_step_is_contained_and_recorded():
     assert out["final_output"]  # run still completes
     assert "[STEP FAILED]" in out["final_output"]
     assert 2 in out.get("failed_steps", [])
+
+
+# ---------------------------------------------------------------------------
+# Plan 4.12: sequential graph end-to-end tests
+# ---------------------------------------------------------------------------
+
+_SEQ_CONFIG = {"configurable": {"thread_id": "test-sequential"}}
+
+
+def _build_sequential_graph(plan, worker):
+    """The real sequential graph, with the two LLM-bearing nodes faked out."""
+    from graphs.sequential_pipeline_graph import build
+
+    def stub_orchestrator(state):
+        return {"plan": plan, "results": {}, "current_step": 0}
+
+    return build(orchestrator=stub_orchestrator, sub_agent=worker)
+
+
+@pytest.mark.parametrize("plan", [LINEAR_PLAN, DIAMOND_PLAN])
+def test_sequential_graph_each_step_runs_exactly_once_invoke(plan):
+    """Under invoke, the sequential graph executes every step exactly once."""
+    calls = Counter()
+
+    def stub_worker(state):
+        n = state["step"]["step"]
+        calls[n] += 1
+        return {"results": {n: f"out-{n}"}}
+
+    graph = _build_sequential_graph(plan, stub_worker)
+    out = graph.invoke({"task": "t", "current_datetime": ""}, config=_SEQ_CONFIG)
+
+    expected = {s["step"]: 1 for s in plan}
+    assert calls == expected
+    last = max(s["step"] for s in plan)
+    assert f"out-{last}" in out["final_output"]
+
+
+@pytest.mark.parametrize("plan", [LINEAR_PLAN, DIAMOND_PLAN])
+def test_sequential_graph_each_step_runs_exactly_once_ainvoke(plan):
+    """Under ainvoke, the sequential graph executes every step exactly once."""
+    calls = Counter()
+
+    async def fake_run(step, results, current_datetime=""):
+        n = step["step"]
+        calls[n] += 1
+        return n, f"out-{n}"
+
+    from agents.sub_agents_nodes import make_parallel_sub_agent_node
+    worker = make_parallel_sub_agent_node(run_step=fake_run)
+    graph = _build_sequential_graph(plan, worker)
+    out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}, config=_SEQ_CONFIG))
+
+    expected = {s["step"]: 1 for s in plan}
+    assert calls == expected
+    last = max(s["step"] for s in plan)
+    assert f"out-{last}" in out["final_output"]

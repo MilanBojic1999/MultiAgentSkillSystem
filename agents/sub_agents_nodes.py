@@ -1,4 +1,3 @@
-import asyncio
 from functools import partial
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -135,20 +134,24 @@ def make_sub_agent_node(run_step=None, llm=None):
         Sequential node: executes the next uncompleted step in the plan.
         """
 
-        plan    = state["plan"]
-        results = state.get("results", {})
+        step    = state["step"]
+        results = state["results"]
         current_datetime = state.get("current_datetime", "")
         # Find the next step whose dependencies are all resolved
-        for step in plan:
-            if step["step"] in results:
-                continue
-            deps_met = all(d in results for d in step.get("depends_on", []))
-            if deps_met:
-                step_num, output = asyncio.run(run_step(step, results, current_datetime))
+        if step["step"] in results:
+            return {"results": results[step["step"]]}
+        deps_met = all(d in results for d in step.get("depends_on", []))
+        if deps_met:
+            step_num, output = await run_step(step, results, current_datetime)
 
-                return {"results": {step_num: output}}
+            return {"results": {step_num: output}}
 
-        return {}
+        unfinished_deps = [d for d in step.get("depends_on", []) if d not in results]
+        raise RuntimeError(
+            f"Step {step['step']} cannot execute: its dependencies "
+            f"{unfinished_deps} are not in results and cannot be satisfied. "
+            f"Check that every step's depends_on references valid step numbers."
+        )
 
     return sub_agent_node
 
