@@ -40,6 +40,27 @@ class AgentState(TypedDict):
     final_output: str
 
 
+def _transitive_dependents(plan: list[dict], failed: set[int]) -> set[int]:
+    """Return every step transitively blocked by a failed step.
+
+    Does not include the *failed* steps themselves — only the steps that depend
+    on them, directly or transitively. Used by scheduler nodes to write
+    ``[SKIPPED — dependency failed]`` markers before the router runs (Phase 4.13).
+    """
+    if not failed:
+        return set()
+    blocked = set(failed)
+    changed = True
+    while changed:
+        changed = False
+        for s in plan:
+            if s["step"] not in blocked:
+                if set(s.get("depends_on", [])) & blocked:
+                    blocked.add(s["step"])
+                    changed = True
+    return blocked - failed
+
+
 class WorkerState(TypedDict):
     """Input schema for a single parallel worker task (the ``Send`` payload).
 

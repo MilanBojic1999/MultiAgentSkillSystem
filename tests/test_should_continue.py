@@ -95,12 +95,13 @@ def test_complete_results_route_to_assemble():
     assert should_continue({"plan": LINEAR_PLAN, "results": results}) == "assemble"
 
 
-def test_blocked_forever_sub_agent_node_raises():
-    """Tests make_sub_agent_node (the old sequential node) directly.
+def test_blocked_forever_sub_agent_node_is_contained():
+    """Tests make_sub_agent_node directly — failure containment (Phase 4.13).
 
     The node receives a step whose dependencies can never be satisfied
-    (referencing a non-existent step 99). The blocked-forever guard should
-    raise RuntimeError instead of returning an empty dict.
+    (referencing a non-existent step 99). The blocked-forever guard raises
+    RuntimeError, which the containment wrapper catches and records as a
+    ``[STEP FAILED]`` result + ``failed_steps`` entry instead of killing the run.
     """
     from agents.sub_agents_nodes import make_sub_agent_node
 
@@ -110,5 +111,7 @@ def test_blocked_forever_sub_agent_node_raises():
         "results": {},
         "current_datetime": "",
     }
-    with pytest.raises(RuntimeError, match="cannot execute"):
-        asyncio.run(node(state))
+    result = asyncio.run(node(state))
+    assert 1 in result.get("results", {})
+    assert "[STEP FAILED]" in result["results"][1]
+    assert 1 in result.get("failed_steps", [])

@@ -5,6 +5,7 @@ Reads a single ``agents/agent_config.json`` file that describes every agent:
 - description   — human-readable role summary
 - tools         — list of tool names (resolved against the auto-discovered TOOL_REGISTRY)
 - mcp_servers   — dict of MCP server name → URL
+- llm           — optional per-agent LLM overrides (Phase 4.3)
 
 Each agent OWNS the MCP servers listed under its key; the loader validates that no
 server is claimed by more than one agent.
@@ -47,12 +48,39 @@ def _validate_mcp_ownership(config: dict[str, dict[str, Any]]) -> None:
             server_owners[server_name] = agent_name
 
 
+_LLM_CONFIG_KEYS = frozenset({"model", "url", "api_key_env", "temperature", "max_tokens"})
+
+
+def _validate_llm_blocks(config: dict[str, dict[str, Any]]) -> None:
+    """Raise ``ValueError`` if any agent's ``llm`` block has unknown keys (Phase 4.3).
+
+    Catches typos at import time so they fail loudly instead of silently
+    falling back to the default endpoint mid-run.
+    """
+    for agent_name, cfg in config.items():
+        llm_block = cfg.get("llm")
+        if llm_block is None:
+            continue
+        if not isinstance(llm_block, dict):
+            raise TypeError(
+                f"Agent '{agent_name}': 'llm' must be a dict, "
+                f"got {type(llm_block).__name__}"
+            )
+        bad = set(llm_block) - _LLM_CONFIG_KEYS
+        if bad:
+            raise ValueError(
+                f"Agent '{agent_name}': unknown key(s) in 'llm' block: "
+                f"{sorted(bad)}. Accepted keys: {sorted(_LLM_CONFIG_KEYS)}."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 _raw = _load_raw_config()
 _validate_mcp_ownership(_raw)
+_validate_llm_blocks(_raw)
 AGENT_CONFIG: dict[str, dict[str, Any]] = _raw
 """Agent-keyed dictionary loaded from ``agents/agent_config.json``.
 
@@ -60,4 +88,5 @@ Each value is a dict with:
 - ``description``  (str)
 - ``tools``        (list[str])
 - ``mcp_servers``  (dict[str, str])
+- ``llm``          (dict | None)  — optional per-agent LLM overrides
 """

@@ -26,16 +26,25 @@ def test_empty_plan_yields_empty_output():
     assert assemble_node({"plan": [], "results": {}})["final_output"] == ""
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="plan 1.4 assemble warning header not yet implemented",
-)
 def test_failed_steps_prepend_a_warning_header():
+    """Plan 4.13: assemble_node emits a warning when ``failed_steps`` is non-empty."""
     state = {
         "plan": LINEAR_PLAN,
         "results": {1: "one", 2: "[STEP FAILED] boom", 3: "three"},
         "failed_steps": [2],
     }
     out = assemble_node(state)["final_output"]
-    assert out.lower().startswith("> ") or "warning" in out.lower()
-    assert "2" in out.split("\n", 1)[0]
+    assert out.startswith("> ⚠️")
+    assert "1 of 3 steps failed" in out.split("\n")[0]
+    assert "steps 2" in out.split("\n")[0]
+    assert "output below is partial" in out.split("\n")[0]
+    # Step bodies still follow the warning
+    assert "## Step 1: subtask 1\none" in out
+
+
+def test_failed_steps_warning_not_emitted_when_none_failed():
+    """No warning when failed_steps is missing or empty."""
+    state = {"plan": LINEAR_PLAN, "results": {1: "one", 2: "two", 3: "three"}}
+    out = assemble_node(state)["final_output"]
+    assert "⚠️" not in out
+    assert out.startswith("## Step 1")

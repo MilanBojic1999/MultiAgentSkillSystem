@@ -70,14 +70,23 @@ def test_each_step_dispatched_exactly_once(plan):
 
 
 def test_failed_step_is_contained_and_recorded():
-    # Plan 1.4 containment, verified on the real worker node: a failing step is
-    # recorded as a result and flagged in failed_steps (an AgentState channel as
-    # of 3.1) instead of killing the run. The failing step is injected through
-    # the worker factory's run_step seam rather than by patching a module global.
+    """Plan 1.4 + 4.13: a failing step is contained; its dependents are skipped.
+
+    Diamond plan where step 1 always throws:
+    - Step 1 → ``[STEP FAILED]`` marker
+    - Step 2 → real result (independent, no deps on step 1)
+    - Step 3 (depends_on=[1, 2]) → ``[SKIPPED — dependency failed]`` because
+      step 1 is failed — the scheduler writes the skip marker BEFORE the router
+      runs, so step 3 is **never dispatched** to the worker.
+    - ``final_output`` carries the warning header from ``assemble_node``.
+    """
     from agents.sub_agents_nodes import make_parallel_sub_agent_node
 
+    calls: list[int] = []
+
     async def fake_run(step, results, current_datetime=""):
-        if step["step"] == 2:
+        calls.append(step["step"])
+        if step["step"] == 1:
             raise RuntimeError("boom")
         return step["step"], f"out-{step['step']}"
 
@@ -86,9 +95,24 @@ def test_failed_step_is_contained_and_recorded():
     # The real worker node is async, so the graph must be driven with ainvoke.
     out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}, config=CONFIG))
 
-    assert out["final_output"]  # run still completes
+    # Step 3 must never reach the worker — the scheduler skips it before dispatch
+    assert 3 not in calls, "blocked step 3 was dispatched to worker"
+
+    # Step 1: failed and recorded
     assert "[STEP FAILED]" in out["final_output"]
-    assert 2 in out.get("failed_steps", [])
+    assert 1 in out.get("failed_steps", [])
+
+    # Step 2: succeeded (independent of the failed step)
+    assert "out-2" in out["final_output"]
+
+    # Step 3: transitively skipped because its dependency (step 1) failed
+    assert "[SKIPPED — dependency failed]" in out["final_output"]
+
+    # Warning header present
+    assert "⚠️" in out["final_output"]
+    assert "1 of 3 steps failed" in out["final_output"]
+    assert "steps 1" in out["final_output"]
+    assert "output below is partial" in out["final_output"]
 
 
 # ---------------------------------------------------------------------------
@@ -146,3 +170,39 @@ def test_sequential_graph_each_step_runs_exactly_once_ainvoke(plan):
     assert calls == expected
     last = max(s["step"] for s in plan)
     assert f"out-{last}" in out["final_output"]
+
+
+def test_sequential_graph_failure_containment_and_skip_propagation():
+    """Plan 4.13: sequential graph also contains failures and skips dependents.
+
+    Linear plan [1→2→3] where step 1 throws:
+    - Step 1 → ``[STEP FAILED]``
+    - Step 2 (depends_on=[1]) → ``[SKIPPED — dependency failed]``
+    - Step 3 (depends_on=[2]) → ``[SKIPPED — dependency failed]`` (transitive)
+    - Warning header present.
+    """
+    from agents.sub_agents_nodes import make_parallel_sub_agent_node
+
+    calls: list[int] = []
+
+    async def fake_run(step, results, current_datetime=""):
+        calls.append(step["step"])
+        if step["step"] == 1:
+            raise RuntimeError("boom")
+        return step["step"], f"out-{step['step']}"
+
+    worker = make_parallel_sub_agent_node(run_step=fake_run)
+    graph = _build_sequential_graph(LINEAR_PLAN, worker)
+    out = asyncio.run(
+        graph.ainvoke({"task": "t", "current_datetime": ""}, config=_SEQ_CONFIG)
+    )
+
+    # Only step 1 was dispatched; steps 2 and 3 were skipped by the scheduler
+    assert calls == [1], f"expected only step 1 to be dispatched, got {calls}"
+
+    assert "[STEP FAILED]" in out["final_output"]
+    assert 1 in out.get("failed_steps", [])
+
+    assert "[SKIPPED — dependency failed]" in out["final_output"]
+    assert "⚠️" in out["final_output"]
+    assert "1 of 3 steps failed" in out["final_output"]

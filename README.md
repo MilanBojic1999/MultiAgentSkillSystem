@@ -234,11 +234,10 @@ ruff check tests/         # lint the test code
 ```
 
 Tests live in `tests/` (one module per production module). A few tests are
-marked `xfail` — they document behavior that isn't implemented yet (the two
-known bugs in [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md),
-the blocked-forever deadlock guards, and the `failed_steps` state field) and
-flip to passing as those fixes land. Tests that would need a live endpoint are
-marked `@pytest.mark.integration` and excluded by default; see
+marked `xfail` — they document behavior that isn't implemented yet (the
+blocked-forever deadlock guard in `fan_out_router` from the improvement plan)
+and flip to passing as those fixes land. Tests that would need a live endpoint
+are marked `@pytest.mark.integration` and excluded by default; see
 [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) for the full
 specification.
 
@@ -275,7 +274,8 @@ Add one entry to `agents/agent_config.json` — no code:
 "coder": {
     "description": "Software engineer skilled in writing and reviewing code.",
     "tools": ["run_bash"],
-    "mcp_servers": {}
+    "mcp_servers": {},
+    "llm": {"temperature": 0.3}
 }
 ```
 
@@ -283,7 +283,9 @@ The orchestrator discovers new agents automatically on the next run. Write the
 `description` for the planner, not for humans — it is the only signal the
 orchestrator has when deciding which agent gets a step. `mcp_servers` maps
 server name → URL; each MCP server must be owned by exactly one agent
-(`config_loader.py` enforces this at startup).
+(`config_loader.py` enforces this at startup). The optional `"llm"` block
+accepts any of `model`, `url`, `api_key_env`, `temperature`, `max_tokens` —
+every key is optional, and an absent block means "use the default endpoint."
 
 ### Recipe 3 — Add a skill
 
@@ -356,11 +358,13 @@ graph (listings report it instead of crashing).
 Topology rules (the hard-won lessons behind items 1.1–1.2 of the improvement
 plan):
 
-- Route workers back through a no-op **scheduler** node with plain `add_edge`
+- Route workers back through a **scheduler** node with plain `add_edge`
   calls, and hang the *only* conditional edge off the scheduler. Conditional
   edges are evaluated once per completed task and `Send` dispatches are not
   deduplicated — a conditional edge attached directly to the worker
-  double-dispatches dependent steps.
+  double-dispatches dependent steps. The scheduler also propagates
+  `[SKIPPED — dependency failed]` markers for steps transitively blocked by
+  a failed step (Phase 4.13).
 - Pass `add_conditional_edges` a callable router plus a plain **list** of
   target names (`["assemble", "parallel_sub_agent"]`) — never a dict keyed on
   the `Send` class, and never a node-name string in place of the router.
@@ -397,12 +401,13 @@ All agent definitions — descriptions, tool assignments, and MCP server ownersh
 }
 ```
 
-Each agent entry has three fields:
+Each agent entry has four fields (two required, two optional):
 - `description` — human-readable role summary (shown to the orchestrator)
 - `tools` — list of tool names to assign to this agent (resolved against the auto-discovered `TOOL_REGISTRY`)
 - `mcp_servers` — dict of MCP server name → URL owned by this agent
+- `llm` *(optional)* — per-agent LLM overrides (`model`, `url`, `api_key_env`, `temperature`, `max_tokens`). Every key is optional; an absent block means "use the env-configured default". `api_key_env` names an environment variable — never stores a literal key.
 
-The `config_loader.py` module loads this file at import time and validates that no MCP server is claimed by more than one agent (each MCP server must have exactly one owner).
+The `config_loader.py` module loads this file at import time and validates MCP ownership, `llm`-block key typos, and that required fields are present — a bad key fails loudly at startup instead of silently falling back to the default endpoint mid-run.
 
 To add a new agent, see [Recipe 2](#recipe-2--add-an-agent).
 
@@ -444,8 +449,9 @@ To add a new skill, see [Recipe 3](#recipe-3--add-a-skill).
 class AgentState(TypedDict):
     task: str                    # User's original request
     plan: list[PlanStep]         # Orchestrator's decomposition
-    results: dict[int, str]      # Accumulated step outputs
-    final_output: str            # Assembled final answer
+    results: dict[int, str]      # Accumulated step outputs (incl. failure markers)
+    failed_steps: list[int]      # Steps that failed after retries (Phase 4.13)
+    final_output: str            # Assembled final answer (with warning header)
     current_datetime: str        # Current date/time for context
 ```
 
@@ -536,7 +542,8 @@ The API uses Pydantic models for request/response validation and includes CORS m
 - **Output validation** (`utils/validator.py`) — Blocks XSS vectors (`<script`), prompt leakage patterns, empty outputs, and oversized outputs (>50K chars)
 - **Sandboxed bash** — `run_bash` drops privileges to `nobody` user before executing
 - **MCP ownership validation** — Agents can only access MCP servers they explicitly own; `config_loader.py` enforces exclusive ownership at startup; `agent_mcp_tools.py` re-checks at runtime
-- **Retry policy** — Parallel sub-agent nodes have `RetryPolicy(max_attempts=2)` for automatic retries on failure
+- **Retry policy** — Sub-agent nodes have `RetryPolicy(max_attempts=2)` for automatic retries on transient errors
+- **Failure containment** — A step that exhausts retries is recorded as `[STEP FAILED]` and its dependents are marked `[SKIPPED — dependency failed]` without being dispatched; the assembler prepends a warning header to `final_output` so partial results are clearly flagged
 
 ## Configuration Reference
 
