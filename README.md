@@ -95,7 +95,7 @@ agent_skills/
 │   ├── logger.py                # JSON-structured logging
 │   ├── json_utils.py            # JSON extraction from LLM output
 │   ├── plan_validator.py        # Plan schema + semantic validation
-│   ├── senitize.py              # Prompt injection detection
+│   ├── sanitize.py              # Prompt injection detection
 │   └── validator.py             # Sub-agent output validation
 │
 └── artifacts/                   # Generated output files (plots, etc.)
@@ -538,7 +538,7 @@ The API uses Pydantic models for request/response validation and includes CORS m
 
 ### Security Features
 
-- **Prompt injection detection** (`utils/senitize.py`) — Scans user input for jailbreak patterns (ignore instructions, system prompt extraction, data exfiltration via markdown images)
+- **Prompt injection detection** (`utils/sanitize.py`) — Scans user input for jailbreak patterns (ignore instructions, system prompt extraction, data exfiltration via markdown images)
 - **Output validation** (`utils/validator.py`) — Blocks XSS vectors (`<script`), prompt leakage patterns, empty outputs, and oversized outputs (>50K chars)
 - **Sandboxed bash** — `run_bash` drops privileges to `nobody` user before executing
 - **MCP ownership validation** — Agents can only access MCP servers they explicitly own; `config_loader.py` enforces exclusive ownership at startup; `agent_mcp_tools.py` re-checks at runtime

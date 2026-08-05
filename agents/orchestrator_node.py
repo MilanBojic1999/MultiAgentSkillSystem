@@ -4,7 +4,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from skill_loader import load_skills
 from dotenv import load_dotenv
 from utils.logger import log_event
-from utils.senitize import sanitize_content
+from utils.sanitize import sanitize_content
 from utils.json_utils import extract_json
 from utils.plan_validator import validate_plan
 from llm_factory import create_llm

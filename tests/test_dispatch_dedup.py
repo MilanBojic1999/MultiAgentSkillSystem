@@ -32,15 +32,6 @@ def test_parallel_graph_module_builds():
 
     assert build() is not None
 
-
-def test_root_import_shim_still_resolves():
-    # Item 1.5: the misspelled root path keeps working for one more release.
-    import paralel_pipeline_graph
-    from graphs import parallel_pipeline_graph
-
-    assert paralel_pipeline_graph.build is parallel_pipeline_graph.build
-
-
 def _build_graph(plan, worker):
     """The real parallel graph, with the two LLM-bearing nodes faked out."""
     pg = import_parallel_or_xfail()

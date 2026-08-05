@@ -74,6 +74,45 @@ def _validate_llm_blocks(config: dict[str, dict[str, Any]]) -> None:
             )
 
 
+def _validate_mcp_shapes(config: dict[str, dict[str, Any]]) -> None:
+    """Raise ``ValueError`` if any MCP server config dict has neither ``url``
+    nor ``command`` (Phase 4.6).
+
+    Plain-string values are accepted for legacy backward compatibility
+    (they are converted to ``{"url": <value>}`` in ``_build_server_map``).
+    """
+    for agent_name, cfg in config.items():
+        servers = cfg.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            raise TypeError(
+                f"Agent '{agent_name}': 'mcp_servers' must be a dict, "
+                f"got {type(servers).__name__}"
+            )
+        for server_name, server_conf in servers.items():
+            # Plain strings: legacy compat, handled elsewhere
+            if isinstance(server_conf, str):
+                continue
+            if not isinstance(server_conf, dict):
+                raise TypeError(
+                    f"Agent '{agent_name}', MCP server '{server_name}': "
+                    f"expected a dict or string config, "
+                    f"got {type(server_conf).__name__}"
+                )
+            has_url = "url" in server_conf
+            has_command = "command" in server_conf
+            if not has_url and not has_command:
+                raise ValueError(
+                    f"Agent '{agent_name}', MCP server '{server_name}': "
+                    f"config dict must have 'url' or 'command' key. "
+                    f"Got keys: {sorted(server_conf.keys())}"
+                )
+            if has_url and has_command:
+                raise ValueError(
+                    f"Agent '{agent_name}', MCP server '{server_name}': "
+                    f"config dict has both 'url' and 'command' — pick one."
+                )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -81,6 +120,7 @@ def _validate_llm_blocks(config: dict[str, dict[str, Any]]) -> None:
 _raw = _load_raw_config()
 _validate_mcp_ownership(_raw)
 _validate_llm_blocks(_raw)
+_validate_mcp_shapes(_raw)
 AGENT_CONFIG: dict[str, dict[str, Any]] = _raw
 """Agent-keyed dictionary loaded from ``agents/agent_config.json``.
 
