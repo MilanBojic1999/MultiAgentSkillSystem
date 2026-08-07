@@ -2,10 +2,10 @@
 
 Usage::
 
-    python -m scaffold graph  my-graph     # -> graphs/my_graph_graph.py
-    python -m scaffold tool   my-tool      # -> tools/my_tool.py
-    python -m scaffold skill  my-skill     # -> skills/my-skill/SKILL.md
-    python -m scaffold agent  my-agent     # appends to agents/agent_config.json
+    python -m scaffold graph  my_graph     # -> graphs/my_graph_graph.py
+    python -m scaffold tool   my_tool      # -> tools/my_tool.py
+    python -m scaffold skill  my_skill     # -> skills/my-skill/SKILL.md
+    python -m scaffold agent  my_agent     # appends to agents/agent_config.json
 
 Every scaffold refuses to overwrite an existing file and prints the next
 step (``pytest tests/test_extension_contracts.py``) after writing.

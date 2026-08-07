@@ -250,6 +250,57 @@ endpoint are marked `@pytest.mark.integration` and excluded by default; see
 [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) for the full
 specification.
 
+## Evaluation Harness
+
+`python -m evals` runs golden plan-shape tasks through the **real orchestrator**
++ a **stub worker** — one LLM call per task, no tools executed. It checks that
+the orchestrator produces plans matching the expected shape (step count,
+assigned agents, dependency structure) and prints a pass/fail table.
+
+```bash
+# Run all golden tasks against the default (parallel) graph
+python -m evals
+
+# Run against a different graph
+python -m evals --graph sequential
+
+# Verbose: print each task text and per-assertion details on failure
+python -m evals --graph parallel --verbose
+```
+
+Exit codes: `0` all tasks passed, `1` at least one FAIL or ERROR, `2` usage
+error (bad graph name, missing tasks dir).
+
+### Golden task format
+
+Drop `.yaml` files into `evals/tasks/` — the runner picks them up automatically:
+
+```yaml
+task: "Calculate the maximum of x^2*sin(x) on [0,2], then summarise it"
+expect:
+  min_steps: 2           # plan must have at least this many steps
+  max_steps: 6           # plan must have at most this many steps
+  agents_include:        # these agents must appear in the plan
+    - mathematician
+    - writer
+  has_dependency: true   # at least one step must depend_on another
+```
+
+All four `expect` keys are optional — omit any to skip that check, or omit
+`expect` entirely for a smoke test ("does the graph run to completion?").
+Unknown keys are ignored (forward-compatible).
+
+### When to run it
+
+- After changing the orchestrator prompt (`agents/orchestrator_node.py`)
+- After adding or removing agents or skills (the roster the planner sees changes)
+- After building a new graph, to verify it produces sane plans
+- After model changes, to catch plan-quality regressions
+
+The harness is **not** part of the default `pytest` suite (it needs a live LLM
+endpoint). Its unit tests in `tests/test_evals_harness.py` are — they cover
+every assertion and edge case without network access.
+
 ## Contributor Recipes
 
 The four most common ways to extend the system. The first three are pure

@@ -42,4 +42,4 @@ py-modules = [
     "scaffold",
     "skill_loader",
 ]
-packages = ["agents", "graphs", "tools", "utils"]
+packages = ["agents", "evals", "graphs", "tools", "utils"]
