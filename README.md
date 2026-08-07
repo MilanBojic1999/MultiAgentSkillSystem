@@ -55,6 +55,7 @@ agent_skills/
 ├── llm_factory.py               # create_llm(...) — the single ChatOpenAI construction site
 ├── skill_loader.py              # SKILL.md file loader (YAML frontmatter + body)
 ├── config_loader.py             # Unified agent-config loader + validator
+├── scaffold.py                  # Extension scaffolding tool (python -m scaffold)
 ├── pyproject.toml               # Packaging metadata + dev deps + pytest config
 ├── requirements.txt             # Pinned lockfile-style dependencies (Docker)
 ├── .env.example                 # Documented template — copy to .env
@@ -233,11 +234,19 @@ pytest                    # runs the full suite
 ruff check tests/         # lint the test code
 ```
 
-Tests live in `tests/` (one module per production module). A few tests are
-marked `xfail` — they document behavior that isn't implemented yet (the
-blocked-forever deadlock guard in `fan_out_router` from the improvement plan)
-and flip to passing as those fixes land. Tests that would need a live endpoint
-are marked `@pytest.mark.integration` and excluded by default; see
+Tests live in `tests/` (one module per production module). Key files:
+
+- `tests/test_extension_contracts.py` — **conformance suite** (plan item 4.16).
+  Parametrized over the live registries; run after adding any extension to
+  verify it is well-formed. A broken skill, agent, tool or graph turns exactly
+  one parametrized case red, with a message naming the offender.
+- `tests/test_scaffold.py` — verifies that every scaffold kind produces
+  output that passes the conformance suite (plan item 4.17).
+
+A few tests are marked `xfail` — they document behavior that isn't implemented
+yet (the blocked-forever deadlock guard in `fan_out_router` from the improvement
+plan) and flip to passing as those fixes land. Tests that would need a live
+endpoint are marked `@pytest.mark.integration` and excluded by default; see
 [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) for the full
 specification.
 
@@ -245,6 +254,44 @@ specification.
 
 The four most common ways to extend the system. The first three are pure
 config/data changes — no pipeline code is touched.
+
+> **⚡ Quick start:** The fastest way to scaffold any extension is
+> `python -m scaffold <kind> <name> [-d "description"]` — it generates a
+> well-formed, immediately-testable stub in one command. See
+> [Recipe 0](#recipe-0--scaffold-an-extension) below.
+
+### Recipe 0 — Scaffold an extension
+
+For `graph | tool | skill | agent`, the `scaffold` command creates a
+well-formed stub with the right shape, frontmatter, and topology rules already
+correct. Every scaffold refuses to overwrite an existing file and prints the
+next step after writing.
+
+```bash
+# Scaffold a new graph (scheduler → router pattern, RetryPolicy, blocked-forever guard)
+python -m scaffold graph my-topology -d "One-line description shown by --list-graphs"
+
+# Scaffold a new tool (@tool-decorated function with typed signature)
+python -m scaffold tool word-count -d "Count the words in a piece of text."
+
+# Scaffold a new skill (YAML frontmatter + body, name matches directory)
+python -m scaffold skill code-review -d "Review code for bugs and style issues."
+
+# Scaffold a new agent (appends a validated entry to agent_config.json)
+python -m scaffold agent coder -d "Software engineer skilled in writing and reviewing code."
+```
+
+After scaffolding, verify with the conformance suite:
+
+```bash
+pytest tests/test_extension_contracts.py
+```
+
+Each kind passes its corresponding 4.16 conformance test unmodified — the
+graph compiles, the tool has a valid `args_schema`, the skill parses
+correctly, and the agent entry resolves.
+
+If you prefer to create extensions by hand, the manual recipes follow.
 
 ### Recipe 1 — Add a tool
 
