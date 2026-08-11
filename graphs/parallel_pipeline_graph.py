@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import RetryPolicy
-from agents.agent_states import AgentState
+from agents.agent_states import AgentState, _transitive_dependents
 from agents.orchestrator_node import make_orchestrator_agent
 from agents.sub_agents_nodes import make_parallel_sub_agent_node
 from assemble_node import assemble_node
@@ -41,7 +41,33 @@ def fan_out_router(state: dict):
 
 
 def scheduler_node(state: dict) -> dict:
-    return {}
+    """Synchronisation barrier: also propagates skips from failed steps (4.13).
+
+    Writes ``[SKIPPED — dependency failed]`` markers for every step transitively
+    blocked by a failed step, so the router never dispatches them.  Also emits
+    ``step_stats`` entries so every step in the plan gets a stats row (4.9).
+    """
+    failed = set(state.get("failed_steps", []))
+    if not failed:
+        return {}
+    blocked = _transitive_dependents(state["plan"], failed)
+    results = state.get("results", {})
+    plan = state["plan"]
+    return {
+        "results": {s: "[SKIPPED — dependency failed]" for s in blocked if s not in results},
+        "step_stats": [
+            {
+                "step": s,
+                "agent": next((p["agent"] for p in plan if p["step"] == s), "unknown"),
+                "status": "skipped",
+                "duration_s": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "tool_calls": 0,
+            }
+            for s in blocked if s not in results
+        ],
+    }
 
 
 def build(*, checkpointer=None, orchestrator=None, sub_agent=None):

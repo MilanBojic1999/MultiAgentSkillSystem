@@ -41,4 +41,4 @@ py-modules = [
     "run_pipeline",
     "skill_loader",
 ]
-packages = ["agents", "graphs", "tools", "utils"]
+packages = ["agents", "evals", "graphs", "scaffold", "tools", "utils"]

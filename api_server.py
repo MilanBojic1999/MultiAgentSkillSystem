@@ -60,6 +60,7 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     final_output: str
+    step_stats: list[dict] | None = None
 
 
 class GraphInfo(BaseModel):
@@ -81,6 +82,7 @@ class StatusResponse(BaseModel):
     task_id: str
     status: str  # "running" | "completed" | "failed"
     final_output: str | None = None
+    step_stats: list[dict] | None = None
     error: str | None = None
 
 
@@ -174,15 +176,22 @@ def _resolve_graph_or_400(graph_name: str | None) -> None:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-async def _run_pipeline(task: str, graph_name: str | None = None) -> str:
-    """Run the selected LangGraph pipeline and return the assembled output."""
+async def _run_pipeline(task: str, graph_name: str | None = None) -> tuple[str, list[dict]]:
+    """Run the selected LangGraph pipeline.
+
+    Returns ``(final_output, step_stats)`` — the assembled output string and
+    the per-step execution statistics collected during the run (Phase 4.9).
+    """
     graph = _get_graph(graph_name)
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
     result = await graph.ainvoke(
         {"task": task, "current_datetime": get_current_datetime_str()},
         config=config,
     )
-    return result.get("final_output", "No final output produced.")
+    return (
+        result.get("final_output", "No final output produced."),
+        result.get("step_stats", []),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +227,8 @@ async def run_pipeline(req: RunRequest):
     """
     _resolve_graph_or_400(req.graph)
     try:
-        output = await _run_pipeline(req.task, req.graph)
-        return RunResponse(final_output=output)
+        output, step_stats = await _run_pipeline(req.task, req.graph)
+        return RunResponse(final_output=output, step_stats=step_stats)
     except Exception as exc:
         error_id = uuid.uuid4().hex[:12]
         log_event("api_run_failed", error_id=error_id, error=str(exc),
@@ -247,9 +256,14 @@ async def run_pipeline_async(req: RunRequest):
 
     async def _background():
         try:
-            output = await _run_pipeline(req.task, req.graph)
+            output, step_stats = await _run_pipeline(req.task, req.graph)
             async with _task_lock:
-                _task_store[task_id] = {"status": "completed", "final_output": output, "error": None}
+                _task_store[task_id] = {
+                    "status": "completed",
+                    "final_output": output,
+                    "step_stats": step_stats,
+                    "error": None,
+                }
         except Exception as exc:
             log_event("api_async_task_failed", task_id=task_id, error=str(exc),
                       traceback=traceback.format_exc())
@@ -284,6 +298,7 @@ async def task_status(task_id: str):
         task_id=task_id,
         status=entry["status"],
         final_output=entry.get("final_output"),
+        step_stats=entry.get("step_stats"),
         error=entry.get("error"),
     )
 

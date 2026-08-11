@@ -17,6 +17,23 @@ class PlanStep(TypedDict):
     skills_needed: list[str]
     depends_on: list[int]
 
+
+class StepStats(TypedDict):
+    """Per-step execution statistics (Phase 4.9).
+
+    Accumulated by worker nodes and scheduler nodes via ``operator.add`` on the
+    ``step_stats`` list in ``AgentState``. Every step in the plan produces exactly
+    one entry — either ``"completed"``, ``"failed"``, or ``"skipped"``.
+    """
+    step: int
+    agent: str
+    status: str           # "completed" | "failed" | "skipped"
+    duration_s: float
+    input_tokens: int
+    output_tokens: int
+    tool_calls: int
+
+
 class AgentState(TypedDict):
     # Inputs
     task: str
@@ -36,8 +53,32 @@ class AgentState(TypedDict):
     # Steps whose sub-agent failed after retries (Phase 1.4 failure containment)
     failed_steps: Annotated[list[int], operator.add]
 
+    # Per-step execution statistics (Phase 4.9) — one entry per plan step
+    step_stats: Annotated[list[StepStats], operator.add]
+
     # Final assembled output
     final_output: str
+
+
+def _transitive_dependents(plan: list[dict], failed: set[int]) -> set[int]:
+    """Return every step transitively blocked by a failed step.
+
+    Does not include the *failed* steps themselves — only the steps that depend
+    on them, directly or transitively. Used by scheduler nodes to write
+    ``[SKIPPED — dependency failed]`` markers before the router runs (Phase 4.13).
+    """
+    if not failed:
+        return set()
+    blocked = set(failed)
+    changed = True
+    while changed:
+        changed = False
+        for s in plan:
+            if s["step"] not in blocked:
+                if set(s.get("depends_on", [])) & blocked:
+                    blocked.add(s["step"])
+                    changed = True
+    return blocked - failed
 
 
 class WorkerState(TypedDict):

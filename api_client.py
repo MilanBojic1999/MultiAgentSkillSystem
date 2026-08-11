@@ -2,7 +2,7 @@
 """
 CLI client for the Agent Skills Pipeline API.
 
-Zero external dependencies — uses only Python stdlib (urllib + json).
+Zero external dependencies - uses only Python stdlib (urllib + json).
 
 Usage:
     # Run a task through the pipeline
@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
 
 DEFAULT_URL = "http://localhost:8000"
@@ -41,7 +41,7 @@ POLL_INTERVAL = 2  # seconds between async status checks
 # ---------------------------------------------------------------------------
 
 
-def _request(method: str, path: str, base_url: str, body: dict | None = None) -> dict[str, Any]:
+def _request(method: str, path: str, base_url: str, body: Optional[dict] = None) -> dict[str, Any]:
     """Send an HTTP request and return the parsed JSON response."""
     url = f"{base_url.rstrip('/')}{path}"
     data = json.dumps(body).encode("utf-8") if body else None
@@ -89,7 +89,7 @@ def list_graphs(base_url: str) -> bool:
     return True
 
 
-def run_task(task: str, base_url: str, graph: str | None = None) -> str | None:
+def run_task(task: str, base_url: str, graph: Optional[str] = None) -> Optional[str]:
     """Run a task synchronously and return the final output."""
     print(f"🚀 Running task:\n   {task}\n")
     print(f"📡 POST {base_url}/run ...")
@@ -103,7 +103,7 @@ def run_task(task: str, base_url: str, graph: str | None = None) -> str | None:
     return result.get("final_output", "")
 
 
-def _run_body(task: str, graph: str | None) -> dict[str, Any]:
+def _run_body(task: str, graph: Optional[str]) -> dict[str, Any]:
     """Request body for /run and /run-async; omit `graph` to take the server default."""
     body: dict[str, Any] = {"task": task}
     if graph:
@@ -111,7 +111,7 @@ def _run_body(task: str, graph: str | None) -> dict[str, Any]:
     return body
 
 
-def run_task_async(task: str, base_url: str, graph: str | None = None) -> str | None:
+def run_task_async(task: str, base_url: str, graph: Optional[str] = None) -> Optional[str]:
     """Start an async task and poll until completion."""
     print(f"🚀 Starting async task:\n   {task}\n")
     print(f"📡 POST {base_url}/run-async ...")

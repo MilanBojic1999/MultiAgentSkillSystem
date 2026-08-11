@@ -1,8 +1,8 @@
-"""utils.senitize.sanitize_content — injection detection and its boundary."""
+"""utils.sanitize.sanitize_content — injection detection and its boundary."""
 
 import pytest
 
-from utils.senitize import sanitize_content
+from utils.sanitize import sanitize_content
 
 
 @pytest.mark.parametrize(

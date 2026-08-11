@@ -1,0 +1,6 @@
+task: "Explane history of machine learning"
+expect:
+  min_steps: 2
+  max_steps: 8
+  agents_include: [researcher, writer]
+  has_dependency: true        # at least one step depends_on another

@@ -55,6 +55,7 @@ agent_skills/
 ├── llm_factory.py               # create_llm(...) — the single ChatOpenAI construction site
 ├── skill_loader.py              # SKILL.md file loader (YAML frontmatter + body)
 ├── config_loader.py             # Unified agent-config loader + validator
+├── scaffold/                    # Extension scaffolding tool (python -m scaffold)
 ├── pyproject.toml               # Packaging metadata + dev deps + pytest config
 ├── requirements.txt             # Pinned lockfile-style dependencies (Docker)
 ├── .env.example                 # Documented template — copy to .env
@@ -95,7 +96,7 @@ agent_skills/
 │   ├── logger.py                # JSON-structured logging
 │   ├── json_utils.py            # JSON extraction from LLM output
 │   ├── plan_validator.py        # Plan schema + semantic validation
-│   ├── senitize.py              # Prompt injection detection
+│   ├── sanitize.py              # Prompt injection detection
 │   └── validator.py             # Sub-agent output validation
 │
 └── artifacts/                   # Generated output files (plots, etc.)
@@ -233,19 +234,99 @@ pytest                    # runs the full suite
 ruff check tests/         # lint the test code
 ```
 
-Tests live in `tests/` (one module per production module). A few tests are
-marked `xfail` — they document behavior that isn't implemented yet (the two
-known bugs in [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md),
-the blocked-forever deadlock guards, and the `failed_steps` state field) and
-flip to passing as those fixes land. Tests that would need a live endpoint are
-marked `@pytest.mark.integration` and excluded by default; see
+Tests live in `tests/` (one module per production module). Key files:
+
+- `tests/test_extension_contracts.py` — **conformance suite** (plan item 4.16).
+  Parametrized over the live registries; run after adding any extension to
+  verify it is well-formed. A broken skill, agent, tool or graph turns exactly
+  one parametrized case red, with a message naming the offender.
+- `tests/test_scaffold.py` — verifies that every scaffold kind produces
+  output that passes the conformance suite (plan item 4.17).
+
+A few tests are marked `xfail` — they document behavior that isn't implemented
+yet (the blocked-forever deadlock guard in `fan_out_router` from the improvement
+plan) and flip to passing as those fixes land. Tests that would need a live
+endpoint are marked `@pytest.mark.integration` and excluded by default; see
 [`docs/history/TESTING_GUIDE.md`](docs/history/TESTING_GUIDE.md) for the full
 specification.
+
+## Evaluation Harness
+
+`python -m evals` runs golden plan-shape tasks through the **real orchestrator**
++ a **stub worker** — one LLM call per task, no tools executed. It checks that
+the orchestrator produces plans matching the expected shape (step count,
+assigned agents, dependency structure) and prints a pass/fail table.
+
+```bash
+# Run all golden tasks against the default (parallel) graph
+python -m evals
+
+# Run against a different graph
+python -m evals --graph sequential
+
+# Verbose: print each task text and per-assertion details on failure
+python -m evals --graph parallel --verbose
+```
+
+Exit codes: `0` all tasks passed, `1` at least one FAIL or ERROR, `2` usage
+error (bad graph name, missing tasks dir).
+
+### Golden task format
+
+Drop `.yaml` files into `evals/tasks/` — the runner picks them up automatically:
+
+```yaml
+task: "Calculate the maximum of x^2*sin(x) on [0,2], then summarise it"
+expect:
+  min_steps: 2           # plan must have at least this many steps
+  max_steps: 6           # plan must have at most this many steps
+  agents_include:        # these agents must appear in the plan
+    - mathematician
+    - writer
+  has_dependency: true   # at least one step must depend_on another
+```
+
+All four `expect` keys are optional — omit any to skip that check, or omit
+`expect` entirely for a smoke test ("does the graph run to completion?").
+Unknown keys are ignored (forward-compatible).
+
+### When to run it
+
+- After changing the orchestrator prompt (`agents/orchestrator_node.py`)
+- After adding or removing agents or skills (the roster the planner sees changes)
+- After building a new graph, to verify it produces sane plans
+- After model changes, to catch plan-quality regressions
+
+The harness is **not** part of the default `pytest` suite (it needs a live LLM
+endpoint). Its unit tests in `tests/test_evals_harness.py` are — they cover
+every assertion and edge case without network access.
 
 ## Contributor Recipes
 
 The four most common ways to extend the system. The first three are pure
 config/data changes — no pipeline code is touched.
+
+> **⚡ Quick start:** `python -m scaffold <kind> <name> [-d "description"]`
+> generates a well-formed, immediately-testable stub in one command.
+> Full usage and architecture: **[scaffold/README.md](scaffold/README.md)**
+
+### Recipe 0 — Scaffold an extension
+
+Generate well-formed stubs in one command. Each scaffold refuses to overwrite
+and passes the conformance suite unchanged — verify with
+`pytest tests/test_extension_contracts.py`.
+
+```bash
+python -m scaffold graph my-topology -d "Custom DAG with a critique loop"
+python -m scaffold tool  word-count   -d "Count the words in a piece of text."
+python -m scaffold skill code-review  -d "Review code for bugs and style issues."
+python -m scaffold agent coder        -d "Software engineer."
+```
+
+Full usage, architecture, and how to extend the scaffold itself:
+**[scaffold/README.md](scaffold/README.md)**.
+
+If you prefer to create extensions by hand, the manual recipes follow.
 
 ### Recipe 1 — Add a tool
 
@@ -275,7 +356,8 @@ Add one entry to `agents/agent_config.json` — no code:
 "coder": {
     "description": "Software engineer skilled in writing and reviewing code.",
     "tools": ["run_bash"],
-    "mcp_servers": {}
+    "mcp_servers": {},
+    "llm": {"temperature": 0.3}
 }
 ```
 
@@ -283,7 +365,9 @@ The orchestrator discovers new agents automatically on the next run. Write the
 `description` for the planner, not for humans — it is the only signal the
 orchestrator has when deciding which agent gets a step. `mcp_servers` maps
 server name → URL; each MCP server must be owned by exactly one agent
-(`config_loader.py` enforces this at startup).
+(`config_loader.py` enforces this at startup). The optional `"llm"` block
+accepts any of `model`, `url`, `api_key_env`, `temperature`, `max_tokens` —
+every key is optional, and an absent block means "use the default endpoint."
 
 ### Recipe 3 — Add a skill
 
@@ -356,11 +440,13 @@ graph (listings report it instead of crashing).
 Topology rules (the hard-won lessons behind items 1.1–1.2 of the improvement
 plan):
 
-- Route workers back through a no-op **scheduler** node with plain `add_edge`
+- Route workers back through a **scheduler** node with plain `add_edge`
   calls, and hang the *only* conditional edge off the scheduler. Conditional
   edges are evaluated once per completed task and `Send` dispatches are not
   deduplicated — a conditional edge attached directly to the worker
-  double-dispatches dependent steps.
+  double-dispatches dependent steps. The scheduler also propagates
+  `[SKIPPED — dependency failed]` markers for steps transitively blocked by
+  a failed step (Phase 4.13).
 - Pass `add_conditional_edges` a callable router plus a plain **list** of
   target names (`["assemble", "parallel_sub_agent"]`) — never a dict keyed on
   the `Send` class, and never a node-name string in place of the router.
@@ -397,12 +483,13 @@ All agent definitions — descriptions, tool assignments, and MCP server ownersh
 }
 ```
 
-Each agent entry has three fields:
+Each agent entry has four fields (two required, two optional):
 - `description` — human-readable role summary (shown to the orchestrator)
 - `tools` — list of tool names to assign to this agent (resolved against the auto-discovered `TOOL_REGISTRY`)
 - `mcp_servers` — dict of MCP server name → URL owned by this agent
+- `llm` *(optional)* — per-agent LLM overrides (`model`, `url`, `api_key_env`, `temperature`, `max_tokens`). Every key is optional; an absent block means "use the env-configured default". `api_key_env` names an environment variable — never stores a literal key.
 
-The `config_loader.py` module loads this file at import time and validates that no MCP server is claimed by more than one agent (each MCP server must have exactly one owner).
+The `config_loader.py` module loads this file at import time and validates MCP ownership, `llm`-block key typos, and that required fields are present — a bad key fails loudly at startup instead of silently falling back to the default endpoint mid-run.
 
 To add a new agent, see [Recipe 2](#recipe-2--add-an-agent).
 
@@ -444,8 +531,10 @@ To add a new skill, see [Recipe 3](#recipe-3--add-a-skill).
 class AgentState(TypedDict):
     task: str                    # User's original request
     plan: list[PlanStep]         # Orchestrator's decomposition
-    results: dict[int, str]      # Accumulated step outputs
-    final_output: str            # Assembled final answer
+    results: dict[int, str]      # Accumulated step outputs (incl. failure markers)
+    failed_steps: list[int]      # Steps that failed after retries (Phase 4.13)
+    step_stats: list[StepStats]  # Per-step timing, tokens, and tool calls (Phase 4.9)
+    final_output: str            # Assembled final answer (with warning header)
     current_datetime: str        # Current date/time for context
 ```
 
@@ -482,7 +571,7 @@ Tools are LangChain `@tool`-decorated Python functions that sub-agents can call.
 
 | Tool | File | Description |
 |---|---|---|
-| `calculate(expr)` | `tools/calculator.py` | Recursive descent expression parser. Supports arithmetic, trig, log, constants (pi, e, phi), 30+ functions, factorial, combinatorics |
+| `calculate(expr, include_steps=False)` | `tools/calculator.py` | Recursive-descent expression evaluator. Returns a structured ``{"ok": …, "result": …, "error": …}`` envelope. Right-associative power, conventional precedence (``2*3^2=18``, ``-2^2=-4``, ``-3!=-6``). Factorial/GCD/LCM/combinatorics require integral inputs — no silent rounding |
 | `plotting_tool(expr, x_min, x_max)` | `tools/plotting.py` | Plots a mathematical expression using NumPy + Matplotlib. Returns the image path |
 | `run_bash(command, timeout)` | `tools/bash_tool.py` | Executes a bash command in a sandboxed subprocess |
 | `run_bash_with_approval(command)` | `tools/bash_tool.py` | Same as above but requires user confirmation first |
@@ -526,17 +615,18 @@ Each MCP server must have a single owning agent for security — `config_loader.
 | `/graphs` | GET | List the graphs discovered in `graphs/`, with descriptions and which is the default |
 | `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional |
 | `/run-async` | POST | Start a pipeline run in the background (same body). Returns a `task_id` immediately (HTTP 202) |
-| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`), or `"failed"` (with `error`) |
+| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`, `step_stats`), or `"failed"` (with `error`) |
 
 The API uses Pydantic models for request/response validation and includes CORS middleware (open by default — tighten in production). A zero-dependency CLI client (`api_client.py`) is provided for interacting with the API from the terminal.
 
 ### Security Features
 
-- **Prompt injection detection** (`utils/senitize.py`) — Scans user input for jailbreak patterns (ignore instructions, system prompt extraction, data exfiltration via markdown images)
+- **Prompt injection detection** (`utils/sanitize.py`) — Scans user input for jailbreak patterns (ignore instructions, system prompt extraction, data exfiltration via markdown images)
 - **Output validation** (`utils/validator.py`) — Blocks XSS vectors (`<script`), prompt leakage patterns, empty outputs, and oversized outputs (>50K chars)
 - **Sandboxed bash** — `run_bash` drops privileges to `nobody` user before executing
 - **MCP ownership validation** — Agents can only access MCP servers they explicitly own; `config_loader.py` enforces exclusive ownership at startup; `agent_mcp_tools.py` re-checks at runtime
-- **Retry policy** — Parallel sub-agent nodes have `RetryPolicy(max_attempts=2)` for automatic retries on failure
+- **Retry policy** — Sub-agent nodes have `RetryPolicy(max_attempts=2)` for automatic retries on transient errors
+- **Failure containment** — A step that exhausts retries is recorded as `[STEP FAILED]` and its dependents are marked `[SKIPPED — dependency failed]` without being dispatched; the assembler prepends a warning header to `final_output` so partial results are clearly flagged
 
 ## Configuration Reference
 
