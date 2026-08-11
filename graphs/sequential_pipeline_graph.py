@@ -62,15 +62,29 @@ def scheduler_node(state: dict) -> dict:
     """Synchronisation barrier: also propagates skips from failed steps (4.13).
 
     Writes ``[SKIPPED — dependency failed]`` markers for every step transitively
-    blocked by a failed step, so the router never dispatches them.
+    blocked by a failed step, so the router never dispatches them.  Also emits
+    ``step_stats`` entries so every step in the plan gets a stats row (4.9).
     """
     failed = set(state.get("failed_steps", []))
     if not failed:
         return {}
     blocked = _transitive_dependents(state["plan"], failed)
     results = state.get("results", {})
+    plan = state["plan"]
     return {
-        "results": {s: "[SKIPPED — dependency failed]" for s in blocked if s not in results}
+        "results": {s: "[SKIPPED — dependency failed]" for s in blocked if s not in results},
+        "step_stats": [
+            {
+                "step": s,
+                "agent": next((p["agent"] for p in plan if p["step"] == s), "unknown"),
+                "status": "skipped",
+                "duration_s": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "tool_calls": 0,
+            }
+            for s in blocked if s not in results
+        ],
     }
 
 

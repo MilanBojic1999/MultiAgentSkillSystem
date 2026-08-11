@@ -25,7 +25,7 @@ from typing import Callable
 # Paths (relative to this module — the repo root)
 # ---------------------------------------------------------------------------
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parent.parent
 GRAPHS_DIR = _ROOT / "graphs"
 TOOLS_DIR = _ROOT / "tools"
 SKILLS_DIR = _ROOT / "skills"

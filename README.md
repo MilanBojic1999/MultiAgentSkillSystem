@@ -55,7 +55,7 @@ agent_skills/
 ├── llm_factory.py               # create_llm(...) — the single ChatOpenAI construction site
 ├── skill_loader.py              # SKILL.md file loader (YAML frontmatter + body)
 ├── config_loader.py             # Unified agent-config loader + validator
-├── scaffold.py                  # Extension scaffolding tool (python -m scaffold)
+├── scaffold/                    # Extension scaffolding tool (python -m scaffold)
 ├── pyproject.toml               # Packaging metadata + dev deps + pytest config
 ├── requirements.txt             # Pinned lockfile-style dependencies (Docker)
 ├── .env.example                 # Documented template — copy to .env
@@ -306,41 +306,25 @@ every assertion and edge case without network access.
 The four most common ways to extend the system. The first three are pure
 config/data changes — no pipeline code is touched.
 
-> **⚡ Quick start:** The fastest way to scaffold any extension is
-> `python -m scaffold <kind> <name> [-d "description"]` — it generates a
-> well-formed, immediately-testable stub in one command. See
-> [Recipe 0](#recipe-0--scaffold-an-extension) below.
+> **⚡ Quick start:** `python -m scaffold <kind> <name> [-d "description"]`
+> generates a well-formed, immediately-testable stub in one command.
+> Full usage and architecture: **[scaffold/README.md](scaffold/README.md)**
 
 ### Recipe 0 — Scaffold an extension
 
-For `graph | tool | skill | agent`, the `scaffold` command creates a
-well-formed stub with the right shape, frontmatter, and topology rules already
-correct. Every scaffold refuses to overwrite an existing file and prints the
-next step after writing.
+Generate well-formed stubs in one command. Each scaffold refuses to overwrite
+and passes the conformance suite unchanged — verify with
+`pytest tests/test_extension_contracts.py`.
 
 ```bash
-# Scaffold a new graph (scheduler → router pattern, RetryPolicy, blocked-forever guard)
-python -m scaffold graph my-topology -d "One-line description shown by --list-graphs"
-
-# Scaffold a new tool (@tool-decorated function with typed signature)
-python -m scaffold tool word-count -d "Count the words in a piece of text."
-
-# Scaffold a new skill (YAML frontmatter + body, name matches directory)
-python -m scaffold skill code-review -d "Review code for bugs and style issues."
-
-# Scaffold a new agent (appends a validated entry to agent_config.json)
-python -m scaffold agent coder -d "Software engineer skilled in writing and reviewing code."
+python -m scaffold graph my-topology -d "Custom DAG with a critique loop"
+python -m scaffold tool  word-count   -d "Count the words in a piece of text."
+python -m scaffold skill code-review  -d "Review code for bugs and style issues."
+python -m scaffold agent coder        -d "Software engineer."
 ```
 
-After scaffolding, verify with the conformance suite:
-
-```bash
-pytest tests/test_extension_contracts.py
-```
-
-Each kind passes its corresponding 4.16 conformance test unmodified — the
-graph compiles, the tool has a valid `args_schema`, the skill parses
-correctly, and the agent entry resolves.
+Full usage, architecture, and how to extend the scaffold itself:
+**[scaffold/README.md](scaffold/README.md)**.
 
 If you prefer to create extensions by hand, the manual recipes follow.
 
@@ -549,6 +533,7 @@ class AgentState(TypedDict):
     plan: list[PlanStep]         # Orchestrator's decomposition
     results: dict[int, str]      # Accumulated step outputs (incl. failure markers)
     failed_steps: list[int]      # Steps that failed after retries (Phase 4.13)
+    step_stats: list[StepStats]  # Per-step timing, tokens, and tool calls (Phase 4.9)
     final_output: str            # Assembled final answer (with warning header)
     current_datetime: str        # Current date/time for context
 ```
@@ -630,7 +615,7 @@ Each MCP server must have a single owning agent for security — `config_loader.
 | `/graphs` | GET | List the graphs discovered in `graphs/`, with descriptions and which is the default |
 | `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional |
 | `/run-async` | POST | Start a pipeline run in the background (same body). Returns a `task_id` immediately (HTTP 202) |
-| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`), or `"failed"` (with `error`) |
+| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`, `step_stats`), or `"failed"` (with `error`) |
 
 The API uses Pydantic models for request/response validation and includes CORS middleware (open by default — tighten in production). A zero-dependency CLI client (`api_client.py`) is provided for interacting with the API from the terminal.
 

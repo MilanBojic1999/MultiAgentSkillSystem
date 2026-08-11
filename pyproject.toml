@@ -39,7 +39,6 @@ py-modules = [
     "llm_factory",
     "paralel_pipeline_graph",  # import-compat shim for the old root path
     "run_pipeline",
-    "scaffold",
     "skill_loader",
 ]
-packages = ["agents", "evals", "graphs", "tools", "utils"]
+packages = ["agents", "evals", "graphs", "scaffold", "tools", "utils"]

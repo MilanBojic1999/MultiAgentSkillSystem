@@ -17,20 +17,60 @@ from agents.agent_states import get_current_datetime_str
 DEFAULT_GRAPH = "parallel"
 
 
-def run(task: str, graph_name: str = DEFAULT_GRAPH) -> str:
-    # thread_id groups checkpoints for this run; use a fixed one for dev/test
+def run(task: str, graph_name: str = DEFAULT_GRAPH) -> tuple[str, list[dict]]:
+    """Run the pipeline synchronously.
+
+    Returns ``(final_output, step_stats)`` (Phase 4.9).
+    """
     config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
     result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
-    return result.get("final_output", "No final output produced.")
+    return (
+        result.get("final_output", "No final output produced."),
+        result.get("step_stats", []),
+    )
 
 
-async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> str:
-    # thread_id groups checkpoints for this run; use a fixed one for dev/test
+async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> tuple[str, list[dict]]:
+    """Run the pipeline asynchronously.
+
+    Returns ``(final_output, step_stats)`` (Phase 4.9).
+    """
     config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
     result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
-    return result.get("final_output", "No final output produced.")
+    return (
+        result.get("final_output", "No final output produced."),
+        result.get("step_stats", []),
+    )
+
+
+def _print_stats(step_stats: list[dict]) -> None:
+    """Pretty-print per-step execution statistics (Phase 4.9)."""
+    # Column widths
+    header = f"{'Step':>4}  {'Agent':<20}  {'Status':<10}  {'Duration':>8}  {'In Tok':>7}  {'Out Tok':>7}  {'#Tools':>6}"
+    print(header)
+    print("-" * len(header))
+    total_in = 0
+    total_out = 0
+    total_tools = 0
+    total_duration = 0.0
+    for s in sorted(step_stats, key=lambda s: s["step"]):
+        print(
+            f"{s['step']:>4}  {s['agent']:<20}  {s['status']:<10}  "
+            f"{s['duration_s']:>7.3f}s  {s['input_tokens']:>7}  "
+            f"{s['output_tokens']:>7}  {s['tool_calls']:>6}"
+        )
+        total_in += s["input_tokens"]
+        total_out += s["output_tokens"]
+        total_tools += s["tool_calls"]
+        total_duration += s["duration_s"]
+    print("-" * len(header))
+    print(
+        f"{'':>4}  {'':<20}  {'':<10}  "
+        f"{total_duration:>7.3f}s  {total_in:>7}  "
+        f"{total_out:>7}  {total_tools:>6}"
+    )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -72,6 +112,13 @@ if __name__ == "__main__":
 
     print(f"Running pipeline '{args.graph}' with task:\n  {task}\n")
     print("=" * 60)
-    output = asyncio.run(run_async(task, args.graph))
+    output, step_stats = asyncio.run(run_async(task, args.graph))
     print("=" * 60)
     print(output)
+
+    if step_stats:
+        print()
+        print("=" * 60)
+        print("Step stats")
+        print("=" * 60)
+        _print_stats(step_stats)

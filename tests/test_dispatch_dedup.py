@@ -79,7 +79,7 @@ def test_failed_step_is_contained_and_recorded():
         calls.append(step["step"])
         if step["step"] == 1:
             raise RuntimeError("boom")
-        return step["step"], f"out-{step['step']}"
+        return step["step"], f"out-{step['step']}", {"input_tokens": 50, "output_tokens": 200, "tool_calls": 1}
 
     worker = make_parallel_sub_agent_node(run_step=fake_run)
     graph = _build_graph(DIAMOND_PLAN, worker)
@@ -104,6 +104,27 @@ def test_failed_step_is_contained_and_recorded():
     assert "1 of 3 steps failed" in out["final_output"]
     assert "steps 1" in out["final_output"]
     assert "output below is partial" in out["final_output"]
+
+    # --- Phase 4.9: step_stats ---
+    stats = {s["step"]: s for s in out.get("step_stats", [])}
+
+    # Step 1: failed
+    assert stats[1]["status"] == "failed"
+    assert stats[1]["agent"] == "researcher"
+    assert stats[1]["duration_s"] >= 0
+    assert stats[1]["tool_calls"] == 0  # never reached the tool
+
+    # Step 2: completed
+    assert stats[2]["status"] == "completed"
+    assert stats[2]["input_tokens"] == 50
+    assert stats[2]["output_tokens"] == 200
+    assert stats[2]["tool_calls"] == 1
+    assert stats[2]["duration_s"] >= 0
+
+    # Step 3: skipped (written by scheduler)
+    assert stats[3]["status"] == "skipped"
+    assert stats[3]["duration_s"] == 0.0
+    assert stats[3]["input_tokens"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +171,7 @@ def test_sequential_graph_each_step_runs_exactly_once_ainvoke(plan):
     async def fake_run(step, results, current_datetime=""):
         n = step["step"]
         calls[n] += 1
-        return n, f"out-{n}"
+        return n, f"out-{n}", {"input_tokens": 10, "output_tokens": 30, "tool_calls": 0}
 
     from agents.sub_agents_nodes import make_parallel_sub_agent_node
     worker = make_parallel_sub_agent_node(run_step=fake_run)
@@ -180,7 +201,7 @@ def test_sequential_graph_failure_containment_and_skip_propagation():
         calls.append(step["step"])
         if step["step"] == 1:
             raise RuntimeError("boom")
-        return step["step"], f"out-{step['step']}"
+        return step["step"], f"out-{step['step']}", {"input_tokens": 10, "output_tokens": 30, "tool_calls": 0}
 
     worker = make_parallel_sub_agent_node(run_step=fake_run)
     graph = _build_sequential_graph(LINEAR_PLAN, worker)
@@ -197,3 +218,59 @@ def test_sequential_graph_failure_containment_and_skip_propagation():
     assert "[SKIPPED — dependency failed]" in out["final_output"]
     assert "⚠️" in out["final_output"]
     assert "1 of 3 steps failed" in out["final_output"]
+
+    # --- Phase 4.9: step_stats ---
+    stats = {s["step"]: s for s in out.get("step_stats", [])}
+    assert stats[1]["status"] == "failed"
+    assert stats[2]["status"] == "skipped"
+    assert stats[3]["status"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.9: dedicated step-stats test
+# ---------------------------------------------------------------------------
+
+def test_step_stats_happy_path_parallel():
+    """Every completed step produces a well-formed StepStats entry.
+
+    Runs the parallel graph with LINEAR_PLAN and a stub run_step that returns
+    known token counts.  Asserts shape, timing, and aggregation.
+    """
+    from agents.sub_agents_nodes import make_parallel_sub_agent_node
+
+    call_order: list[int] = []
+
+    async def fake_run(step, results, current_datetime=""):
+        call_order.append(step["step"])
+        return (
+            step["step"],
+            f"out-{step['step']}",
+            {
+                "input_tokens": 100 + step["step"] * 10,
+                "output_tokens": 200 + step["step"] * 5,
+                "tool_calls": step["step"],
+            },
+        )
+
+    worker = make_parallel_sub_agent_node(run_step=fake_run)
+    graph = _build_graph(LINEAR_PLAN, worker)
+    out = asyncio.run(graph.ainvoke({"task": "t", "current_datetime": ""}, config=CONFIG))
+
+    stats = out.get("step_stats", [])
+    assert len(stats) == 3, f"expected 3 stats entries, got {len(stats)}"
+
+    by_step = {s["step"]: s for s in stats}
+
+    for n in [1, 2, 3]:
+        s = by_step[n]
+        assert s["status"] == "completed"
+        assert s["agent"] == "researcher"
+        assert s["duration_s"] >= 0
+        # Stub is near-instant — duration should be well under 1 second
+        assert s["duration_s"] < 1.0, f"step {n} took {s['duration_s']}s, expected <1s"
+        assert s["input_tokens"] == 100 + n * 10
+        assert s["output_tokens"] == 200 + n * 5
+        assert s["tool_calls"] == n
+
+    # Order is preserved by the reducer (append-only)
+    assert [s["step"] for s in stats] == call_order
