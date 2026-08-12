@@ -8,7 +8,7 @@
         "description": "Skilled in gathering and synthesizing information from various sources.",
         "tools": ["run_bash"],
         "mcp_servers": {
-            "yotta_mcp": {"url": "http://207.189.105.118:8001/mcp"}
+            "yotta_mcp": {"url": "localhost:8000"}
         },
         "execution": {
             "max_attempts": 3
