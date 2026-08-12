@@ -102,6 +102,44 @@ def _valid_llm_block(llm_block: Any, agent_name: str) -> None:
         )
 
 
+# The set of accepted keys in an agent's "execution" block (mirrors
+# config_loader's _EXECUTION_KEYS) and its value bounds (Slice 2).
+_EXECUTION_KEYS = frozenset({"max_attempts"})
+_MAX_ATTEMPTS_BOUND = 10
+
+
+def _valid_execution_block(exec_block: Any, agent_name: str) -> None:
+    """Assert the optional execution block only contains recognised keys (Slice 2).
+
+    ``max_attempts`` must be an integer from 1 through 10; booleans are
+    rejected even though ``bool`` subclasses ``int``.
+    """
+    if exec_block is None:
+        return
+    if not isinstance(exec_block, dict):
+        raise AssertionError(
+            f"Agent '{agent_name}': 'execution' must be a dict, "
+            f"got {type(exec_block).__name__}"
+        )
+    bad = set(exec_block) - _EXECUTION_KEYS
+    if bad:
+        raise AssertionError(
+            f"Agent '{agent_name}': unknown key(s) in 'execution' block: "
+            f"{sorted(bad)}. Accepted keys: {sorted(_EXECUTION_KEYS)}."
+        )
+    if "max_attempts" not in exec_block:
+        return
+    value = exec_block["max_attempts"]
+    assert (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 1 <= value <= _MAX_ATTEMPTS_BOUND
+    ), (
+        f"Agent '{agent_name}': 'execution.max_attempts' must be an integer "
+        f"from 1 to {_MAX_ATTEMPTS_BOUND} (not a boolean), got {value!r}"
+    )
+
+
 @pytest.mark.parametrize("agent_name", sorted(AGENT_CONFIG))
 def test_every_agent_resolves(agent_name: str):
     """Every agent must have a non-empty description, and every tool,
@@ -137,6 +175,9 @@ def test_every_agent_resolves(agent_name: str):
 
     # --- llm block -----------------------------------------------------------
     _valid_llm_block(cfg.get("llm"), agent_name)
+
+    # --- execution block (Slice 2) ------------------------------------------
+    _valid_execution_block(cfg.get("execution"), agent_name)
 
 
 # ============================================================================

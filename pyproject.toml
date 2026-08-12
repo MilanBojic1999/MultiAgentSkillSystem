@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "httpx"]  # httpx: fastapi TestClient for tests/test_api_server.py
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

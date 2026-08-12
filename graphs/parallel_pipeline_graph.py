@@ -21,6 +21,12 @@ def fan_out_router(state: dict):
     After orchestration, dispatch ALL independent steps in parallel via Send.
     Steps with depends_on=[1] wait until step 1 is in results (handled by
     the dependency layer grouping below).
+
+    Distinguishes completion from deadlock (Slice 1):
+    - returns ``"assemble"`` only when every planned step has a result;
+    - returns ``Send`` objects when one or more unfinished steps are ready;
+    - raises ``RuntimeError`` when steps are permanently blocked (no ready step
+      but unfinished steps remain with dependencies that can never be satisfied).
     """
 
     plan    = state["plan"]
@@ -33,11 +39,28 @@ def fan_out_router(state: dict):
         and all(d in results for d in s.get("depends_on", []))
     ]
 
-    if not ready:
-        return "assemble"
+    if ready:
+        # Send each ready step to the sub_agent_node in parallel
+        return [Send("parallel_sub_agent", {"step": s, "results": results, "current_datetime": current_datetime}) for s in ready]
 
-    # Send each ready step to the sub_agent_node in parallel
-    return [Send("parallel_sub_agent", {"step": s, "results": results, "current_datetime": current_datetime}) for s in ready]
+    # No ready steps — distinguish "all done" from "permanently blocked"
+    unfinished = [s["step"] for s in plan if s["step"] not in results]
+    if unfinished:
+        detail_parts = []
+        for s in plan:
+            if s["step"] in unfinished:
+                unmet = [d for d in s.get("depends_on", []) if d not in results]
+                detail_parts.append(
+                    f"step {s['step']} (unmet dependencies: {unmet})"
+                )
+        raise RuntimeError(
+            f"No step is ready to execute, but {len(unfinished)} step(s) "
+            f"remain unfinished and are permanently blocked: {unfinished}. "
+            f"Details: {'; '.join(detail_parts)}. "
+            f"Check that every step's depends_on references valid step numbers."
+        )
+
+    return "assemble"
 
 
 def scheduler_node(state: dict) -> dict:
@@ -82,7 +105,9 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     builder = StateGraph(AgentState)
     # ValueError from plan validation (1.2) should re-plan, not kill the run.
     builder.add_node("orchestrator", orchestrator, retry_policy=RetryPolicy(max_attempts=2, retry_on=(ValueError,)))
-    builder.add_node("parallel_sub_agent",    sub_agent, retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)))
+    # No worker RetryPolicy (Slice 3): the worker node owns the bounded
+    # attempt loop configured per agent via ``execution.max_attempts``.
+    builder.add_node("parallel_sub_agent",    sub_agent)
     builder.add_node("assemble",     assemble_node)
     builder.add_node("scheduler", scheduler_node)
 
