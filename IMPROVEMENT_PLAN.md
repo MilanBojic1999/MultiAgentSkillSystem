@@ -17,7 +17,12 @@
 - [Phase 1 — Correctness Fixes](#phase-1--correctness-fixes)
 - [Phase 2 — Developer Experience & Adoption](#phase-2--developer-experience--adoption)
 - [Phase 3 — Architecture Refactor (Graph Factories)](#phase-3--architecture-refactor-graph-factories)
-- [Phase 4 — New Features](#phase-4--new-features)
+- [Phase 4 — Baseline Hardening & New Features](#phase-4--baseline-hardening--new-features)
+  - [Tier 1 — the baseline must be sound](#tier-1--the-baseline-must-be-sound)
+  - [Tier 2 — prove the extension points work](#tier-2--prove-the-extension-points-work)
+  - [Tier 3 — capability demonstrations](#tier-3--capability-demonstrations)
+  - [Tier 4 — deferred](#tier-4--deferred)
+  - [Scope statement](#scope-statement--decide-before-advertising-the-baseline)
 - [Suggested Order & Dependencies](#suggested-order--dependencies)
 
 ---
@@ -226,7 +231,7 @@ failed/skipped markers.
 | Stale docstring demanding `async with client:` that no caller uses (fine for streamable HTTP — fix the docs, not the code) | `agent_mcp_tools.py:37-39` |
 | Deduplicate `assemble_node` (copy-pasted in both graph files) into a shared module | `pipeline_graph.py:17`, `paralel_pipeline_graph.py:38` |
 | Replace `print()` debugging in the worker with `log_event` | `agents/sub_agents_nodes.py:83,107-108` |
-| ✅ Renamed `graphs/paralel_pipeline_graph.py` → `graphs/parallel_pipeline_graph.py` (root shim kept for one release, item 3.3). Still to do: `utils/senitize.py` → `utils/sanitize.py` | repo root, `utils/` |
+| ✅ Renamed `graphs/paralel_pipeline_graph.py` → `graphs/parallel_pipeline_graph.py` (root shim kept for one release, item 3.3). Still to do: `utils/sanitize.py` → `utils/sanitize.py` | repo root, `utils/` |
 | Delete legacy `agents/agent_rouster.json` (superseded by `agent_config.json`) and its README mention | `agents/`, `README.md` |
 | Skill frontmatter parsing: `content.split("---")[1]` breaks on files not starting with `---`; use a regex (`^---\n(.*?)\n---`) or the `python-frontmatter` package | `skill_loader.py:16` |
 
@@ -606,11 +611,544 @@ Also landed here from 1.5: `graphs/paralel_pipeline_graph.py` →
 
 ---
 
-## Phase 4 — New Features
+## Phase 4 — Baseline Hardening & New Features
 
-Ordered roughly by value ÷ effort. Items marked ⛓ depend on Phase 3.
+> **Reframed 2026-07-27.** The destination for this project is now decided: it is
+> a **baseline other developers fork and extend** — "add a graph, agent, skill,
+> tool, MCP server or model with the least amount of pain." That changes how
+> Phase 4 is prioritised:
+>
+> 1. **Extension points that are still code changes outrank user-facing
+>    features.** 4.3 and 4.6 are the last two holes in the extension matrix, so
+>    they move ahead of streaming and HITL.
+> 2. **Every reference implementation must actually run.** A template whose
+>    example graph doesn't execute costs more than any missing feature — hence
+>    4.12 at the top.
+> 3. **Application-level concerns get demoted.** 4.4 and 4.7 are decisions a
+>    fork makes, not defaults a baseline should bake in.
+>
+> Item numbers are **unchanged** from the previous revision — `api_server.py:104`
+> cites 4.7 and `llm_factory.py:27` cites 4.3. New items continue from 4.12.
 
-### 4.1 Streaming progress (SSE) — no refactor needed
+### The extension matrix — what this phase is graded against
+
+| Extension point | Mechanism | State |
+|---|---|---|
+| Tool | drop a `@tool` function in `tools/*.py` | ✅ auto-discovered, recipe documented |
+| Agent | entry in `agents/agent_config.json` | ✅ no code |
+| Skill | `skills/<name>/SKILL.md` | ✅ no code |
+| Graph | module in `graphs/` defining `build()` | ✅ auto-discovered, lazy, fault-tolerant |
+| **MCP server** | `mcp_servers` block in the agent config | ❌ `streamable_http` URLs only; a public IP hardcoded (4.6) |
+| **Model per agent** | — | ❌ one global env-configured endpoint (4.3) |
+| **State schema** | — | ❌ hardwired to plan-and-execute (see *Scope statement*) |
+
+### Tiers
+
+| Tier | Items | Gate to leave the tier |
+|---|---|---|
+| **1 — the baseline must be sound** | 4.12, 4.13, 4.3, 4.6, 4.14, 4.15, 4.18 | Both shipped graphs run end to end; no extension point requires editing code |
+| **2 — prove the extension points work** | 4.16, 4.17, 4.10, 4.9 | A deliberately broken extension turns exactly one test red |
+| **3 — capability demonstrations** | 4.8, 4.11, 4.1, 4.2, 4.5 | A third graph exists that was built without touching `agents/` (verification target; reassessed 2026-08-12 as optional for fork usability — see the Tier 3 section intro) |
+| **4 — deferred** | 4.4, 4.7 | Revisit only when a concrete consumer demands them |
+
+---
+
+## Tier 1 — the baseline must be sound
+
+### 4.12 The sequential graph has never executed a step ⚠️ highest priority
+
+**Problem.** `make_sub_agent_node` is declared `async def` but calls
+`asyncio.run(run_step(...))` (`agents/sub_agents_nodes.py:147`). Verified
+empirically against the current tree:
+
+- **`ainvoke`** — used by `run_pipeline.run_async`, `api_server._run_pipeline`
+  and every async test →
+  `RuntimeError: asyncio.run() cannot be called from a running event loop`
+- **`invoke`** — used by `run_pipeline.run` →
+  `TypeError: No synchronous function provided to "sub_agent". Either
+  initialize with a synchronous function or invoke via the async API`
+
+So `--graph sequential` and `{"graph": "sequential"}` fail on the first step, on
+every entry path. The fix is one word (`await`); the cost of having shipped it
+is not.
+
+**Why it outranks everything else.** `graphs/sequential_pipeline_graph.py` is
+the file README Recipe 4 tells a new contributor to copy when writing their own
+graph. It is *the template*, and it does not run.
+
+**Why the tests missed it.** `tests/test_should_continue.py:30` is the only test
+that invokes the node, and it is `xfail(strict=False)` for an unrelated reason
+(the missing 1.2 blocked-forever guard). The `RuntimeError` is absorbed as an
+expected failure. `xfail(strict=False)` is for behaviour that is *specified but
+unimplemented* — using it on a code path that has never been proven to work
+converts a coverage hole into a green test.
+
+**Fix.**
+- `await run_step(...)` instead of `asyncio.run(run_step(...))`.
+- Give the sequential worker the same failure containment as the parallel one
+  (4.13), so the two reference topologies behave identically.
+- Add the 1.2 blocked-forever guard: raise `RuntimeError` naming the blocked
+  steps instead of returning `{}`. Returning `{}` makes `should_continue` loop
+  forever, because `len(results)` never grows.
+- Add `RetryPolicy(max_attempts=2, retry_on=(ValueError,))` to the sequential
+  graph's orchestrator node — the parallel graph has it, this one doesn't
+  (`graphs/sequential_pipeline_graph.py:36`).
+- Replace the `xfail` in `test_should_continue.py` with a real assertion.
+
+**Acceptance criteria.** `build_graph("sequential")` executes a 3-step linear
+plan end to end under **both** `invoke` and `ainvoke` with a stub `run_step`
+(mirroring `tests/test_dispatch_dedup.py`); no `xfail` remains in
+`test_should_continue.py`; a plan whose remaining steps are all blocked raises
+`RuntimeError` naming them.
+
+---
+
+### 4.13 Finish Phase 1.4 failure containment
+
+**Problem.** 1.4 landed one third of its design.
+`make_parallel_sub_agent_node` catches, logs and records `[STEP FAILED] …` plus
+`failed_steps` — but the two consumers of that information were never written:
+
+- `fan_out_router` (`graphs/parallel_pipeline_graph.py:30-34`) only tests
+  `d in results`. A failed step **is** in `results`, so its dependents are
+  considered ready and run anyway, receiving the failure text as "Upstream
+  context". One failure silently degrades every downstream step instead of
+  stopping that branch — and pays for the LLM calls.
+- `assemble_node` (`assemble_node.py`) emits no warning header, so failed and
+  successful steps are presented identically in `final_output`.
+- The sequential worker has no containment at all (see 4.12).
+
+**Fix.** Compute the blocked set transitively and write skip markers from the
+scheduler node — which currently does nothing and already runs exactly once per
+layer, which is precisely when this propagation must happen:
+
+```python
+def scheduler_node(state: AgentState) -> dict:
+    """Synchronisation barrier: also propagates skips from failed steps."""
+    blocked = _transitive_dependents(state["plan"], set(state.get("failed_steps", [])))
+    results = state.get("results", {})
+    return {"results": {s: "[SKIPPED — dependency failed]"
+                        for s in blocked if s not in results}}
+```
+
+`fan_out_router` then needs no change: a skipped step is in `results`, so it is
+never dispatched, and its own dependents are already in `blocked`.
+
+`assemble_node` prepends when `failed_steps` is non-empty:
+
+```
+> ⚠️ 2 of 5 steps failed (steps 3, 4). The output below is partial.
+```
+
+**Design note.** This is the one responsibility the no-op scheduler can take on
+without becoming topology-specific — it is a property of *dependency layers*,
+not of this particular fan-out strategy. Keep the node-level `RetryPolicy` as
+the transient-error net; containment is the final fallback after retries.
+
+**Acceptance criteria.** Extend the containment case in
+`tests/test_dispatch_dedup.py`: a diamond plan whose step 1 always throws
+produces a `final_output` containing step 2's real result, `[STEP FAILED]` for
+step 1, `[SKIPPED — dependency failed]` for step 3, the warning header, and
+**no worker invocation for step 3**.
+
+### 4.3 Per-agent LLM configuration ⬆ promoted to Tier 1
+
+**Status.** Half the plumbing already exists: `llm_factory.create_llm(model,
+url, api_key_env, temperature, max_tokens)` accepts every parameter and caches
+per exact tuple. What is missing is the *read* side —
+`run_sub_agent_async` (`agents/sub_agents_nodes.py:49`) calls a bare
+`create_llm()` and ignores the agent's config.
+
+**Why Tier 1 now.** "Point one agent at a different model" is the first thing a
+fork will want, and today it is a code edit. It is one of the two remaining
+holes in the extension matrix.
+
+```json
+"mathematician": {
+  "description": "...",
+  "tools": ["calculate", "plotting_tool"],
+  "mcp_servers": {},
+  "llm": {"temperature": 0.2, "max_tokens": 2048,
+          "model": "other-model", "url": "http://other:8000/v1",
+          "api_key_env": "OTHER_LLM_KEY"}
+}
+```
+
+Every key in the block is optional; an absent block means the single
+env-configured endpoint, so existing configs need zero changes. API keys are
+referenced by env-var **name** (`api_key_env`) and never stored in the config.
+
+**Fix.** In `run_sub_agent_async`, when no explicit `llm=` was injected:
+
+```python
+llm = llm or create_llm(**_llm_kwargs(AGENT_CONFIG.get(agent_name, {}).get("llm", {})))
+```
+
+`_llm_kwargs` whitelists the five accepted keys and raises `ValueError` naming
+the agent and the offending key otherwise. Validate the block in
+`config_loader.py` at import time — a typo in `agent_config.json` must fail
+loudly at startup, not silently fall back to the default endpoint mid-run.
+
+**Acceptance criteria.** An agent with `"llm": {"temperature": 0.2}` gets a
+distinct cached client; an agent with no block gets the env default; an unknown
+key inside `"llm"` raises at config load naming agent + key;
+`tests/test_config_loader.py` and `tests/test_llm_factory.py` cover both paths.
+
+---
+
+### 4.6 MCP transport shapes + env-var URLs ⬆ promoted to Tier 1
+
+**Problem — two, in the same file.**
+
+1. `create_mcp_client` (`agent_mcp_tools.py:50-55`) hardcodes
+   `{"transport": "streamable_http"}`, so only URL servers work. **stdio** —
+   the transport most published MCP servers ship with — is unreachable.
+2. `agents/agent_config.json` contains a literal public IP
+   (`http://207.189.105.118:8001/mcp`) with no auth in front of it, committed to
+   git history. For a repo intended to be forked and shared, that is both the
+   wrong default and an exposure: a fork inherits it without deciding to.
+
+**Fix.** Accept three config shapes, detected by key:
+
+```json
+"mcp_servers": {
+  "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]},
+  "yotta_mcp":  {"url": "${YOTTA_MCP_URL}"},
+  "legacy":     "http://host:8001/mcp"
+}
+```
+
+- dict containing `url` → `{"transport": "streamable_http"}`
+- dict containing `command` → `{"transport": "stdio"}` (with `args`, `env`)
+- plain string → current behaviour, kept for backward compatibility
+- `${VAR}` anywhere in a URL is expanded from the environment; a missing
+  variable raises, naming the agent, the server and the variable
+
+Move the yotta URL to `YOTTA_MCP_URL` and document it in `.env.example`. The IP
+remains in git history — rotating or firewalling that host is a separate,
+non-code decision and is out of scope here.
+
+**Acceptance criteria.** New `tests/test_mcp_client.py`: each of the three
+shapes maps to the correct transport dict; `${VAR}` expands; a missing variable
+raises naming agent/server/variable; the existing ownership check still fires.
+No live MCP server required — assert on the dict passed to
+`MultiServerMCPClient`, which means extracting it into a testable
+`_build_server_map()` helper.
+
+---
+
+### 4.14 Structured plan output + re-plan with feedback
+
+*(This was the optional "stretch" under item 1.3; it never landed, and it is
+the largest remaining reliability lever.)*
+
+**Problem.** Plan generation is still the biggest source of failed runs, and
+all three mitigations are absent:
+
+1. `_extract_json` regex-scrapes JSON out of free text (`utils/json_utils.py`).
+   The backend is vLLM, which supports guided decoding — this fragility is
+   optional.
+2. `RetryPolicy(retry_on=(ValueError,))` on the orchestrator re-invokes with
+   **identical messages**, at `temperature=0.1`, against an `lru_cache`d
+   client. The retry re-rolls the dice without telling the model what was
+   wrong, so it very often reproduces the same bad plan.
+3. `agents/orchestrator_node.py:92-93` wraps *every* exception — including
+   `PlanValidationError` — into `"Failed to parse JSON response: {e}"`, the
+   most misleading possible message for a semantic validation failure.
+
+**Fix.**
+
+```python
+def _plan_once(messages):
+    if STRUCTURED_OUTPUT:                      # env-gated, default on
+        return llm.with_structured_output(PlanModel).invoke(messages)
+    return extract_json(llm.invoke(messages).content)
+
+for attempt in range(MAX_PLAN_ATTEMPTS):       # default 2
+    try:
+        return validate_plan(_plan_once(messages), set(roster), set(index))
+    except (PlanValidationError, ValueError) as e:
+        log_event("orchestrator_replan", attempt=attempt, error=str(e))
+        messages += [AIMessage(content=raw),
+                     HumanMessage(content=REPLAN_PROMPT.format(error=e))]
+raise PlanValidationError(...)                 # exhausted → node RetryPolicy
+```
+
+`PlanModel` is a thin wrapper (`plan: list[PlanStepModel]`) around the model
+that already exists in `utils/plan_validator.py`. Keep `_extract_json` as the
+fallback for backends without guided decoding (`STRUCTURED_OUTPUT=false`), and
+stop swallowing `PlanValidationError` into the JSON-parse message.
+
+**Interaction with the node `RetryPolicy`.** In-node re-planning handles
+*semantic* failures with feedback; the node-level retry stays as the outer net
+for transport errors. Cap in-node attempts at 2 so the two loops don't multiply
+into four LLM calls.
+
+**Acceptance criteria.** `tests/test_orchestrator_node.py` gains: a fake model
+returning an invalid plan then a valid one yields the valid plan within a single
+node call and logs `orchestrator_replan`; the feedback message contains the
+validator's error text; two consecutive invalid plans raise
+`PlanValidationError` (not `"Failed to parse JSON response"`);
+`STRUCTURED_OUTPUT=false` still works through `_extract_json`.
+
+---
+
+### 4.15 Drop `run_bash` from the shipped baseline
+
+**Decision (2026-07-27).** Remove the shell tool entirely rather than sandbox
+it.
+
+**Problem.** `tools/bash_tool.py` gives `shell=True` execution to both
+`mathematician` and `researcher` (`agents/agent_config.json`), driven by
+free-form natural language arriving at `POST /run`, behind
+`allow_origins=["*"]` and no authentication. The privilege drop only fires when
+running as root. For a repo meant to be forked, shipping remote code execution
+as a **default** is the wrong starting posture — a fork inherits it without
+ever deciding to.
+
+**Fix.**
+- Delete `tools/bash_tool.py`; remove `"run_bash"` from both agents in
+  `agents/agent_config.json`.
+- **`skills/roll-dice/SKILL.md` depends on it** — its body is
+  `echo $((RANDOM % <sides> + 1))`. Replace it with a native `tools/dice.py`
+  `@tool`, which is a better Recipe 1 demonstration anyway: it exercises the
+  tool extension point instead of shelling out of it.
+- `run_bash_with_approval` goes with it — it calls `input()` and can never work
+  under the API server or inside a graph run.
+- README: document the removal and the reasoning under Recipe 1, so a fork that
+  genuinely wants shell access adds it deliberately.
+
+**Not in scope here.** CORS policy and API authentication are deployment
+decisions a baseline cannot make for its forks. Note them in the README's
+security section instead of guessing.
+
+**Acceptance criteria.** No `subprocess` call is reachable from a default
+agent; `roll-dice` works through the native tool; the conformance suite (4.16)
+asserts every tool named in `agent_config.json` resolves.
+
+---
+
+### 4.18 Template hygiene
+
+Small, but it is the first impression a fork gets:
+
+- `utils/sanitize.py` → `utils/sanitize.py` — the last unchecked row of item
+  1.5. A misspelled module in a template gets copied forward forever.
+- Delete the root `paralel_pipeline_graph.py` shim. It protects downstream
+  importers who do not exist; item 3.3 gave it "one release", and this is that
+  release. **Deleting the shim without also removing `paralel_pipeline_graph`
+  from `py-modules` in `pyproject.toml` (and the README note describing the
+  shim) breaks `pip install -e .` — verified 2026-08-12; this one line is a
+  hard prerequisite before the baseline is advertised** (see the Tier 3
+  reassessment). ✅ done (2026-08-12) — shim file, `py-modules` entry and
+  README note all removed.
+- Confirm `old_agent.py`, `testing_main.py`, `debug_log.log` (currently ~300 MB
+  in the working tree), `scraped_pages/` and `artifacts/` are **untracked** as
+  well as gitignored — a `.gitignore` entry added after a file was committed
+  does not remove it from the repo.
+- Pin `langgraph` with an upper bound in `pyproject.toml`. A baseline that
+  silently breaks on LangGraph 2.0 fails exactly the people it exists for.
+
+---
+
+## Tier 2 — prove the extension points work
+
+### 4.16 Extension-point conformance tests
+
+**Problem.** All five extension points auto-discover, which means a broken
+extension fails at **runtime**, deep inside a graph, on the machine of whoever
+forked the repo. Nothing asserts that the currently-registered inventory is
+well-formed. `tests/test_graph_registry.py` tests the registry *mechanism*
+using synthetic probe modules — no test looks at the real graphs, agents,
+skills or tools.
+
+**Fix.** One module, parametrized over the live registries, so it grows
+automatically as a fork adds extensions:
+
+```python
+@pytest.mark.parametrize("name", sorted(available_graphs()))
+def test_every_graph_compiles(name):
+    build_graph(name, orchestrator=fake_orchestrator, sub_agent=fake_worker,
+                checkpointer=MemorySaver())
+
+@pytest.mark.parametrize("agent", sorted(AGENT_CONFIG))
+def test_every_agent_resolves(agent):
+    # description non-empty; every tool name in TOOL_REGISTRY;
+    # every mcp_servers entry a recognised shape; any "llm" block valid (4.3)
+
+@pytest.mark.parametrize("skill", sorted(load_skills()[0]))
+def test_every_skill_parses(skill):
+    # frontmatter has name + description; name matches its directory; body non-empty
+
+@pytest.mark.parametrize("tool", sorted(TOOL_REGISTRY))
+def test_every_tool_is_usable(tool):
+    # non-empty description; JSON-serialisable args_schema
+```
+
+**Why this is Tier 2 and not optional.** For a baseline, this file *is* the
+extension contract. It is also the cheapest possible defence against the
+failure mode this repo has already hit twice: a shipped module that doesn't
+import (item 2.3, bug 1) or doesn't run (4.12).
+
+**Acceptance criteria.** Adding a deliberately broken skill, agent, tool or
+graph turns exactly one parametrized case red, with a message naming the
+offender. README documents it as the command to run after adding an extension.
+
+---
+
+### 4.17 `scaffold` command ✅ done (2026-08-06)
+
+**Fix.** `python -m scaffold <kind> <name>` for `graph | agent | skill | tool`,
+emitting a working, immediately-testable stub:
+
+- `graph` — the Phase 3.2 template with the non-negotiable topology rules
+  already correct (plain edge back to the scheduler, exactly one conditional
+  edge, list path map), plus `GRAPH_DESCRIPTION`
+- `tool` — a `@tool` function with a docstring and a typed signature
+- `skill` — `SKILL.md` with valid frontmatter
+- `agent` — appends a validated entry to `agents/agent_config.json`
+
+Refuses to overwrite an existing file; prints the next step
+(`pytest tests/test_extension_contracts.py`) after writing.
+
+**Acceptance criteria.** For each kind, scaffolding into a temporary tree
+produces something that passes 4.16 unmodified. Roughly 150 lines plus
+templates; no new dependency.
+
+**Implementation.** `scaffold.py` (290 lines including templates), 49 tests
+in `tests/test_scaffold.py`, registered in `pyproject.toml`. All four kinds
+pass `test_extension_contracts.py`.
+
+---
+
+### 4.10 Minimal evaluation harness ⬇ scoped down
+
+**Revised scope.** The original item (YAML golden tasks + output assertions +
+LLM-judge rubric) is a project in itself. Build the half that needs no judge
+first: **plan-shape assertions only**, in `evals/tasks/*.yaml`:
+
+```yaml
+task: "Calculate the maximum of x^2*sin(x) on [0,2], then summarise it"
+expect:
+  min_steps: 2
+  max_steps: 6
+  agents_include: [mathematician, writer]
+  has_dependency: true        # at least one step depends_on another
+```
+
+The runner builds a graph with the **real orchestrator** and a **stub worker**,
+so a full sweep costs one LLM call per task and executes no tools. Output
+quality assertions and the judge model are a later increment.
+
+**Why it matters more under the baseline framing.** This is the harness a
+downstream developer points at *their* orchestrator prompt or *their* graph to
+check they haven't regressed. It is also the only way to answer "is 4.8
+actually better?"
+
+**Acceptance criteria.** `python -m evals` runs every task against `--graph`,
+prints a pass/fail table and exits non-zero on failure; carries the
+`integration` marker so it stays out of the default `pytest` run.
+
+---
+
+### 4.9 Per-step stats
+
+Design unchanged: aggregate usage via LangChain callbacks
+(`UsageMetadataCallbackHandler` / `response.usage_metadata`), accumulate into
+`step_stats: Annotated[list[StepStats], operator.add]`, return in the API
+response.
+
+**One revision.** On a self-hosted vLLM the interesting numbers are **latency
+and tool-call counts**, not cost. Record `duration_s` and `tool_calls`
+alongside tokens — `run_sub_agent_async` already collects the tool calls
+(`agents/sub_agents_nodes.py:105-109`) and currently throws them away after
+logging them.
+
+Pairs with 4.10: a plan-shape eval that also reports token and latency deltas
+answers "better?" quantitatively rather than by impression.
+
+---
+
+## Tier 3 — capability demonstrations
+
+> **Necessity reassessment (2026-08-12).** None of these items is required for
+> the baseline's purpose — a developer forking and extending the repo. Tier 3
+> exists to *prove* the extension points (confidence and advertising), not to
+> *enable* them; the scaffold (4.17) and conformance tests (4.16) already cover
+> extension mechanically. Two things outside this tier do block a fork today,
+> and both are effectively Tier 1 work:
+>
+> 1. `pyproject.toml` still lists the deleted `paralel_pipeline_graph` shim in
+>    `py-modules` → the README's first documented command,
+>    `pip install -e ".[dev]"`, fails. One-line fix; hard prerequisite before
+>    advertising the baseline (tracked under 4.18). ✅ done (2026-08-12)
+> 2. 4.5 (plot-path collision) is a silent wrong-output defect in a default
+>    tool, not a feature — by the plan's own rule ("a reference implementation
+>    that does not run is worse than a missing feature") it belongs in Tier 1.
+>    ✅ done (2026-08-12)
+>
+> Ranked by necessity for a fork developer:
+>
+> | Item | Needed by a fork? | Honest framing |
+> |---|---|---|
+> | 4.5 artifacts | **Yes** | ✅ fixed 2026-08-12 — per-run artifact dirs, unique filenames, `GET /artifacts` |
+> | 4.1 streaming | only once a UI consumer exists | ~15-line transport add-on per the sketch |
+> | 4.2 HITL | no | dev-experience nicety / bad-plan debugger |
+> | 4.8 reflection graph | no | proof of the one-file-graph claim, not capability |
+> | 4.11 synthesis graph | no | the learning platform's Writing-agent feature, not a baseline requirement |
+>
+> Conclusion: Tier 3 can wait for concrete consumers (4.1 when the UI exists,
+> 4.11 for the platform); its gate remains the verification target for when it
+> resumes. The scope statement below is the zero-cost item that should land
+> before the baseline is advertised.
+
+### 4.8 Re-planning / reflection graph — reframed as Phase 3's acceptance test
+
+Design unchanged:
+
+```
+orchestrator → scheduler ⇄ workers
+                  │ (layer done)
+                  ▼
+              critique  ──accept──▶ scheduler (next layer)
+                  │
+                  └──revise──▶ orchestrator (re-plan remaining steps)
+```
+
+**What changes is why it is worth building.** Phase 3's acceptance criterion
+says "adding a graph touches exactly one new file in `graphs/` and nothing in
+`agents/`". That claim is currently **unverified** — both shipped graphs predate
+the refactor. 4.8 is the test of it.
+
+**Added constraint.** If building this requires touching `agents/`, that is a
+finding to record in this document — not something to quietly work around.
+
+Keep it small: a critique node scoring the last completed layer, a
+`revision_count` cap in state, one route back to the orchestrator. Depends on
+4.13 (a rejected step and a failed step need the same blocked-dependents
+machinery) and benefits from 4.10 and 4.14 (the re-plan-with-feedback prompt is
+the same idea at node scale).
+
+---
+
+### 4.11 Writer-synthesized output — as a variant graph, not a flag
+
+Original design stands, with one revision: build it as
+`graphs/synthesis_pipeline_graph.py` carrying its own `assemble_node`, rather
+than as a `"synthesize": true` flag on the existing graphs. Three reasons: it
+keeps the parallel graph's assemble a pure function; it exercises the "each
+graph owns its glue" decision from Phase 3; and it is the **third** graph, which
+is exactly what the rule-of-three says should finally settle whether the shared
+`assemble_node.py` gets promoted or dissolved.
+
+Note what this deliberately does *not* change: the baseline's default
+`final_output` stays a mechanical `## Step N:` join. That is the right default
+for a framework — predictable, no extra LLM call, no extra failure mode. The
+synthesis graph is the demonstration of how a fork does better.
+
+---
+
+### 4.1 Streaming progress (SSE) — keep, with a correction
 
 Expose LangGraph's native streaming over the API so callers see the plan and
 each step completion live instead of a silent blocking call:
@@ -628,141 +1166,149 @@ async def run_stream(req: RunRequest):
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 ```
 
-Update `api_client.py` to consume it. This also becomes the transport for any
-future web UI.
+**Correction to the sketch.** `stream_mode="updates"` yields **node-level**
+events only: the plan, then one event per completed step. Token-level streaming
+from sub-agents additionally requires `stream_mode="messages"` **and**
+`subgraphs=True`, because `create_react_agent` compiles to a subgraph whose
+internals are invisible to the parent stream by default. Decide which is being
+shipped — `"updates"` is enough for a progress UI; `"messages"` is what a chat
+UI needs.
 
-### 4.2 Human-in-the-loop plan approval — no refactor needed
+Also: `_get_graph` caches compiled graphs per process, so `/run-stream` shares
+the checkpointer with every other endpoint — give each stream its own
+`thread_id`, exactly as `_run_pipeline` does. Update `api_client.py` to consume
+it; this also becomes the transport for any future web UI.
 
-The checkpointer prerequisite already exists. Compile with
-`interrupt_before=["scheduler"]` (post-1.1 topology): the first invoke returns
-after planning; the caller inspects/edits `state["plan"]`, optionally
-`graph.update_state(config, {"plan": edited})`, then resumes with
+---
+
+### 4.2 Human-in-the-loop plan approval — keep, with the interrupt point corrected
+
+**The previous sketch was wrong.** `interrupt_before=["scheduler"]` interrupts
+before *every* layer, not just after planning — the scheduler is re-entered once
+per superstep by design; that is the entire point of item 1.1. Use
+`interrupt_after=["orchestrator"]`, which fires exactly once.
+
+The rest stands: the checkpointer prerequisite already exists, the first invoke
+returns after planning, the caller inspects/edits `state["plan"]`, optionally
+calls `graph.update_state(config, {"plan": edited})`, then resumes with
 `graph.invoke(None, config)`. Expose as `POST /run?approve_plan=true` +
 `POST /resume/{thread_id}`. Doubles as a debugging tool for bad plans.
 
-### 4.3 Per-agent LLM configuration
+---
 
-Extend `agent_config.json` with an optional `"llm"` block, resolved by the
-Phase 1.3 factory — absent block ⇒ the single env-configured endpoint, so the
-current single-vLLM setup needs zero config changes:
+### 4.5 Artifact handling — a live defect, then a convention ⬆ effectively Tier 1 ✅ done (2026-08-12)
 
-```json
-"mathematician": {
-  "description": "...",
-  "tools": ["calculate", "plotting_tool"],
-  "mcp_servers": {},
-  "llm": {"temperature": 0.2, "max_tokens": 2048,
-          "model": "other-model", "url": "http://other:8000/v1",
-          "api_key_env": "OTHER_LLM_KEY"}
-}
-```
+**It is a bug, not just a missing feature.** `plotting_tool`
+(`tools/plotting.py:78`) writes a fixed `artifacts/plot.png`. Under the parallel
+graph, two plotting steps in the same layer overwrite each other and both return
+the same path — nondeterministic output, silently.
 
-Keys in the block are all optional; API keys are referenced by env-var *name*
-(`api_key_env`), never stored in the config file.
+**Fix, in two parts.**
 
-### 4.4 Multi-turn conversations
+1. Per-run artifacts directory keyed by thread/task id, passed via
+   `configurable`; file-producing tools write there and return the relative
+   path; add `GET /artifacts/{task_id}/{filename}` (FastAPI `FileResponse`).
+2. Because this is a baseline: make it a **documented convention** every
+   file-producing tool follows — `get_artifact_path(name) -> Path`, resolved
+   from the run context — and add it to README Recipe 1. Otherwise every tool a
+   fork adds reinvents the same collision.
 
-`thread_id` plumbing exists end to end. Accept `thread_id` in `RunRequest`; on
-follow-up turns, feed the previous `final_output`/`results` to the orchestrator
-as context so it plans a delta ("now also plot the derivative") instead of
-starting from scratch. Requires a small `AgentState` addition
-(`history` or reuse of checkpointed state) and an orchestrator prompt section.
+---
 
-### 4.5 Artifact handling
+## Tier 4 — deferred
 
-The plotting tool writes files the API can't return. Give each run an artifacts
-directory keyed by thread/task id (pass it via `configurable`), have file-producing
-tools write there and return the relative path, and add
-`GET /artifacts/{task_id}/{filename}` (FastAPI `FileResponse`).
+### 4.4 Multi-turn conversations — deferred
 
-### 4.6 stdio MCP servers
+An application-level concern, not a baseline one. The pieces a fork needs
+(`thread_id` plumbing, a checkpointer seam) already exist; the pieces that don't
+(context-window budgeting, history truncation policy, orchestrator
+delta-planning prompts) are product decisions this repo cannot make on a fork's
+behalf. Revisit if the baseline ever gains a reference UI.
 
-`create_mcp_client` (`agent_mcp_tools.py:49`) only supports `streamable_http`
-URLs. Accept the standard command form too:
+### 4.7 Durable runs — collapsed to a documented seam
 
-```json
-"mcp_servers": {
-  "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]},
-  "yotta_mcp":  {"url": "http://.../mcp"}
-}
-```
+`_make_checkpointer` (`api_server.py:112`) is already the single swap point,
+which was the actual deliverable of this item. What remains is small and mostly
+documentation:
 
-Detect shape (`url` key vs `command` key) and map to
-`{"transport": "streamable_http"}` / `{"transport": "stdio"}` respectively.
-Keep backward compatibility with the current plain-string URL form.
+- Ship one **`AsyncSqliteSaver`** example — async, because every API path uses
+  `ainvoke`; the synchronous `SqliteSaver` will not work there.
+- Document the seam and the `.checkpoints/` gitignore entry that already exists.
+- Backing `_task_store` with the same database stays deferred: it is a
+  deployment concern, and an unbounded in-memory dict is an acceptable baseline
+  default **as long as it is documented as one**.
 
-### 4.7 Durable runs + persistent task store ⛓
+---
 
-Swap `MemorySaver` for `SqliteSaver`/`PostgresSaver` (checkpointer injection
-comes from Phase 3) so a crashed run resumes from the last completed step. Back
-the API's in-memory `_task_store` (`api_server.py:67`) with the same database —
-today a server restart loses all task state, and the store grows unboundedly.
+## Scope statement — decide before advertising the baseline
 
-### 4.8 Re-planning / reflection graph ⛓ (also needs 1.1 + 1.2)
+`AgentState` (`agents/agent_states.py:20`) hardwires `plan` / `results` /
+`current_step` / `final_output`, and both shared nodes require that schema. A
+fork building a supervisor loop, a plain ReAct chat agent or an
+evaluator-optimizer can reuse the graph registry, the tool/skill/config loaders
+and `llm_factory` — but **not** `agents/`. So the honest description today is:
 
-The first genuinely new graph, built from Phase 3 parts:
+> a baseline for **plan-and-execute** agentic systems
 
-```
-orchestrator → scheduler ⇄ workers
-                  │ (step done)
-                  ▼
-              critique  ──accept──▶ scheduler (next layer)
-                  │
-                  └──revise──▶ orchestrator (re-plan remaining steps)
-```
+Two options, and this document should commit to one:
 
-A cheap critique node scores each step output; on failure it either re-dispatches
-the step with feedback appended, or sends the whole remaining plan back to the
-orchestrator. Cap iterations via a `revision_count` field in state. Without the
-1.1 scheduler fix this topology multiplies the duplicate-`Send` bug; without 1.2
-a revised plan can silently deadlock — hence the dependencies.
+- **(a) Narrow the claim.** Free. The plan-and-execute niche is well covered by
+  what already exists, and the fixed state schema is exactly what lets the two
+  shared nodes stay reusable across graphs.
+- **(b) Generalise.** Make `AgentState` a protocol/generic, let each graph
+  declare its own state, and reduce `agents/` to nodes parameterised over a
+  state contract. This is real work and it is **Phase 5** — not something to
+  smuggle into a Phase 4 item.
 
-### 4.9 Cost / token tracking ⛓ (wants 1.3)
-
-Aggregate per-step token usage via LangChain callbacks
-(`UsageMetadataCallbackHandler` or `response.usage_metadata`), store in state
-(`step_stats: Annotated[list[StepStats], operator.add]`), return in the API
-response: `steps: [{step, agent, tokens_in, tokens_out, duration_s}]`.
-
-### 4.10 Evaluation harness ⛓
-
-`evals/` with golden tasks (YAML: task, required plan properties, output
-assertions, optional LLM-judge rubric) + a runner that builds graphs via the
-Phase 3 factory with either the real endpoint or a cheap judge model. This is
-what answers "is the new graph actually better?" — the project's stated goal.
-
-### 4.11 Writer-synthesized final output
-
-Replace the mechanical string-join in `assemble_node` with an optional pass
-through the writer agent (skill: `answer-writer`), controlled per-graph or per
-request (`"synthesize": true`). Falls back to the join when the writer fails.
-Since each graph owns its `assemble_node` after Phase 3, this is simply a new
-graph (or a variant assemble function inside an existing graph file) — no
-shared-node changes needed; possible before Phase 3 as a flag in the existing
-graphs.
+**Recommendation: (a) now, (b) only when a concrete second topology family
+actually demands it.**
 
 ---
 
 ## Suggested Order & Dependencies
 
+Phases 1–3 are complete (Phase 1.5's `sanitize` rename carries over into 4.18).
+What remains:
+
 ```
-1.1 scheduler fix ──┐
-1.2 plan validation ─┼─▶ 2.3 tests+CI ─▶ Phase 3 refactor ─▶ 4.7 / 4.8 / 4.9 / 4.10
-1.3 llm factory ────┘                          ▲
-                                               │
-2.1 .env.example ── 2.2 packaging ─────────────┘
-2.4 docs / 2.5 logging          (any time)
-4.1 streaming / 4.2 HITL / 4.3 per-agent LLM / 4.6 stdio MCP   (any time after 1.1–1.3)
+Tier 1 — the baseline must be sound
+  4.12 sequential graph fix ──▶ 4.13 failure containment ──┐
+  4.14 structured output + replan ─────────────────────────┼──▶ Tier 2
+  4.3 per-agent LLM / 4.6 MCP shapes / 4.15 drop run_bash ─┘
+        4.18 template hygiene   (any time)
+
+Tier 2 — prove the extension points work
+  4.16 conformance tests ──▶ 4.17 scaffold
+  4.10 minimal evals ──▶ 4.9 step stats
+
+Tier 3 — capability demonstrations
+  4.8 reflection graph      (needs 4.13; wants 4.10, 4.14)
+  4.11 synthesis graph      (the third graph — settles assemble_node's fate)
+  4.1 streaming / 4.2 HITL / 4.5 artifacts
+
+**Reassessed 2026-08-12:** Tier 3 is optional for the baseline's
+fork-and-extend purpose (see the section intro). The two items that actually
+block a fork developer today are the `pyproject.toml` shim entry (4.18) and
+the plot-path collision (4.5) — pull both ahead of Tier 3; defer the rest
+until concrete consumers demand them (4.1: a UI; 4.11: the learning platform).
+✅ Both landed 2026-08-12 (see 4.5 and 4.18).
+
+Tier 4 — deferred
+  4.4 multi-turn, 4.7 durable task store
 ```
 
 Rules of thumb:
 
-- **Nothing new lands on top of the duplicate-`Send` topology** — 1.1 first, it
-  is a ~20-line change.
-- **Phase 3 does not start until 2.3's tests are green**, so the refactor has a
-  behavioral safety net.
-- DX items (2.1, 2.4, 2.5) are independent and good first issues for a new
-  contributor.
+- **A reference implementation that does not run is worse than a missing
+  feature.** 4.12 lands before anything else in Phase 4.
+- **Extension holes outrank features.** 4.3 and 4.6 are the last two places
+  where extending the baseline means editing code — they come before streaming,
+  HITL and artifacts.
+- **Every new extension ships with its conformance case** (4.16) and its README
+  recipe, in the same PR.
+- `xfail(strict=False)` is for behaviour that is *specified but unimplemented* —
+  never for a code path that has never been proven to work. That is how 4.12
+  stayed hidden.
 - When adding a feature, update the recipe section of the README in the same PR
   — docs drift is how this repo got four stale planning documents.
 

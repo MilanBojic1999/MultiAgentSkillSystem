@@ -7,6 +7,7 @@ Endpoints:
     POST /run             — run the pipeline synchronously (blocking)
     POST /run-async       — start a pipeline run in the background
     GET  /status/{task_id} — check status of an async run
+    GET  /artifacts/{task_id}/{filename} — serve a generated artifact file
 """
 
 import asyncio
@@ -18,6 +19,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
@@ -30,6 +32,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from graphs import build_graph, graph_descriptions
 from agents.agent_states import ExecutionStatus, StepStatus, get_current_datetime_str
 from assemble_node import pipeline_result
+from utils.artifacts import get_artifact_path
 from utils.logger import log_event
 
 # Graph used when a request does not name one.
@@ -75,12 +78,15 @@ class RunResponse(BaseModel):
 
     ``status`` is ``completed`` or ``partial`` on HTTP 200; a fatal error
     before assembly is an HTTP 500 error response instead (Slice 4).
+    ``task_id`` keys the run's artifact directory (plan 4.5) — the client
+    fetches generated files from ``GET /artifacts/{task_id}/{filename}``.
     """
     status: ExecutionStatus
     final_output: str
     failed_steps: list[int] = []
     skipped_steps: list[int] = []
     step_stats: list[StepStatsModel] = []
+    task_id: str = ""
 
 
 class GraphInfo(BaseModel):
@@ -204,21 +210,30 @@ def _resolve_graph_or_400(graph_name: str | None) -> None:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-async def _run_pipeline(task: str, graph_name: str | None = None) -> RunResponse:
+async def _run_pipeline(task: str, graph_name: str | None = None,
+                        task_id: str | None = None) -> RunResponse:
     """Run the selected LangGraph pipeline and return its typed result.
 
     ``status`` is ``completed`` when every planned step finished and
     ``partial`` when containment failed or skipped steps while assembly still
     produced usable output. Fatal planner, graph or configuration errors
     raise here — they are transport-level failures, never partial results.
+
+    ``task_id`` keys the run's artifact directory (plan 4.5); a fresh one is
+    generated for synchronous runs and returned in the response so the client
+    can fetch generated files from ``GET /artifacts/{task_id}/{filename}``.
     """
     graph = _get_graph(graph_name)
-    config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
+    run_id = task_id or uuid.uuid4().hex[:12]
+    config = {"configurable": {
+        "thread_id": f"api-{uuid.uuid4().hex[:8]}",
+        "task_id": run_id,
+    }}
     result = await graph.ainvoke(
         {"task": task, "current_datetime": get_current_datetime_str()},
         config=config,
     )
-    return RunResponse(**pipeline_result(result))
+    return RunResponse(task_id=run_id, **pipeline_result(result))
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +305,10 @@ async def run_pipeline_async(req: RunRequest):
 
     async def _background():
         try:
-            result = await _run_pipeline(req.task, req.graph)
+            # The task id also keys the run's artifact directory (plan 4.5),
+            # so the client can fetch generated files from
+            # GET /artifacts/{task_id}/{filename} with the id it already has.
+            result = await _run_pipeline(req.task, req.graph, task_id)
             async with _task_lock:
                 # Terminal "completed" or "partial" — both preserve the
                 # assembled output and per-step statistics (Slice 4).
@@ -345,6 +363,28 @@ async def task_status(task_id: str):
         step_stats=entry.get("step_stats", []),
         error=entry.get("error"),
     )
+
+
+@app.get("/artifacts/{task_id}/{filename}")
+async def get_artifact(task_id: str, filename: str):
+    """
+    Serve a generated artifact file for a run (plan 4.5).
+
+    File-producing tools write into ``<ARTIFACTS_DIR>/<task_id>/`` and return
+    the relative path, so the client fetches it with the task id from
+    ``/run``, ``/run-async`` or ``/status``. Both path segments are validated
+    as single safe segments — traversal attempts get a 400.
+    """
+    try:
+        path = get_artifact_path(filename, config={"configurable": {"task_id": task_id}})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact '{filename}' not found for task '{task_id}'.",
+        )
+    return FileResponse(path)
 
 
 # ---------------------------------------------------------------------------

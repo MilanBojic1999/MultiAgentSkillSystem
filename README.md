@@ -348,6 +348,34 @@ That's it. `tools/__init__.py` scans the directory at import time and collects
 every `@tool` function into `TOOL_REGISTRY` — no imports, exports, or
 registration code.
 
+#### File-producing tools
+
+A tool that writes a file must follow the artifact convention (plan 4.5)
+instead of picking its own location:
+
+```python
+import uuid
+from langchain_core.runnables import RunnableConfig
+from utils.artifacts import get_artifact_path
+
+@tool
+def my_exporter(data: str, config: RunnableConfig = None) -> str:
+    """..."""
+    path = get_artifact_path(f"out-{uuid.uuid4().hex[:8]}.txt", config)
+    path.write_text(data)
+    return str(path)
+```
+
+- `get_artifact_path` resolves to `<ARTIFACTS_DIR>/<task id>/<name>` from the
+  run config — the task id is threaded through `configurable`, so parallel
+  runs (and concurrent steps inside one run, thanks to the unique name) never
+  overwrite each other. Without a run config (REPL, tests, demos) files land
+  directly under the root.
+- Return the path — the sub-agent reports it in its output, and clients fetch
+  the file via `GET /artifacts/{task_id}/{filename}` (`ARTIFACTS_DIR` defaults
+  to `artifacts/`, env-overridable).
+- `plotting_tool` (`tools/plotting.py`) is the reference implementation.
+
 ### Recipe 2 — Add an agent
 
 Add one entry to `agents/agent_config.json` — no code:
@@ -617,6 +645,7 @@ Each MCP server must have a single owning agent for security — `config_loader.
 | `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional. Returns `status` (`completed`/`partial`), `final_output`, `failed_steps`, `skipped_steps`, and typed `step_stats` — HTTP 200 even for contained failures |
 | `/run-async` | POST | Start a pipeline run in the background (same body). Returns a `task_id` immediately (HTTP 202) |
 | `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, then `"completed"` or `"partial"` (with `final_output`, `failed_steps`, `skipped_steps`, `step_stats`), or `"failed"` (with a safe `error` message) |
+| `/artifacts/{task_id}/{filename}` | GET | Serve a generated artifact file (plots, etc.) for a run. `task_id` comes from `/run` (sync response), `/run-async` or `/status` |
 
 The API uses Pydantic models for request/response validation and includes CORS middleware (open by default — tighten in production). A zero-dependency CLI client (`api_client.py`) is provided for interacting with the API from the terminal.
 
@@ -754,7 +783,6 @@ Caveats:
 - **MCP client**: Ensure the MCP server is reachable before running agents that depend on it; the pipeline will fail if an MCP-dependent agent is dispatched and the server is down.
 - **Skill body parsing**: `skill_loader.py` uses `maxsplit=2` when splitting on `---` to handle body content containing dash sequences. Ensure SKILL.md files follow the standard `---\n(YAML frontmatter)\n---\n(body)` format.
 - **Sequential pipeline**: `graphs/sequential_pipeline_graph.py` is a reference topology — it re-evaluates its router after every step and has no scheduler barrier. `parallel` is the default everywhere.
-- **Old import path**: the root `paralel_pipeline_graph.py` (misspelled) is an import-compat shim for one release and no longer exposes a pre-compiled `graph` singleton — use `build_graph("parallel")`.
 
 ## License
 
