@@ -535,6 +535,7 @@ class AgentState(TypedDict):
     failed_steps: list[int]      # Steps that failed after retries (Phase 4.13)
     step_stats: list[StepStats]  # Per-step timing, tokens, and tool calls (Phase 4.9)
     final_output: str            # Assembled final answer (with warning header)
+    status: ExecutionStatus      # "completed" | "partial" — written by assemble (Slice 4)
     current_datetime: str        # Current date/time for context
 ```
 
@@ -613,9 +614,9 @@ Each MCP server must have a single owning agent for security — `config_loader.
 |---|---|---|
 | `/health` | GET | Health check — returns `{"status": "ok"}` |
 | `/graphs` | GET | List the graphs discovered in `graphs/`, with descriptions and which is the default |
-| `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional |
+| `/run` | POST | Run the pipeline synchronously (blocks until complete). Body: `{"task": "...", "graph": "parallel"}` — `graph` is optional. Returns `status` (`completed`/`partial`), `final_output`, `failed_steps`, `skipped_steps`, and typed `step_stats` — HTTP 200 even for contained failures |
 | `/run-async` | POST | Start a pipeline run in the background (same body). Returns a `task_id` immediately (HTTP 202) |
-| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, `"completed"` (with `final_output`, `step_stats`), or `"failed"` (with `error`) |
+| `/status/{task_id}` | GET | Poll for async task status. Returns `"running"`, then `"completed"` or `"partial"` (with `final_output`, `failed_steps`, `skipped_steps`, `step_stats`), or `"failed"` (with a safe `error` message) |
 
 The API uses Pydantic models for request/response validation and includes CORS middleware (open by default — tighten in production). A zero-dependency CLI client (`api_client.py`) is provided for interacting with the API from the terminal.
 
@@ -625,7 +626,7 @@ The API uses Pydantic models for request/response validation and includes CORS m
 - **Output validation** (`utils/validator.py`) — Blocks XSS vectors (`<script`), prompt leakage patterns, empty outputs, and oversized outputs (>50K chars)
 - **Sandboxed bash** — `run_bash` drops privileges to `nobody` user before executing
 - **MCP ownership validation** — Agents can only access MCP servers they explicitly own; `config_loader.py` enforces exclusive ownership at startup; `agent_mcp_tools.py` re-checks at runtime
-- **Retry policy** — Sub-agent nodes have `RetryPolicy(max_attempts=2)` for automatic retries on transient errors
+- **Per-agent retry** — Each step runs up to its agent's `execution.max_attempts` total attempts (default 2, validated 1–10 at config load); the worker node owns the bounded retry loop, so a step is contained only after its final attempt
 - **Failure containment** — A step that exhausts retries is recorded as `[STEP FAILED]` and its dependents are marked `[SKIPPED — dependency failed]` without being dispatched; the assembler prepends a warning header to `final_output` so partial results are clearly flagged
 
 ## Configuration Reference

@@ -1,8 +1,11 @@
+import asyncio
 import time
 from functools import partial
+from typing import Awaitable, Callable
 
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda
 from skill_loader import load_skills, load_skills_body
 from tools.agent_tools import AGENT_TOOLS
 from utils.validator import validate_step_output
@@ -13,7 +16,7 @@ from utils.logger import log_event
 
 from agents import AGENT_ROSTER
 from agents.agent_states import get_current_datetime_str, WorkerState
-from config_loader import AGENT_CONFIG
+from config_loader import AGENT_CONFIG, get_max_attempts
 
 load_dotenv()
 
@@ -158,6 +161,81 @@ async def run_sub_agent_async(
     return step_num, output, stats
 
 
+async def run_step_with_attempts(
+    step: dict,
+    run_attempt: Callable[[], Awaitable[tuple[int, str, dict]]],
+    max_attempts: int,
+    graph_name: str = "",
+) -> tuple[int, str, dict]:
+    """Run ``run_attempt`` up to ``max_attempts`` times (Slice 3).
+
+    Returns ``(step_num, output, stats)`` from the first successful attempt.
+    On exhaustion, re-raises the final attempt's exception so the calling
+    worker can contain it — containment therefore happens **only after the
+    final attempt**, never before.
+
+    This helper is the pipeline's single retry owner: graph builders attach
+    no worker-node ``RetryPolicy``, so a permanently failing step produces
+    exactly ``max_attempts`` executions. The count comes validated from
+    ``config_loader.get_max_attempts`` (integer 1–10, default 2).
+
+    Every failed **non-final** attempt logs ``sub_agent_attempt_failed`` with
+    step, agent, attempt number, maximum attempts, exception type and error
+    text; the final failure is logged by the calling worker. Attempt-level
+    token aggregation is not claimed — failed calls expose no reliable usage.
+
+    ``asyncio.CancelledError``, ``KeyboardInterrupt`` and ``SystemExit`` are
+    never contained as step failures: they escape immediately.
+    """
+    step_num = step["step"]
+    agent_name = step["agent"]
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await run_attempt()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                log_event(
+                    "sub_agent_attempt_failed",
+                    step_num=step_num,
+                    agent_name=agent_name,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    exception_type=type(exc).__name__,
+                    error=str(exc),
+                    graph=graph_name or None,
+                )
+    if last_exc is None:  # pragma: no cover - max_attempts is validated >= 1
+        raise RuntimeError(
+            f"run_step_with_attempts got max_attempts={max_attempts!r} (must be >= 1)"
+        )
+    raise last_exc
+
+
+async def _run_guarded_attempt(
+    step: dict,
+    run_step: Callable[..., Awaitable[tuple[int, str, dict]]],
+    results: dict,
+    current_datetime: str,
+) -> tuple[int, str, dict]:
+    """One sequential-worker attempt: satisfy the dependency guard, then run.
+
+    Raises ``RuntimeError`` when the step's dependencies are not all present
+    — a permanently blocked step dispatched in error. The guard participates
+    in the bounded attempt loop like any other ordinary exception (Slice 3).
+    """
+    unfinished_deps = [d for d in step.get("depends_on", []) if d not in results]
+    if unfinished_deps:
+        raise RuntimeError(
+            f"Step {step['step']} cannot execute: its dependencies "
+            f"{unfinished_deps} are not in results and cannot be satisfied. "
+            f"Check that every step's depends_on references valid step numbers."
+        )
+    return await run_step(step, results, current_datetime)
+
 
 def _resolve_run_step(run_step, llm):
     """``run_step`` wins; otherwise run the real step, optionally on a given LLM."""
@@ -169,6 +247,10 @@ def _resolve_run_step(run_step, llm):
 def make_sub_agent_node(run_step=None, llm=None):
     """Factory for the sequential worker node.
 
+    Returns a dual-mode node (``RunnableLambda``): the sync body drives the
+    attempt loop on a fresh event loop for ``graph.invoke``, the async body
+    awaits it directly for ``graph.ainvoke``.
+
     ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
     coroutine
     ``(step, results, current_datetime) -> (step_num, output, stats_dict)``.
@@ -176,43 +258,48 @@ def make_sub_agent_node(run_step=None, llm=None):
     """
     run_step = _resolve_run_step(run_step, llm)
 
-    async def sub_agent_node(state: WorkerState) -> dict:
+    async def sub_agent_node_async(state: WorkerState) -> dict:
         """Sequential node: executes the next uncompleted step in the plan.
 
-        Failure containment (Phase 4.13): a failed step is recorded as a result
-        and flagged in ``failed_steps`` instead of killing the whole graph.
-        Per-step stats (Phase 4.9): every step — completed, failed, or blocked —
-        emits a ``StepStats`` entry.
+        Retry before containment (Slice 3): the node owns the bounded attempt
+        loop configured by the agent's ``execution.max_attempts``, so a step
+        is contained only after its final attempt raises. Per-step stats
+        (Phase 4.9): every step — completed, failed, or blocked — emits exactly
+        one ``StepStats`` entry, with ``duration_s`` covering all attempts.
         """
         step = state["step"]
         results = state["results"]
         current_datetime = state.get("current_datetime", "")
 
+        # Step already completed — no-op (defensive; the router should
+        # never dispatch an already-completed step, but if it does we
+        # must not return a scalar string that would break the results
+        # reducer ``lambda a, b: {**a, **b}``).
+        if step["step"] in results:
+            return {}
+
         t0 = time.monotonic()
         try:
-            # Find the next step whose dependencies are all resolved
-            if step["step"] in results:
-                return {"results": results[step["step"]]}
-            deps_met = all(d in results for d in step.get("depends_on", []))
-            if deps_met:
-                step_num, output, inner_stats = await run_step(step, results, current_datetime)
-                stats = {
-                    "step": step_num,
-                    "agent": step["agent"],
-                    "status": "completed",
-                    "duration_s": round(time.monotonic() - t0, 3),
-                    "input_tokens": inner_stats["input_tokens"],
-                    "output_tokens": inner_stats["output_tokens"],
-                    "tool_calls": inner_stats["tool_calls"],
-                }
-                return {"results": {step_num: output}, "step_stats": [stats]}
-
-            unfinished_deps = [d for d in step.get("depends_on", []) if d not in results]
-            raise RuntimeError(
-                f"Step {step['step']} cannot execute: its dependencies "
-                f"{unfinished_deps} are not in results and cannot be satisfied. "
-                f"Check that every step's depends_on references valid step numbers."
+            step_num, output, inner_stats = await run_step_with_attempts(
+                step,
+                partial(_run_guarded_attempt, step, run_step, results, current_datetime),
+                get_max_attempts(step["agent"]),
+                graph_name="sequential",
             )
+            stats = {
+                "step": step_num,
+                "agent": step["agent"],
+                "status": "completed",
+                "duration_s": round(time.monotonic() - t0, 3),
+                "input_tokens": inner_stats["input_tokens"],
+                "output_tokens": inner_stats["output_tokens"],
+                "tool_calls": inner_stats["tool_calls"],
+            }
+            return {"results": {step_num: output}, "step_stats": [stats]}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            # Cancellation and process-level signals are never contained as
+            # step failures — they escape to the caller (Slice 3).
+            raise
         except Exception as e:
             duration = round(time.monotonic() - t0, 3)
             log_event("sub_agent_step_failed", step=state["step"]["step"], error=str(e))
@@ -230,11 +317,19 @@ def make_sub_agent_node(run_step=None, llm=None):
                 }],
             }
 
-    return sub_agent_node
+    def sub_agent_node(state: WorkerState) -> dict:
+        """Sync entry point — LangGraph calls this under ``graph.invoke``."""
+        return asyncio.run(sub_agent_node_async(state))
+
+    return RunnableLambda(sub_agent_node, afunc=sub_agent_node_async)
 
 
 def make_parallel_sub_agent_node(run_step=None, llm=None):
     """Factory for the parallel worker node (one ``Send`` task per ready step).
+
+    Returns a dual-mode node (``RunnableLambda``): the sync body drives the
+    attempt loop on a fresh event loop for ``graph.invoke``, the async body
+    awaits it directly for ``graph.ainvoke``.
 
     ``run_step`` defaults to ``run_sub_agent_async``; tests inject a stub
     coroutine
@@ -245,12 +340,15 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
     """
     run_step = _resolve_run_step(run_step, llm)
 
-    async def parallel_sub_agent_node(state: WorkerState) -> dict:
+    async def parallel_sub_agent_node_async(state: WorkerState) -> dict:
         step = state["step"]
         t0 = time.monotonic()
         try:
-            step_num, output, inner_stats = await run_step(
-                step, state["results"], state.get("current_datetime", "")
+            step_num, output, inner_stats = await run_step_with_attempts(
+                step,
+                partial(run_step, step, state["results"], state.get("current_datetime", "")),
+                get_max_attempts(step["agent"]),
+                graph_name="parallel",
             )
             stats = {
                 "step": step_num,
@@ -262,6 +360,10 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
                 "tool_calls": inner_stats["tool_calls"],
             }
             return {"results": {step_num: output}, "step_stats": [stats]}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            # Cancellation and process-level signals are never contained as
+            # step failures — they escape to the caller (Slice 3).
+            raise
         except Exception as e:
             duration = round(time.monotonic() - t0, 3)
             log_event("sub_agent_step_failed", step=state["step"]["step"], error=str(e))
@@ -277,4 +379,8 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
                         "tool_calls": 0,
                     }]}
 
-    return parallel_sub_agent_node
+    def parallel_sub_agent_node(state: WorkerState) -> dict:
+        """Sync entry point — LangGraph calls this under ``graph.invoke``."""
+        return asyncio.run(parallel_sub_agent_node_async(state))
+
+    return RunnableLambda(parallel_sub_agent_node, afunc=parallel_sub_agent_node_async)

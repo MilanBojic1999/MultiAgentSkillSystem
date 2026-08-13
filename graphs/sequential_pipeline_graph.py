@@ -43,9 +43,17 @@ def sequential_router(state: dict):
     if not ready:
         unfinished = [s["step"] for s in plan if s["step"] not in results]
         if unfinished:
+            detail_parts = []
+            for s in plan:
+                if s["step"] in unfinished:
+                    unmet = [d for d in s.get("depends_on", []) if d not in results]
+                    detail_parts.append(
+                        f"step {s['step']} (unmet dependencies: {unmet})"
+                    )
             raise RuntimeError(
                 f"No step is ready to execute, but {len(unfinished)} step(s) "
                 f"remain unfinished and are permanently blocked: {unfinished}. "
+                f"Details: {'; '.join(detail_parts)}. "
                 f"Check that every step's depends_on references valid step numbers."
             )
         return "assemble"
@@ -117,10 +125,9 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
         "orchestrator", orchestrator,
         retry_policy=RetryPolicy(max_attempts=2, retry_on=(ValueError,)),
     )
-    builder.add_node(
-        "sub_agent", sub_agent,
-        retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)),
-    )
+    # No worker RetryPolicy (Slice 3): the worker node owns the bounded
+    # attempt loop configured per agent via ``execution.max_attempts``.
+    builder.add_node("sub_agent", sub_agent)
     builder.add_node("assemble", assemble_node)
     builder.add_node("scheduler", scheduler_node)
 

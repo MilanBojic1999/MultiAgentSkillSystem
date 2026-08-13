@@ -6,6 +6,7 @@ Reads a single ``agents/agent_config.json`` file that describes every agent:
 - tools         — list of tool names (resolved against the auto-discovered TOOL_REGISTRY)
 - mcp_servers   — dict of MCP server name → URL
 - llm           — optional per-agent LLM overrides (Phase 4.3)
+- execution     — optional per-agent execution policy: ``max_attempts`` (Slice 2)
 
 Each agent OWNS the MCP servers listed under its key; the loader validates that no
 server is claimed by more than one agent.
@@ -113,6 +114,52 @@ def _validate_mcp_shapes(config: dict[str, dict[str, Any]]) -> None:
                 )
 
 
+_EXECUTION_KEYS = frozenset({"max_attempts"})
+
+# Bounds for ``execution.max_attempts`` (Slice 2). The count is total
+# executions per step, including the first attempt. The upper bound prevents
+# a config typo from producing an excessive number of model or tool calls.
+DEFAULT_MAX_ATTEMPTS = 2
+_MAX_ATTEMPTS_BOUND = 10
+
+
+def _validate_execution_blocks(config: dict[str, dict[str, Any]]) -> None:
+    """Raise if any agent's ``execution`` block is malformed (Slice 2).
+
+    Recognises exactly one key today: ``execution.max_attempts``. Booleans
+    are rejected even though Python treats ``bool`` as a subclass of ``int``.
+    """
+    for agent_name, cfg in config.items():
+        exec_block = cfg.get("execution")
+        if exec_block is None:
+            continue
+        if not isinstance(exec_block, dict):
+            raise TypeError(
+                f"Agent '{agent_name}': 'execution' must be a dict, "
+                f"got {type(exec_block).__name__}"
+            )
+        bad = set(exec_block) - _EXECUTION_KEYS
+        if bad:
+            raise ValueError(
+                f"Agent '{agent_name}': unknown key(s) in 'execution' block: "
+                f"{sorted(bad)}. Accepted keys: {sorted(_EXECUTION_KEYS)}."
+            )
+        if "max_attempts" not in exec_block:
+            continue
+        value = exec_block["max_attempts"]
+        field = f"Agent '{agent_name}': 'execution.max_attempts'"
+        if isinstance(value, bool):
+            raise ValueError(
+                f"{field} must be an integer from 1 to {_MAX_ATTEMPTS_BOUND}, "
+                f"not a boolean (got {value})."
+            )
+        if not isinstance(value, int) or not 1 <= value <= _MAX_ATTEMPTS_BOUND:
+            raise ValueError(
+                f"{field} must be an integer from 1 to {_MAX_ATTEMPTS_BOUND}, "
+                f"got {value!r}."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -121,6 +168,7 @@ _raw = _load_raw_config()
 _validate_mcp_ownership(_raw)
 _validate_llm_blocks(_raw)
 _validate_mcp_shapes(_raw)
+_validate_execution_blocks(_raw)
 AGENT_CONFIG: dict[str, dict[str, Any]] = _raw
 """Agent-keyed dictionary loaded from ``agents/agent_config.json``.
 
@@ -129,4 +177,21 @@ Each value is a dict with:
 - ``tools``        (list[str])
 - ``mcp_servers``  (dict[str, str])
 - ``llm``          (dict | None)  — optional per-agent LLM overrides
+- ``execution``    (dict | None)  — optional per-agent execution policy
 """
+
+
+def get_max_attempts(agent_name: str) -> int:
+    """Return the validated total-execution count for an agent (Slice 2).
+
+    ``execution.max_attempts`` counts **total executions** per step, not
+    retries after the first execution: ``2`` means the initial attempt plus
+    one retry. Absent ``execution`` blocks normalize to the
+    ``DEFAULT_MAX_ATTEMPTS`` of ``2``, so existing configurations need no
+    migration. Values were validated at load time, so this can never return
+    an out-of-range count.
+    """
+    block = AGENT_CONFIG.get(agent_name, {}).get("execution")
+    if not block:
+        return DEFAULT_MAX_ATTEMPTS
+    return block["max_attempts"]

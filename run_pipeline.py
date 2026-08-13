@@ -12,37 +12,34 @@ import asyncio
 import sys
 
 from graphs import build_graph, graph_descriptions
-from agents.agent_states import get_current_datetime_str
+from agents.agent_states import PipelineResult, get_current_datetime_str
+from assemble_node import pipeline_result
 
 DEFAULT_GRAPH = "parallel"
 
 
-def run(task: str, graph_name: str = DEFAULT_GRAPH) -> tuple[str, list[dict]]:
+def run(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
     """Run the pipeline synchronously.
 
-    Returns ``(final_output, step_stats)`` (Phase 4.9).
+    Returns the typed result: ``status`` (``completed``/``partial``),
+    ``final_output``, ``failed_steps``, ``skipped_steps`` and ``step_stats``
+    (Slice 4).
     """
     config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
     result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
-    return (
-        result.get("final_output", "No final output produced."),
-        result.get("step_stats", []),
-    )
+    return pipeline_result(result)
 
 
-async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> tuple[str, list[dict]]:
+async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
     """Run the pipeline asynchronously.
 
-    Returns ``(final_output, step_stats)`` (Phase 4.9).
+    Returns the same typed result as :func:`run` (Slice 4).
     """
     config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
     result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
-    return (
-        result.get("final_output", "No final output produced."),
-        result.get("step_stats", []),
-    )
+    return pipeline_result(result)
 
 
 def _print_stats(step_stats: list[dict]) -> None:
@@ -112,13 +109,14 @@ if __name__ == "__main__":
 
     print(f"Running pipeline '{args.graph}' with task:\n  {task}\n")
     print("=" * 60)
-    output, step_stats = asyncio.run(run_async(task, args.graph))
+    result = asyncio.run(run_async(task, args.graph))
     print("=" * 60)
-    print(output)
+    print(f"Status: {result['status']}")
+    print(result["final_output"])
 
-    if step_stats:
+    if result["step_stats"]:
         print()
         print("=" * 60)
         print("Step stats")
         print("=" * 60)
-        _print_stats(step_stats)
+        _print_stats(result["step_stats"])

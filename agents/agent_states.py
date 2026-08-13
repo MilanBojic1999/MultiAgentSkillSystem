@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 from typing_extensions import TypedDict
 import operator
 from datetime import datetime
@@ -18,6 +18,21 @@ class PlanStep(TypedDict):
     depends_on: list[int]
 
 
+StepStatus = Literal["completed", "failed", "skipped"]
+"""Per-step terminal status (Slice 4)."""
+
+ExecutionStatus = Literal["completed", "partial", "failed", "running"]
+"""Terminal pipeline status (Slice 4).
+
+- ``completed`` — every planned step completed successfully;
+- ``partial`` — at least one step failed or was skipped, but the graph
+  assembled usable output;
+- ``failed`` — the planner, graph, configuration or infrastructure failed
+  before a usable assembled result existed;
+- ``running`` — an asynchronous run has not reached a terminal state.
+"""
+
+
 class StepStats(TypedDict):
     """Per-step execution statistics (Phase 4.9).
 
@@ -27,11 +42,24 @@ class StepStats(TypedDict):
     """
     step: int
     agent: str
-    status: str           # "completed" | "failed" | "skipped"
+    status: StepStatus
     duration_s: float
     input_tokens: int
     output_tokens: int
     tool_calls: int
+
+
+class PipelineResult(TypedDict):
+    """Typed pipeline result returned at presentation boundaries (Slice 4).
+
+    Built by ``assemble_node.pipeline_result`` from a terminal graph state and
+    consumed by the CLI and the API response models.
+    """
+    status: ExecutionStatus
+    final_output: str
+    failed_steps: list[int]
+    skipped_steps: list[int]
+    step_stats: list[StepStats]
 
 
 class AgentState(TypedDict):
@@ -58,6 +86,9 @@ class AgentState(TypedDict):
 
     # Final assembled output
     final_output: str
+
+    # Terminal execution status, written by the assemble node (Slice 4)
+    status: ExecutionStatus
 
 
 def _transitive_dependents(plan: list[dict], failed: set[int]) -> set[int]:

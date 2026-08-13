@@ -58,6 +58,7 @@ def test_each_step_dispatched_exactly_once(plan):
     assert calls == expected                      # the 1.1 bug over-counts join steps
     last = max(s["step"] for s in plan)
     assert f"out-{last}" in out["final_output"]
+    assert out["status"] == "completed"           # Slice 4
 
 
 def test_failed_step_is_contained_and_recorded():
@@ -98,6 +99,9 @@ def test_failed_step_is_contained_and_recorded():
 
     # Step 3: transitively skipped because its dependency (step 1) failed
     assert "[SKIPPED — dependency failed]" in out["final_output"]
+
+    # Slice 4: the assembled run carries a machine-readable partial status
+    assert out["status"] == "partial"
 
     # Warning header present
     assert "⚠️" in out["final_output"]
@@ -161,6 +165,7 @@ def test_sequential_graph_each_step_runs_exactly_once_invoke(plan):
     assert calls == expected
     last = max(s["step"] for s in plan)
     assert f"out-{last}" in out["final_output"]
+    assert out["status"] == "completed"           # Slice 4
 
 
 @pytest.mark.parametrize("plan", [LINEAR_PLAN, DIAMOND_PLAN])
@@ -182,6 +187,7 @@ def test_sequential_graph_each_step_runs_exactly_once_ainvoke(plan):
     assert calls == expected
     last = max(s["step"] for s in plan)
     assert f"out-{last}" in out["final_output"]
+    assert out["status"] == "completed"           # Slice 4
 
 
 def test_sequential_graph_failure_containment_and_skip_propagation():
@@ -209,8 +215,10 @@ def test_sequential_graph_failure_containment_and_skip_propagation():
         graph.ainvoke({"task": "t", "current_datetime": ""}, config=_SEQ_CONFIG)
     )
 
-    # Only step 1 was dispatched; steps 2 and 3 were skipped by the scheduler
-    assert calls == [1], f"expected only step 1 to be dispatched, got {calls}"
+    # Only step 1 was dispatched — three times (the shipped config gives
+    # researcher max_attempts=3, Slice 3) — then contained; steps 2 and 3
+    # were skipped by the scheduler without being dispatched.
+    assert calls == [1, 1, 1], f"expected step 1 three times and no other dispatch, got {calls}"
 
     assert "[STEP FAILED]" in out["final_output"]
     assert 1 in out.get("failed_steps", [])
@@ -218,6 +226,7 @@ def test_sequential_graph_failure_containment_and_skip_propagation():
     assert "[SKIPPED — dependency failed]" in out["final_output"]
     assert "⚠️" in out["final_output"]
     assert "1 of 3 steps failed" in out["final_output"]
+    assert out["status"] == "partial"             # Slice 4
 
     # --- Phase 4.9: step_stats ---
     stats = {s["step"]: s for s in out.get("step_stats", [])}
@@ -258,6 +267,7 @@ def test_step_stats_happy_path_parallel():
 
     stats = out.get("step_stats", [])
     assert len(stats) == 3, f"expected 3 stats entries, got {len(stats)}"
+    assert out["status"] == "completed"           # Slice 4
 
     by_step = {s["step"]: s for s in stats}
 

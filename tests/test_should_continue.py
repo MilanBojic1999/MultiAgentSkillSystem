@@ -111,7 +111,41 @@ def test_blocked_forever_sub_agent_node_is_contained():
         "results": {},
         "current_datetime": "",
     }
-    result = asyncio.run(node(state))
+    result = asyncio.run(node.ainvoke(state))
     assert 1 in result.get("results", {})
     assert "[STEP FAILED]" in result["results"][1]
     assert 1 in result.get("failed_steps", [])
+
+
+def test_already_completed_step_returns_reducer_compatible_state():
+    """Slice 1: the sequential worker's duplicate-result branch is a no-op.
+
+    If a worker receives a step already present in ``results`` (defensive
+    path — the router should never dispatch it), it must NOT return the raw
+    output string under ``results`` (a scalar would break the state reducer
+    ``lambda a, b: {**a, **b}``) and must NOT emit a second stats row.
+    """
+    from agents.sub_agents_nodes import make_sub_agent_node
+
+    calls: list[int] = []
+
+    async def fake_run(step, results, current_datetime=""):
+        calls.append(step["step"])
+        return step["step"], "out-1", {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
+
+    node = make_sub_agent_node(run_step=fake_run)
+    result = asyncio.run(
+        node.ainvoke({
+            "step": step(1),
+            "results": {1: "out-1"},
+            "current_datetime": "",
+        })
+    )
+
+    # The step must not be re-executed…
+    assert calls == []
+
+    # …and the returned state must be reducer-compatible: no scalar under
+    # ``results``, no duplicate stats row.
+    assert "results" not in result or isinstance(result["results"], dict)
+    assert "step_stats" not in result or result["step_stats"] == []

@@ -100,6 +100,12 @@ def run_task(task: str, base_url: str, graph: Optional[str] = None) -> Optional[
         print(f"❌ Error: {result.get('detail', 'Unknown error')}")
         return None
 
+    status = result.get("status", "completed")
+    if status == "partial":
+        failed = len(result.get("failed_steps", []))
+        print(f"⚠️  Pipeline finished with status 'partial' ({failed} step(s) failed).")
+    else:
+        print(f"✅ Pipeline finished with status '{status}'.")
     return result.get("final_output", "")
 
 
@@ -142,6 +148,11 @@ def run_task_async(task: str, base_url: str, graph: Optional[str] = None) -> Opt
 
         if task_status == "completed":
             print(f"\n✅ Task completed!")
+            return status.get("final_output", "")
+
+        if task_status == "partial":
+            failed = len(status.get("failed_steps", []))
+            print(f"\n⚠️  Task finished with status 'partial' ({failed} step(s) failed).")
             return status.get("final_output", "")
 
         if task_status == "failed":

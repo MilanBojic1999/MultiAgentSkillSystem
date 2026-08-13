@@ -14,7 +14,7 @@ import os
 import uuid
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +28,8 @@ load_dotenv()
 from langgraph.checkpoint.memory import MemorySaver
 
 from graphs import build_graph, graph_descriptions
-from agents.agent_states import get_current_datetime_str
+from agents.agent_states import ExecutionStatus, StepStatus, get_current_datetime_str
+from assemble_node import pipeline_result
 from utils.logger import log_event
 
 # Graph used when a request does not name one.
@@ -58,9 +59,28 @@ class RunRequest(BaseModel):
     )
 
 
+class StepStatsModel(BaseModel):
+    """One typed per-step statistics row (Slice 4)."""
+    step: int
+    agent: str
+    status: StepStatus
+    duration_s: float
+    input_tokens: int
+    output_tokens: int
+    tool_calls: int
+
+
 class RunResponse(BaseModel):
+    """Typed synchronous execution result.
+
+    ``status`` is ``completed`` or ``partial`` on HTTP 200; a fatal error
+    before assembly is an HTTP 500 error response instead (Slice 4).
+    """
+    status: ExecutionStatus
     final_output: str
-    step_stats: list[dict] | None = None
+    failed_steps: list[int] = []
+    skipped_steps: list[int] = []
+    step_stats: list[StepStatsModel] = []
 
 
 class GraphInfo(BaseModel):
@@ -75,14 +95,22 @@ class GraphsResponse(BaseModel):
 
 class AsyncRunResponse(BaseModel):
     task_id: str
-    status: str = "started"
+    status: Literal["started"] = "started"
 
 
 class StatusResponse(BaseModel):
+    """Typed asynchronous poll response: ``running`` until terminal.
+
+    Terminal states are ``completed``, ``partial`` (output and stats are
+    preserved and retrievable) and ``failed`` (``error`` carries the safe
+    public message) — Slice 4.
+    """
     task_id: str
-    status: str  # "running" | "completed" | "failed"
+    status: ExecutionStatus
     final_output: str | None = None
-    step_stats: list[dict] | None = None
+    failed_steps: list[int] = []
+    skipped_steps: list[int] = []
+    step_stats: list[StepStatsModel] = []
     error: str | None = None
 
 
@@ -176,11 +204,13 @@ def _resolve_graph_or_400(graph_name: str | None) -> None:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-async def _run_pipeline(task: str, graph_name: str | None = None) -> tuple[str, list[dict]]:
-    """Run the selected LangGraph pipeline.
+async def _run_pipeline(task: str, graph_name: str | None = None) -> RunResponse:
+    """Run the selected LangGraph pipeline and return its typed result.
 
-    Returns ``(final_output, step_stats)`` — the assembled output string and
-    the per-step execution statistics collected during the run (Phase 4.9).
+    ``status`` is ``completed`` when every planned step finished and
+    ``partial`` when containment failed or skipped steps while assembly still
+    produced usable output. Fatal planner, graph or configuration errors
+    raise here — they are transport-level failures, never partial results.
     """
     graph = _get_graph(graph_name)
     config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
@@ -188,10 +218,7 @@ async def _run_pipeline(task: str, graph_name: str | None = None) -> tuple[str, 
         {"task": task, "current_datetime": get_current_datetime_str()},
         config=config,
     )
-    return (
-        result.get("final_output", "No final output produced."),
-        result.get("step_stats", []),
-    )
+    return RunResponse(**pipeline_result(result))
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +249,13 @@ async def run_pipeline(req: RunRequest):
     Run the full multi-agent pipeline **synchronously** (the HTTP call blocks
     until the pipeline finishes).
 
-    Suitable for most use-cases where the task completes within a few seconds
-    to a couple of minutes.
+    Contained step failures return HTTP 200 with ``status: partial`` and the
+    usable assembled output; only a fatal planner/graph/configuration error
+    is an HTTP 500 (Slice 4).
     """
     _resolve_graph_or_400(req.graph)
     try:
-        output, step_stats = await _run_pipeline(req.task, req.graph)
-        return RunResponse(final_output=output, step_stats=step_stats)
+        return await _run_pipeline(req.task, req.graph)
     except Exception as exc:
         error_id = uuid.uuid4().hex[:12]
         log_event("api_run_failed", error_id=error_id, error=str(exc),
@@ -252,16 +279,27 @@ async def run_pipeline_async(req: RunRequest):
     task_id = uuid.uuid4().hex[:12]
 
     async with _task_lock:
-        _task_store[task_id] = {"status": "running", "final_output": None, "error": None}
+        _task_store[task_id] = {
+            "status": "running",
+            "final_output": None,
+            "failed_steps": [],
+            "skipped_steps": [],
+            "step_stats": [],
+            "error": None,
+        }
 
     async def _background():
         try:
-            output, step_stats = await _run_pipeline(req.task, req.graph)
+            result = await _run_pipeline(req.task, req.graph)
             async with _task_lock:
+                # Terminal "completed" or "partial" — both preserve the
+                # assembled output and per-step statistics (Slice 4).
                 _task_store[task_id] = {
-                    "status": "completed",
-                    "final_output": output,
-                    "step_stats": step_stats,
+                    "status": result.status,
+                    "final_output": result.final_output,
+                    "failed_steps": result.failed_steps,
+                    "skipped_steps": result.skipped_steps,
+                    "step_stats": [s.model_dump() for s in result.step_stats],
                     "error": None,
                 }
         except Exception as exc:
@@ -276,6 +314,9 @@ async def run_pipeline_async(req: RunRequest):
                 _task_store[task_id] = {
                     "status": "failed",
                     "final_output": None,
+                    "failed_steps": [],
+                    "skipped_steps": [],
+                    "step_stats": [],
                     "error": error,
                 }
 
@@ -286,7 +327,8 @@ async def run_pipeline_async(req: RunRequest):
 @app.get("/status/{task_id}", response_model=StatusResponse)
 async def task_status(task_id: str):
     """
-    Retrieve the current status and result (if completed) of an async pipeline run.
+    Retrieve the current status and, once terminal, the result of an async
+    pipeline run. Terminal ``partial`` results keep their output and stats.
     """
     async with _task_lock:
         entry = _task_store.get(task_id)
@@ -298,7 +340,9 @@ async def task_status(task_id: str):
         task_id=task_id,
         status=entry["status"],
         final_output=entry.get("final_output"),
-        step_stats=entry.get("step_stats"),
+        failed_steps=entry.get("failed_steps", []),
+        skipped_steps=entry.get("skipped_steps", []),
+        step_stats=entry.get("step_stats", []),
         error=entry.get("error"),
     )
 

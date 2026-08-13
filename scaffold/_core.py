@@ -137,10 +137,9 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
         "orchestrator", orchestrator,
         retry_policy=RetryPolicy(max_attempts=2, retry_on=(ValueError,)),
     )
-    builder.add_node(
-        "sub_agent", sub_agent,
-        retry_policy=RetryPolicy(max_attempts=2, retry_on=(Exception,)),
-    )
+    # No worker RetryPolicy: the worker node owns the bounded attempt loop
+    # configured per agent via ``execution.max_attempts`` (Slice 3).
+    builder.add_node("sub_agent", sub_agent)
     builder.add_node("assemble", assemble_node)
     builder.add_node("scheduler", scheduler_node)
 
