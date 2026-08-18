@@ -1,5 +1,10 @@
 # Implementation Plan: Multi-Agent Pipeline with Agent Skills on LangGraph/LangChain
 
+> **⚠️ Design history — may be stale.** This plan predates the current code and
+> is kept for context only. The active roadmap is
+> [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md); start from the repository
+> `README.md`.
+
 > Adaptation of *Building a Multi-Agent Pipeline with Agent Skills & a Tool Broker*
 > to LangGraph 1.x / LangChain 1.x as the base runtime.
 > June 2026.

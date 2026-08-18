@@ -1,5 +1,10 @@
 # Multi-Agent Pipeline with SKILL.md — LangGraph/LangChain Implementation Plan
 
+> **⚠️ Design history — may be stale.** This guide predates the current code
+> and is kept for context only. The active roadmap is
+> [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md); start from the repository
+> `README.md`.
+
 > Mapping your existing architecture to LangGraph/LangChain primitives, step by step.
 > Your original plan's concepts are preserved; this document shows exactly how each
 > piece translates and where LangGraph gives you more for less code.
