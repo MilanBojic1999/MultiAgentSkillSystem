@@ -1,7 +1,7 @@
 # streaming.py
 import json
 import uuid
-from agent_states import get_current_datetime_str
+from agents.agent_states import get_current_datetime_str
 from pipeline_entry import build_task_string, build_files_state
 
 # ---------------------------------------------------------------------------
@@ -28,8 +28,20 @@ def _patched_convert_delta_to_message_chunk(_dict, default_class):
 _lc_base._convert_delta_to_message_chunk = _patched_convert_delta_to_message_chunk
 # ---------------------------------------------------------------------------
 
-# Stream the SEQUENTIAL graph — parallel interleaves tokens (see §4).
-from yotta_graph import graph
+# The yotta graph is built lazily on first stream — building needs an LLM
+# configuration, and importing this module must not (repo convention:
+# imports carry no import-time side effects). ``build_graph`` resolves the
+# auto-registered "yotta" graph (graphs/yotta_graph.py).
+from graphs import build_graph
+
+_graph_cache: dict = {}
+
+
+def _get_graph():
+    if "yotta" not in _graph_cache:
+        _graph_cache["yotta"] = build_graph("yotta")
+    return _graph_cache["yotta"]
+
 
 # Nodes that represent an "agent turn"; each opens a new <thinking_step>.
 _AGENT_NODES = {"orchestrator", "sub_agent", "verify", "writer", "citatitaion"}
@@ -97,7 +109,7 @@ async def stream_pipeline(task: str, files: list | None = None):
     is_thinking = None                        # None = undecided for this step
     open_step = False
     current_agent = None
-    async for event in graph.astream_events(state_in, config=config, version="v2"):
+    async for event in _get_graph().astream_events(state_in, config=config, version="v2"):
         kind = event["event"]
 
         agent_name = event.get("name", "unknown_agent")

@@ -135,7 +135,7 @@ def render_files_block(files: dict[str, str], max_chars_per_file: int = MAX_WORK
     """Render a filename -> content mapping as an '## Attached documents' Markdown block.
 
     Used both for worker prompt injection (agents/sub_agents_nodes.py) and the
-    writer's empty-plan fallback (yotta_graph.py) — the two places raw
+    writer's empty-plan fallback (graphs/yotta_graph.py) — the two places raw
     document text is allowed to reach an agent directly.
     """
     if not files:

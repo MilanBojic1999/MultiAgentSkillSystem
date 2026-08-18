@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # match the dev venv
+          cache: pip
+      - run: pip install -e ".[dev]"
+      # Lint the test code and the graph package (both are new code). Repo-wide
+      # `ruff check .` surfaces a batch of pre-existing findings and is deferred
+      # to its own cleanup commit (see docs/history/TESTING_GUIDE.md → CI
+      # workflow), so it does not gate this suite's PR.
+      - run: ruff check tests/ graphs/
+      - run: pytest -q

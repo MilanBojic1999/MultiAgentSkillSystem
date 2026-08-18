@@ -3,20 +3,24 @@ FastAPI REST API server for the multi-agent LangGraph pipeline.
 
 Endpoints:
     GET  /health          — health check
+    GET  /graphs          — list the graphs discovered in graphs/
     POST /run             — run the pipeline synchronously (blocking)
     POST /run-async       — start a pipeline run in the background
     GET  /status/{task_id} — check status of an async run
+    GET  /artifacts/{task_id}/{filename} — serve a generated artifact file
 """
 
 import asyncio
+import os
 import uuid
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
@@ -24,21 +28,31 @@ from dotenv import load_dotenv
 # Load env before importing pipeline modules (they read os.getenv at import time)
 load_dotenv()
 
-from yotta_graph import builder as yotta_builder
-from agent_states import get_current_datetime_str
+from langgraph.checkpoint.memory import MemorySaver
+
+from graphs import build_graph, graph_descriptions
+from agents.agent_states import ExecutionStatus, StepStatus, get_current_datetime_str
+from assemble_node import pipeline_result
+from utils.artifacts import get_artifact_path
+from utils.logger import log_event
+
 from pipeline_entry import (
     build_task_string,
     build_files_state,
     UnsupportedFileTypeError,
     EmptyExtractedTextError,
 )
+
 from streaming import stream_pipeline
 from yotta_tool import call_yotta, parse_yotta_results
 
-# Compile without a checkpointer to prevent unbounded MemorySaver growth
-# in the long-running server.  Each request is stateless and uses a unique
-# thread_id — there's no need to persist checkpoints across calls.
-api_graph = yotta_builder.compile()
+# Graph used when a request does not name one.
+DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "parallel").strip() or "parallel"
+
+# When true, API error responses include the full traceback; otherwise clients
+# get a generic message + id and the traceback stays in the server log.
+DEBUG = os.getenv("DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -61,6 +75,29 @@ class RunRequest(BaseModel):
         description="The natural-language task to run through the pipeline",
         examples=["Calculate sin(pi/4) + cos(pi/4) and plot both functions"],
     )
+    
+    files: list[FileInput] | None = Field(
+        default=None,
+        description="Optional list of files to include as input context",
+    )
+
+    graph: str | None = Field(
+        default=None,
+        description=f"Which graph in graphs/ to run (default: {DEFAULT_GRAPH}). "
+                    f"See GET /graphs.",
+        examples=["parallel", "sequential"],
+    )
+
+
+class StepStatsModel(BaseModel):
+    """One typed per-step statistics row (Slice 4)."""
+    step: int
+    agent: str
+    status: StepStatus
+    duration_s: float
+    input_tokens: int
+    output_tokens: int
+    tool_calls: int
     files: list[FileInput] | None = Field(
         default=None,
         description="Optional list of files to include as input context",
@@ -68,18 +105,49 @@ class RunRequest(BaseModel):
 
 
 class RunResponse(BaseModel):
+    """Typed synchronous execution result.
+
+    ``status`` is ``completed`` or ``partial`` on HTTP 200; a fatal error
+    before assembly is an HTTP 500 error response instead (Slice 4).
+    ``task_id`` keys the run's artifact directory (plan 4.5) — the client
+    fetches generated files from ``GET /artifacts/{task_id}/{filename}``.
+    """
+    status: ExecutionStatus
     final_output: str
+    failed_steps: list[int] = []
+    skipped_steps: list[int] = []
+    step_stats: list[StepStatsModel] = []
+    task_id: str = ""
+
+
+class GraphInfo(BaseModel):
+    name: str
+    description: str = ""
+    default: bool = False
+
+
+class GraphsResponse(BaseModel):
+    graphs: list[GraphInfo]
 
 
 class AsyncRunResponse(BaseModel):
     task_id: str
-    status: str = "started"
+    status: Literal["started"] = "started"
 
 
 class StatusResponse(BaseModel):
+    """Typed asynchronous poll response: ``running`` until terminal.
+
+    Terminal states are ``completed``, ``partial`` (output and stats are
+    preserved and retrievable) and ``failed`` (``error`` carries the safe
+    public message) — Slice 4.
+    """
     task_id: str
-    status: str  # "running" | "completed" | "failed"
+    status: ExecutionStatus
     final_output: str | None = None
+    failed_steps: list[int] = []
+    skipped_steps: list[int] = []
+    step_stats: list[StepStatsModel] = []
     error: str | None = None
 
 
@@ -96,17 +164,52 @@ _task_lock: asyncio.Lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Compiled-graph cache
+# ---------------------------------------------------------------------------
+# Graphs are compiled once per process and reused across requests. The
+# checkpointer is created here rather than inside each graph's build() so a
+# durable backend (SqliteSaver/PostgresSaver — plan item 4.7) can be swapped in
+# at one place.
+
+_graph_cache: dict[str, Any] = {}
+_checkpointer: Any = None
+
+
+def _make_checkpointer():
+    """The checkpointer shared by every graph in this process."""
+    return MemorySaver()
+
+
+def _get_graph(name: str | None):
+    """Return the compiled graph for ``name``, building it on first use.
+
+    Raises ``ValueError`` (naming the available graphs) for an unknown name.
+    """
+    name = (name or DEFAULT_GRAPH).strip() or DEFAULT_GRAPH
+    if name not in _graph_cache:
+        _graph_cache[name] = build_graph(name, checkpointer=_checkpointer)
+        log_event("api_graph_compiled", graph=name)
+    return _graph_cache[name]
+
+
+# ---------------------------------------------------------------------------
 # Application lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown hooks."""
-    # Nothing special to initialise — the graph is already compiled at import
+    global _checkpointer
+    _checkpointer = _make_checkpointer()
+    # Compile the default graph up front so a broken graph module surfaces at
+    # startup instead of on the first request. Other graphs compile on demand.
+    _get_graph(DEFAULT_GRAPH)
     yield
     # Clean up any lingering tasks
     async with _task_lock:
         _task_store.clear()
+    _graph_cache.clear()
+    _checkpointer = None
 
 
 app = FastAPI(
@@ -130,30 +233,41 @@ app.add_middleware(
 # Pipeline runner (shared by sync and async endpoints)
 # ---------------------------------------------------------------------------
 
+def _resolve_graph_or_400(graph_name: str | None) -> None:
+    """Compile the requested graph early so a bad name is a 400, not a 500."""
+    try:
+        _get_graph(graph_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-async def _run_pipeline(task: str, files: list[FileInput] | None = None) -> str:
-    """Run the multi-agent LangGraph pipeline and return the assembled output."""
-    # Decode/extract file text first — fail fast on a bad upload before
-    # spending a search call on it.
+
+async def _run_pipeline(task: str, files: list[FileInput] | None, graph_name: str | None = None,
+                        task_id: str | None = None) -> RunResponse:
+    """Run the selected LangGraph pipeline and return its typed result.
+
+    ``status`` is ``completed`` when every planned step finished and
+    ``partial`` when containment failed or skipped steps while assembly still
+    produced usable output. Fatal planner, graph or configuration errors
+    raise here — they are transport-level failures, never partial results.
+
+    ``task_id`` keys the run's artifact directory (plan 4.5); a fresh one is
+    generated for synchronous runs and returned in the response so the client
+    can fetch generated files from ``GET /artifacts/{task_id}/{filename}``.
+    """
+    graph = _get_graph(graph_name)
+    run_id = task_id or uuid.uuid4().hex[:12]
+    config = {"configurable": {
+        "thread_id": f"api-{uuid.uuid4().hex[:8]}",
+        "task_id": run_id,
+    }}
+
     files_state = build_files_state(files)
-    task_string = build_task_string(task, files)
-    # Search on the bare task — not the file-laden string, matching the streaming path.
-    yotta_results = await call_yotta(task)
-    clean_findings = parse_yotta_results(yotta_results)
 
-    # Pass search results as a dedicated state field instead of embedding
-    # them in the task string, so the writer node doesn't have to parse.
-    config = {"configurable": {"thread_id": f"api-{uuid.uuid4().hex[:8]}"}}
-    result = await api_graph.ainvoke(
-        {
-            "task": task_string,
-            "search_results": clean_findings,
-            "current_datetime": get_current_datetime_str(),
-            "files": files_state,
-        },
+    result = await graph.ainvoke(
+        {"task": task, "current_datetime": get_current_datetime_str(), "files": files_state,},
         config=config,
     )
-    return result.get("final_output", "No final output produced.")
+    return RunResponse(task_id=run_id, **pipeline_result(result))
 
 
 # ---------------------------------------------------------------------------
@@ -166,27 +280,45 @@ async def health():
     return HealthResponse(status="ok")
 
 
+@app.get("/graphs", response_model=GraphsResponse)
+async def list_graphs():
+    """List every graph discovered in ``graphs/`` — any module there defining
+    ``build()`` shows up here without further registration."""
+    return GraphsResponse(
+        graphs=[
+            GraphInfo(name=name, description=description, default=(name == DEFAULT_GRAPH))
+            for name, description in graph_descriptions().items()
+        ]
+    )
+
+
 @app.post("/run", response_model=RunResponse)
 async def run_pipeline(req: RunRequest):
     """
     Run the full multi-agent pipeline **synchronously** (the HTTP call blocks
     until the pipeline finishes).
 
-    Suitable for most use-cases where the task completes within a few seconds
-    to a couple of minutes.
+    Contained step failures return HTTP 200 with ``status: partial`` and the
+    usable assembled output; only a fatal planner/graph/configuration error
+    is an HTTP 500 (Slice 4).
     """
+    _resolve_graph_or_400(req.graph)
     try:
-        output = await _run_pipeline(req.task, req.files)
-        return RunResponse(final_output=output)
+        return await _run_pipeline(req.task, req.files, req.graph)
     except UnsupportedFileTypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except EmptyExtractedTextError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Pipeline failed: {exc}\n\n{traceback.format_exc()}",
+        error_id = uuid.uuid4().hex[:12]
+        log_event("api_run_failed", error_id=error_id, error=str(exc),
+                  traceback=traceback.format_exc())
+        detail = (
+            f"Pipeline failed: {exc}\n\n{traceback.format_exc()}"
+            if DEBUG
+            else f"Pipeline failed. See server logs (error id: {error_id})."
         )
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @app.post("/run-async", response_model=AsyncRunResponse, status_code=202)
@@ -196,22 +328,52 @@ async def run_pipeline_async(req: RunRequest):
 
     Poll ``GET /status/{task_id}`` to check progress and retrieve the result.
     """
+    _resolve_graph_or_400(req.graph)
     task_id = uuid.uuid4().hex[:12]
 
     async with _task_lock:
-        _task_store[task_id] = {"status": "running", "final_output": None, "error": None}
+        _task_store[task_id] = {
+            "status": "running",
+            "final_output": None,
+            "failed_steps": [],
+            "skipped_steps": [],
+            "step_stats": [],
+            "error": None,
+        }
 
     async def _background():
         try:
-            output = await _run_pipeline(req.task, req.files)
+            # The task id also keys the run's artifact directory (plan 4.5),
+            # so the client can fetch generated files from
+            # GET /artifacts/{task_id}/{filename} with the id it already has.
+            result = await _run_pipeline(req.task, req.files, req.graph, task_id)
             async with _task_lock:
-                _task_store[task_id] = {"status": "completed", "final_output": output, "error": None}
+                # Terminal "completed" or "partial" — both preserve the
+                # assembled output and per-step statistics (Slice 4).
+                _task_store[task_id] = {
+                    "status": result.status,
+                    "final_output": result.final_output,
+                    "failed_steps": result.failed_steps,
+                    "skipped_steps": result.skipped_steps,
+                    "step_stats": [s.model_dump() for s in result.step_stats],
+                    "error": None,
+                }
         except Exception as exc:
+            log_event("api_async_task_failed", task_id=task_id, error=str(exc),
+                      traceback=traceback.format_exc())
+            error = (
+                f"{exc}\n{traceback.format_exc()}"
+                if DEBUG
+                else f"Pipeline failed. See server logs (task id: {task_id})."
+            )
             async with _task_lock:
                 _task_store[task_id] = {
                     "status": "failed",
                     "final_output": None,
-                    "error": f"{exc}\n{traceback.format_exc()}",
+                    "failed_steps": [],
+                    "skipped_steps": [],
+                    "step_stats": [],
+                    "error": error,
                 }
 
     asyncio.create_task(_background())
@@ -221,7 +383,8 @@ async def run_pipeline_async(req: RunRequest):
 @app.get("/status/{task_id}", response_model=StatusResponse)
 async def task_status(task_id: str):
     """
-    Retrieve the current status and result (if completed) of an async pipeline run.
+    Retrieve the current status and, once terminal, the result of an async
+    pipeline run. Terminal ``partial`` results keep their output and stats.
     """
     async with _task_lock:
         entry = _task_store.get(task_id)
@@ -233,8 +396,34 @@ async def task_status(task_id: str):
         task_id=task_id,
         status=entry["status"],
         final_output=entry.get("final_output"),
+        failed_steps=entry.get("failed_steps", []),
+        skipped_steps=entry.get("skipped_steps", []),
+        step_stats=entry.get("step_stats", []),
         error=entry.get("error"),
     )
+
+
+@app.get("/artifacts/{task_id}/{filename}")
+async def get_artifact(task_id: str, filename: str):
+    """
+    Serve a generated artifact file for a run (plan 4.5).
+
+    File-producing tools write into ``<ARTIFACTS_DIR>/<task_id>/`` and return
+    the relative path, so the client fetches it with the task id from
+    ``/run``, ``/run-async`` or ``/status``. Both path segments are validated
+    as single safe segments — traversal attempts get a 400.
+    """
+    try:
+        path = get_artifact_path(filename, config={"configurable": {"task_id": task_id}})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact '{filename}' not found for task '{task_id}'.",
+        )
+    return FileResponse(path)
+
 
 
 @app.post("/run-stream")

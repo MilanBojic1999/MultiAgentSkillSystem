@@ -1,0 +1,6 @@
+task: "Calculate the maximum of x^2*sin(x) on [0,2], then summarise it"
+expect:
+  min_steps: 2
+  max_steps: 6
+  agents_include: [mathematician, writer]
+  has_dependency: true        # at least one step depends_on another
