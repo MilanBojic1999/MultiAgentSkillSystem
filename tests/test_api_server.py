@@ -56,14 +56,20 @@ PARTIAL_STATE = {
 
 
 class _FakeGraph:
-    """Graph stand-in: returns ``state`` after optionally waiting on a gate."""
+    """Graph stand-in: returns ``state`` after optionally waiting on a gate.
+
+    Records the config of the last ``ainvoke`` so tests can assert what the
+    server put into ``configurable`` (plan 4.5).
+    """
 
     def __init__(self, state=None, exc=None, release=None):
         self._state = state
         self._exc = exc
         self._release = release
+        self.last_config = None
 
     async def ainvoke(self, payload, config=None):
+        self.last_config = config
         if self._release is not None:
             await self._release.wait()
         if self._exc is not None:
@@ -163,6 +169,17 @@ def test_run_unknown_graph_returns_400(client, monkeypatch):
     assert "nope" in resp.json()["detail"]
 
 
+def test_sync_run_returns_task_id_and_keys_artifacts(client, monkeypatch):
+    """Plan 4.5: the sync response carries the id of the run's artifact directory."""
+    fake = _FakeGraph(COMPLETED_STATE)
+    monkeypatch.setattr(api_server, "_get_graph", lambda name=None: fake)
+    resp = client.post("/run", json={"task": "t"})
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    assert task_id
+    assert fake.last_config["configurable"]["task_id"] == task_id
+
+
 # ---------------------------------------------------------------------------
 # Asynchronous /run-async + /status
 # ---------------------------------------------------------------------------
@@ -228,6 +245,49 @@ def test_async_unknown_graph_returns_400(client, monkeypatch):
 def test_status_unknown_task_returns_404(client):
     resp = client.get("/status/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_async_run_passes_task_id_as_artifact_key(client, monkeypatch):
+    """Plan 4.5: async runs key artifacts by the task id the client already has."""
+    fake = _FakeGraph(COMPLETED_STATE)
+    monkeypatch.setattr(api_server, "_get_graph", lambda name=None: fake)
+    resp = client.post("/run-async", json={"task": "t"})
+    task_id = resp.json()["task_id"]
+    _wait_terminal(client, task_id)
+    assert fake.last_config["configurable"]["task_id"] == task_id
+
+
+# ---------------------------------------------------------------------------
+# GET /artifacts/{task_id}/{filename} (plan 4.5)
+# ---------------------------------------------------------------------------
+
+def test_artifacts_endpoint_serves_existing_file(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
+    (tmp_path / "task-1").mkdir()
+    (tmp_path / "task-1" / "plot-abcd1234.png").write_bytes(b"fake-png")
+    resp = client.get("/artifacts/task-1/plot-abcd1234.png")
+    assert resp.status_code == 200
+    assert resp.content == b"fake-png"
+
+
+def test_artifacts_endpoint_404_for_missing_file(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
+    resp = client.get("/artifacts/task-1/nope.png")
+    assert resp.status_code == 404
+    assert "nope.png" in resp.json()["detail"]
+
+
+def test_artifacts_endpoint_rejects_invalid_segments(client, monkeypatch, tmp_path):
+    """A filename failing segment validation is a 400, never a file read.
+
+    The traversal cases ("..", "../x") are pinned at the helper level in
+    ``tests/test_artifacts.py``; here an unambiguously invalid segment
+    (a space) exercises the endpoint's 400 branch without depending on how
+    HTTP clients normalize dot segments in URLs.
+    """
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path))
+    resp = client.get("/artifacts/task-1/bad%20name.png")
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------

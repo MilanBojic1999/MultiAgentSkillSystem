@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableLambda, RunnableConfig
 from skill_loader import load_skills, load_skills_body
 from tools.agent_tools import AGENT_TOOLS
 from utils.validator import validate_step_output
@@ -64,6 +64,7 @@ async def run_sub_agent_async(
     results: dict,
     current_datetime: str = "",
     llm=None,
+    config: RunnableConfig | None = None,
 ) -> tuple[int, str, dict]:
     """Run one sub-agent step. Returns (step_number, output_text, stats_dict).
 
@@ -76,6 +77,10 @@ async def run_sub_agent_async(
     temperature (Phase 1.3). It is resolved here rather than at import so that
     importing this module needs no LLM configuration; ``create_llm`` is
     lru_cached, so repeat calls are a dict lookup.
+
+    ``config`` is the run config threaded through from the graph invocation and
+    forwarded to the sub-agent, so tools can read ``configurable`` (plan 4.5,
+    artifact paths). ``None`` is fine — the sub-agent runs with a fresh config.
     """
     agent_name   = step["agent"]
     step_num     = step["step"]
@@ -123,14 +128,14 @@ async def run_sub_agent_async(
             tools=all_tools,
             prompt=SystemMessage(content=system_prompt),
         )
-        result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+        result = await agent.ainvoke({"messages": [("user", step["subtask"])]}, config=config)
     else:
         agent = create_react_agent(
                 model=llm,
                 tools=native_tools,
                 prompt=SystemMessage(content=system_prompt),
             )
-        result = await agent.ainvoke({"messages": [("user", step["subtask"])]})
+        result = await agent.ainvoke({"messages": [("user", step["subtask"])]}, config=config)
 
 
     tools_used = [
@@ -238,10 +243,24 @@ async def _run_guarded_attempt(
 
 
 def _resolve_run_step(run_step, llm):
-    """``run_step`` wins; otherwise run the real step, optionally on a given LLM."""
+    """Return ``(run_step, takes_config)``.
+
+    ``run_step`` wins; otherwise the real step runs, optionally on a given LLM.
+    ``takes_config`` is True only for the production runner, which accepts the
+    run config so tools can read ``configurable`` (plan 4.5); test-injected
+    stubs keep their 3-argument signature and never receive it.
+    """
     if run_step is not None:
-        return run_step
-    return partial(run_sub_agent_async, llm=llm) if llm is not None else run_sub_agent_async
+        return run_step, False
+    default = partial(run_sub_agent_async, llm=llm) if llm is not None else run_sub_agent_async
+    return default, True
+
+
+def _bind_config(run_step, takes_config, config):
+    """Bind the run config into ``run_step`` when it is accepted, else no-op."""
+    if takes_config and config is not None:
+        return partial(run_step, config=config)
+    return run_step
 
 
 def make_sub_agent_node(run_step=None, llm=None):
@@ -256,9 +275,9 @@ def make_sub_agent_node(run_step=None, llm=None):
     ``(step, results, current_datetime) -> (step_num, output, stats_dict)``.
     ``llm`` overrides the client that default ``run_step`` uses.
     """
-    run_step = _resolve_run_step(run_step, llm)
+    run_step, takes_config = _resolve_run_step(run_step, llm)
 
-    async def sub_agent_node_async(state: WorkerState) -> dict:
+    async def sub_agent_node_async(state: WorkerState, config: RunnableConfig = None) -> dict:
         """Sequential node: executes the next uncompleted step in the plan.
 
         Retry before containment (Slice 3): the node owns the bounded attempt
@@ -280,9 +299,10 @@ def make_sub_agent_node(run_step=None, llm=None):
 
         t0 = time.monotonic()
         try:
+            step_runner = _bind_config(run_step, takes_config, config)
             step_num, output, inner_stats = await run_step_with_attempts(
                 step,
-                partial(_run_guarded_attempt, step, run_step, results, current_datetime),
+                partial(_run_guarded_attempt, step, step_runner, results, current_datetime),
                 get_max_attempts(step["agent"]),
                 graph_name="sequential",
             )
@@ -317,9 +337,9 @@ def make_sub_agent_node(run_step=None, llm=None):
                 }],
             }
 
-    def sub_agent_node(state: WorkerState) -> dict:
+    def sub_agent_node(state: WorkerState, config: RunnableConfig = None) -> dict:
         """Sync entry point — LangGraph calls this under ``graph.invoke``."""
-        return asyncio.run(sub_agent_node_async(state))
+        return asyncio.run(sub_agent_node_async(state, config))
 
     return RunnableLambda(sub_agent_node, afunc=sub_agent_node_async)
 
@@ -338,15 +358,16 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
     Failure is contained here (Phase 1.4): an exhausted step is recorded as a
     result and flagged in ``failed_steps`` instead of killing the whole graph.
     """
-    run_step = _resolve_run_step(run_step, llm)
+    run_step, takes_config = _resolve_run_step(run_step, llm)
 
-    async def parallel_sub_agent_node_async(state: WorkerState) -> dict:
+    async def parallel_sub_agent_node_async(state: WorkerState, config: RunnableConfig = None) -> dict:
         step = state["step"]
         t0 = time.monotonic()
         try:
+            step_runner = _bind_config(run_step, takes_config, config)
             step_num, output, inner_stats = await run_step_with_attempts(
                 step,
-                partial(run_step, step, state["results"], state.get("current_datetime", "")),
+                partial(step_runner, step, state["results"], state.get("current_datetime", "")),
                 get_max_attempts(step["agent"]),
                 graph_name="parallel",
             )
@@ -379,8 +400,8 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
                         "tool_calls": 0,
                     }]}
 
-    def parallel_sub_agent_node(state: WorkerState) -> dict:
+    def parallel_sub_agent_node(state: WorkerState, config: RunnableConfig = None) -> dict:
         """Sync entry point — LangGraph calls this under ``graph.invoke``."""
-        return asyncio.run(parallel_sub_agent_node_async(state))
+        return asyncio.run(parallel_sub_agent_node_async(state, config))
 
     return RunnableLambda(parallel_sub_agent_node, afunc=parallel_sub_agent_node_async)

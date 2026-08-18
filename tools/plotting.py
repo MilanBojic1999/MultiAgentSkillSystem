@@ -30,13 +30,16 @@ Usage::
 from __future__ import annotations
 
 import math
+import uuid
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
 from tools.expr_parser import CalculatorError, ErrorCode, compile_expression
+from utils.artifacts import get_artifact_path
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +177,7 @@ def plotting_tool(
     expression: str,
     x_min: float = -10,
     x_max: float = 10,
+    config: RunnableConfig = None,
 ) -> str:
     """Generate a plot of a mathematical expression and return the image path.
 
@@ -184,12 +188,17 @@ def plotting_tool(
         ``"sin(x)"``
         ``"x^2 - 4*x + 3"``
         ``"exp(-x^2)"``
+
+    The image is written into the run's artifact directory with a unique
+    filename per invocation (plan 4.5), so concurrent plotting steps never
+    overwrite each other. ``config`` is injected by LangChain.
     """
+    output_file = get_artifact_path(f"plot-{uuid.uuid4().hex[:8]}.png", config)
     return plot_function(
         expression=expression,
         x_min=x_min,
         x_max=x_max,
-        output_file="artifacts/plot.png",
+        output_file=str(output_file),
     )
 
 

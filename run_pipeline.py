@@ -10,12 +10,26 @@ Usage:
 import argparse
 import asyncio
 import sys
+import uuid
 
 from graphs import build_graph, graph_descriptions
 from agents.agent_states import PipelineResult, get_current_datetime_str
 from assemble_node import pipeline_result
 
 DEFAULT_GRAPH = "parallel"
+
+
+def _run_config() -> dict:
+    """Build the run config for one pipeline run.
+
+    ``task_id`` keys the run's artifact directory (plan 4.5), so every CLI
+    run writes generated files (e.g. plots) into its own ``artifacts/<id>/``
+    instead of overwriting the previous run's files.
+    """
+    return {"configurable": {
+        "thread_id": "test-run-1",
+        "task_id": uuid.uuid4().hex[:12],
+    }}
 
 
 def run(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
@@ -25,9 +39,8 @@ def run(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
     ``final_output``, ``failed_steps``, ``skipped_steps`` and ``step_stats``
     (Slice 4).
     """
-    config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
-    result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
+    result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config())
     return pipeline_result(result)
 
 
@@ -36,9 +49,8 @@ async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResul
 
     Returns the same typed result as :func:`run` (Slice 4).
     """
-    config = {"configurable": {"thread_id": "test-run-1"}}
     graph = build_graph(graph_name)
-    result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=config)
+    result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config())
     return pipeline_result(result)
 
 

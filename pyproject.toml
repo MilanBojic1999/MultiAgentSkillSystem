@@ -37,7 +37,6 @@ py-modules = [
     "assemble_node",
     "config_loader",
     "llm_factory",
-    "paralel_pipeline_graph",  # import-compat shim for the old root path
     "run_pipeline",
     "skill_loader",
 ]
