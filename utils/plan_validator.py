@@ -7,7 +7,8 @@ from utils.logger import log_event
       "subtask": "<concise description>",
       "agent": "<agent_name>",
       "skills_needed": ["<skill-name>"],
-      "depends_on": []
+      "depends_on": [],
+      "files": ["<attached-filename>"]
 '''
 
 class PlanStepModel(BaseModel):
@@ -16,6 +17,10 @@ class PlanStepModel(BaseModel):
     agent: str = Field()
     skills_needed: list[str] = Field(default_factory=list)
     depends_on: list[int] = Field(default_factory=list)
+    # Attached documents assigned to this step. Kept on the model so the field
+    # survives model_dump(): it is the only way a worker gets a document's full
+    # text (the orchestrator sees 300-char previews only).
+    files: list[str] = Field(default_factory=list)
 
 
 class PlanValidationError(ValueError):

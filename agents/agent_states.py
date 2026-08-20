@@ -1,5 +1,5 @@
 from typing import Annotated, Literal
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 import operator
 from datetime import datetime
 
@@ -16,6 +16,10 @@ class PlanStep(TypedDict):
     agent: str
     skills_needed: list[str]
     depends_on: list[int]
+    # Filenames of attached documents the orchestrator assigned to this step;
+    # the worker injects those documents' full text into its system prompt.
+    # NotRequired: plans validated before this field existed omit it.
+    files: NotRequired[list[str]]
 
 
 StepStatus = Literal["completed", "failed", "skipped"]
@@ -118,10 +122,16 @@ class WorkerState(TypedDict):
     A worker sees only the step it must run plus the results accumulated so far;
     it writes ``results``/``failed_steps`` back into ``AgentState`` via that
     state's reducers, so no reducers are needed here.
+
+    ``files`` carries the run's attached documents (``{filename: text}``) so the
+    worker can inject the full text of the ones its step was assigned — nothing
+    outside the payload is visible to it. ``NotRequired`` because only the yotta
+    router populates it; parallel/sequential have no ``files`` channel.
     """
     step: PlanStep
     results: dict[int, str]
     current_datetime: str
+    files: NotRequired[dict[str, str]]
 
 
 RESULTS_RESET = "__reset__"  # sentinel: clear results on replan

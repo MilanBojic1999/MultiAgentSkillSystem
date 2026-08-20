@@ -168,6 +168,9 @@ def run_task(task: str, base_url: str, files: list[dict] | None = None, graph: O
     body: dict[str, Any] = {"task": task}
     if files:
         body["files"] = files
+    
+    if graph:
+        body["graph"] = graph
 
     result = _request("POST", "/run", base_url, body=body)
 

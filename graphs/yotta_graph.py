@@ -101,6 +101,9 @@ def fan_out_router(state: dict):
         # shape matches the parallel graph; step_verifications + streaming are
         # carried as well so the production worker can bind verifier feedback
         # (F2) — feedback is NOT the payload itself (see the worker factory).
+        # ``files`` (the run's attached documents) rides along too: a Send
+        # payload is the ONLY state a worker sees, so without it a step the
+        # orchestrator assigned documents to would receive filenames but no text.
         return [
             Send("sub_agent", {
                 "step": s,
@@ -108,6 +111,7 @@ def fan_out_router(state: dict):
                 "current_datetime": current_datetime,
                 "step_verifications": state.get("step_verifications", {}),
                 "streaming": state.get("streaming", False),
+                "files": state.get("files", {}),
             })
             for s in ready
         ]
@@ -146,8 +150,10 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
       its old result is still in ``results`` (intentional re-execution);
     - the **production runner** reads ``step_verifications`` from its input to
       bind ``feedback=`` (F2 — the latest ``[Retry k/2]`` note) plus
-      ``streaming=`` via ``partial``; injected 3-arg test stubs keep their
-      signature and never receive either keyword.
+      ``streaming=`` and ``files=`` (the run's attached documents, keyed by
+      filename — the runner injects the ones this step was assigned) via
+      ``partial``; injected 3-arg test stubs keep their signature and never
+      receive any of those keywords.
     """
     run_step, takes_config = _resolve_run_step(run_step, llm)
 
@@ -167,6 +173,7 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
                     state["results"],
                     state.get("current_datetime", ""),
                     streaming=state.get("streaming", False),
+                    files=state.get("files", {}),
                     feedback=feedback,
                 )
             else:
@@ -754,6 +761,7 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     orchestrator = orchestrator or make_orchestrator_agent()
     sub_agent = sub_agent or make_yotta_sub_agent_node()
 
+    print("inside yotta_graph")
     builder = StateGraph(YottaState)
     # ValueError from plan validation (1.2) should re-plan, not kill the run —
     # same as the parallel graph. No worker/verify RetryPolicy (Slice 3): the

@@ -5,13 +5,14 @@ same fixtures work in tests that touch the real config.
 """
 
 
-def step(n, agent="researcher", skills=(), deps=()):
+def step(n, agent="researcher", skills=(), deps=(), files=()):
     return {
         "step": n,
         "subtask": f"subtask {n}",
         "agent": agent,
         "skills_needed": list(skills),
         "depends_on": list(deps),
+        "files": list(files),
     }
 
 

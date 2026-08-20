@@ -189,6 +189,7 @@ def _get_graph(name: str | None):
     if name not in _graph_cache:
         _graph_cache[name] = build_graph(name, checkpointer=_checkpointer)
         log_event("api_graph_compiled", graph=name)
+    print("graph name:", name)
     return _graph_cache[name]
 
 

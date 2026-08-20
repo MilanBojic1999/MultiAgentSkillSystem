@@ -27,7 +27,9 @@ class FakeLLMCall:
     """Scripted ``run_sub_agent_async`` covering all three call sites.
 
     - workers (numeric step): return ``(step, "out-<n>", stats)``, recording
-      the step and the ``feedback`` kwarg the production worker binds (F2);
+      the step and the ``feedback`` kwarg the production worker binds (F2),
+      plus — in ``worker_files`` — the step's own ``files`` assignment and the
+      ``files`` kwarg carrying the run's attached documents;
     - verifier (step ``"verify"``): replay the scripted verdict lists, one
       per verify pass;
     - writer (step ``"assemble"``): return ``"FINAL"``, recording the subtask
@@ -37,6 +39,8 @@ class FakeLLMCall:
     def __init__(self, verdicts):
         self.verdicts = list(verdicts)
         self.worker_calls: list[tuple[int, str]] = []
+        # (step number, the step's own ``files`` assignment, the ``files`` kwarg)
+        self.worker_files: list[tuple[int, list[str], dict[str, str]]] = []
         self.writer_subtask = ""
         self.verifier_subtasks: list[str] = []
 
@@ -49,6 +53,9 @@ class FakeLLMCall:
             self.writer_subtask = step["subtask"]
             return step["step"], "FINAL", _STATS
         self.worker_calls.append((step["step"], kwargs.get("feedback", "")))
+        self.worker_files.append(
+            (step["step"], step.get("files", []), kwargs.get("files") or {})
+        )
         return step["step"], f"out-{step['step']}", _STATS
 
 
@@ -103,10 +110,16 @@ def test_router_first_layer_dispatches_both_independent_steps():
 
 
 def test_router_send_payload_carries_expected_keys():
-    out = _route({})
+    out = _route({}, files={"a.txt": "doc"})
     payload = out[0].arg
     assert set(payload) >= {"step", "results", "current_datetime",
-                            "step_verifications", "streaming"}
+                            "step_verifications", "streaming", "files"}
+    # a Send payload is the only state a worker sees — documents must ride along
+    assert payload["files"] == {"a.txt": "doc"}
+
+
+def test_router_send_payload_files_default_to_empty_dict():
+    assert _route({})[0].arg["files"] == {}
 
 
 def test_router_second_layer_dispatches_the_join_step():
@@ -205,6 +218,33 @@ def test_e2e_happy_path_parallel_execution_then_writer(monkeypatch):
     assert out["results"] == {1: "out-1", 2: "out-2", 3: "out-3"}
 
 
+def test_e2e_worker_receives_attached_documents(monkeypatch):
+    """Both severed links, end to end: a step's ``files`` assignment survives
+    into the plan, and the run's documents reach the worker through the Send
+    payload (the worker used to be called with no ``files`` at all)."""
+    plan = [step(1, files=["a.txt"]), step(2)]
+
+    def files_orchestrator(state):
+        return {"plan": plan, "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[[
+        {"step": 1, "verification_result": "PASSED", "notes": ""},
+        {"step": 2, "verification_result": "PASSED", "notes": ""},
+    ]])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=files_orchestrator)
+    out = _invoke(graph, search_results="sr", files={"a.txt": "doc text"})
+
+    received = {n: (assigned, docs) for n, assigned, docs in fake.worker_files}
+    # every worker is handed the run's whole document channel ...
+    assert received[1][1] == {"a.txt": "doc text"}
+    assert received[2][1] == {"a.txt": "doc text"}
+    # ... and run_sub_agent_async narrows it to the step's own assignment,
+    # which now survives validation (step 2 was assigned no documents)
+    assert received[1][0] == ["a.txt"]
+    assert received[2][0] == []
+    assert out["final_output"] == "FINAL"
+
+
 def test_e2e_retry_reruns_failed_step_exactly_once_with_feedback(monkeypatch):
     """One FAILED verdict → the step is re-executed exactly once (via
     ``pending_retries``, even though its old result is in results) and the
@@ -279,3 +319,36 @@ def test_e2e_direct_route_empty_plan_skips_agents(monkeypatch):
     assert fake.worker_calls == []                 # no sub-agents ran
     assert "good findings" in fake.writer_subtask
     assert "doc text" in fake.writer_subtask       # files via render_files_block
+
+
+def test_e2e_empty_plan_after_replan_skips_second_pass(monkeypatch):
+    """The verifier demands a replan, but the orchestrator's replan pass
+    returns an empty plan (search results were sufficient after all): the
+    wiped results stay empty, no second worker pass runs, and the writer
+    falls through to the direct route."""
+    orchestrator_calls = {"n": 0}
+
+    def plan_then_empty_orchestrator(state):
+        orchestrator_calls["n"] += 1
+        if orchestrator_calls["n"] == 1:
+            return {"plan": DIAMOND_PLAN, "results": {}, "current_step": 0}
+        return {"plan": [], "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[
+        [
+            {"step": 1, "verification_result": "FAILED", "notes": "REPLAN: add a step"},
+            {"step": 2, "verification_result": "PASSED", "notes": ""},
+            {"step": 3, "verification_result": "PASSED", "notes": ""},
+        ],
+    ])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=plan_then_empty_orchestrator)
+    out = _invoke(graph, search_results="good findings")
+
+    assert orchestrator_calls["n"] == 2                 # initial plan + replan pass
+    assert sorted(s for s, _ in fake.worker_calls) == [1, 2, 3]   # one pass only
+    assert out["replan_count"] == 1
+    assert out["results"] == {}                         # wiped, nothing re-ran
+    assert out["final_output"] == "FINAL"
+    assert "good findings" in fake.writer_subtask       # direct-route grounding
+    assert "## Sub-agent results" not in fake.writer_subtask
+    assert "## Original plan" not in fake.writer_subtask

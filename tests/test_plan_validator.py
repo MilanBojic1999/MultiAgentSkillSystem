@@ -69,6 +69,25 @@ def test_unknown_agent_raises_and_lists_known_agents():
         _validate([step(1, agent="nonexistent")])
 
 
+def test_files_assignment_survives_validation():
+    # A step's ``files`` list is the ONLY way a worker gets a document's full
+    # text, so model_dump() must carry the field rather than drop it.
+    out = _validate([step(1, files=["notes.md"])])
+    assert out[0]["files"] == ["notes.md"]
+
+
+def test_files_defaults_to_empty_list_when_omitted():
+    out = _validate([{"step": 1, "subtask": "a", "agent": "researcher"}])
+    assert out[0]["files"] == []
+
+
+def test_non_string_files_entry_is_a_schema_violation():
+    # Bad types trigger a re-plan through the orchestrator's RetryPolicy,
+    # rather than reaching a worker as an unusable filename.
+    with pytest.raises(PlanValidationError, match="index 0"):
+        _validate([step(1, files=[123])])
+
+
 def test_unknown_skill_is_dropped_not_raised():
     plan = [step(1, skills=["roll-dice", "bogus-skill"])]
     out = _validate(plan)

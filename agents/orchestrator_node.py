@@ -106,6 +106,7 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
     _FAILED_OUTPUT_PREVIEW_CHARS = 1500
 
     def orchestrator_agent(state: dict):
+        print(state.keys())
         user_task = state["task"]
         current_datetime = state.get("current_datetime") or get_current_datetime_str()
         skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items() if name not in _PIPELINE_RESERVED_SKILLS])
@@ -144,9 +145,12 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
         try:
             plan_json = extract_json(response.content)
             plan = plan_json.get("plan", [])
-            if not isinstance(plan, list) or len(plan) == 0:
+            if not isinstance(plan, list):
                 raise ValueError(f"Orchestrator produced an empty or invalid plan: {plan_json}")
             log_event("orchestrator_agent_plan", pipeline_plan=plan)
+
+            if len(plan) == 0:
+                return {"plan": plan, "results": {}, "current_step": 0}
 
             plan = validate_plan(plan, set(roster), set(index))
 
