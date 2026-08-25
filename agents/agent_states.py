@@ -57,13 +57,21 @@ class PipelineResult(TypedDict):
     """Typed pipeline result returned at presentation boundaries (Slice 4).
 
     Built by ``assemble_node.pipeline_result`` from a terminal graph state and
-    consumed by the CLI and the API response models.
+    consumed by the CLI and the API response models. The effort-slider
+    metadata (effort slider) has safe defaults so graph modules that predate
+    it stay compatible.
     """
     status: ExecutionStatus
     final_output: str
     failed_steps: list[int]
     skipped_steps: list[int]
     step_stats: list[StepStats]
+    # Effort slider metadata
+    effort: str
+    verification: str | None
+    verification_exhausted: bool
+    replan_count: int
+    safety_stop_reason: str | None
 
 
 class AgentState(TypedDict):
@@ -163,3 +171,14 @@ class YottaState(AgentState):
     # after the scheduler barrier — so a plain channel would reject the
     # parallel workers' writes (InvalidUpdateError).
     pending_retries: Annotated[list[int], lambda a, b: b]
+    # Effort slider (execution policy contract). ``effort_router`` writes the
+    # canonical preset + serialized policy at entry; every budgeted node reads
+    # them from here, and Send payloads carry both so workers see the same
+    # budgets. All four counters are written by exactly one node each, in its
+    # own superstep — plain channels, no reducers needed.
+    effort: str
+    execution_policy: dict
+    dispatch_count: int
+    safety_stop_reason: str
+    verification_attempts: int
+    verification_exhausted: bool

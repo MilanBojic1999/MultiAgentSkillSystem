@@ -16,6 +16,7 @@ import re
 
 from agents import AGENT_ROSTER
 from agents.agent_states import get_current_datetime_str
+from execution_policy import policy_from_state
 
 
 load_dotenv()
@@ -43,7 +44,7 @@ You are the Planner in a multi-agent research pipeline.
 Current datetime: {current_datetime}
 
 ## Replanning
-A verifier_report in your input means this is a replanning pass, not a first pass. Revise only the subqueries it flagged — add a missing one, reword an unanswerable one, or fix a wrong dependency — and leave every subquery the verifier already passed untouched. This pipeline caps replanning at three passes; if replan_count is already 2 going in, mark any subquery still unresolved as such rather than requesting a fourth pass.
+A verifier report in your input means this is a replanning pass, not a first pass. Revise only the subqueries it flagged — add a missing one, reword an unanswerable one, or fix a wrong dependency — and leave every subquery the verifier already passed untouched. The run's effort policy caps the number of replanning passes; the input tells you how many have already run. If you are at the cap, mark any subquery still unresolved as such rather than requesting another pass.
 
 **Stable step ids**: for every subquery you are keeping unchanged (the verifier already approved it), reuse its EXACT SAME `step` id and EXACT SAME `subtask` text from the previous plan — the pipeline uses an (id, subtask) match to carry its already-verified output forward without re-running it. If you reword a kept subquery even slightly, its research will be discarded and it will re-run from scratch. Only assign new ids (starting above the highest id in the previous plan) to genuinely new or reworded subqueries.
 
@@ -106,7 +107,6 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
     _FAILED_OUTPUT_PREVIEW_CHARS = 1500
 
     def orchestrator_agent(state: dict):
-        print(state.keys())
         user_task = state["task"]
         current_datetime = state.get("current_datetime") or get_current_datetime_str()
         skill_summery = "\n".join([f"- {name}: {desc['description']}" for name, desc in SKILL_INDEX.items() if name not in _PIPELINE_RESERVED_SKILLS])
@@ -115,11 +115,22 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
         streaming = state.get("streaming", False)
         search_results = state.get("search_results", "")
         files = state.get("files", {})
+        policy = policy_from_state(state)
 
         system_prompt = ORCHESTRATOR_SYSTEM.format(
             agent_roster=agent_roster_str,
             skill_index=skill_summery,
             current_datetime=current_datetime,
+        )
+        # Effort budget: tell the planner its step cap and remaining replan
+        # budget up front so it plans within them instead of being rejected.
+        system_prompt += (
+            f"\n\n## Effort budget (this run)\n"
+            f"The run's effort preset is '{policy.preset}'. Your plan may "
+            f"contain at most {policy.max_plan_steps} steps, and replanning is "
+            f"capped at {policy.max_replans} passes (this input is pass "
+            f"{state.get('replan_count', 0)} of that budget). Keep the plan "
+            f"within these limits."
         )
 
         user_task = sanitize_content(user_task, "user")
@@ -127,10 +138,19 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
 
         if search_results:
             user_parts.append(f"## Initial search results\n{search_results}")
-        
+
         files_block = _describe_attached_files(files)
         if files_block:
             user_parts.append(files_block)
+
+        # Replan pass: the verifier's structured notes are the feedback the
+        # planner must address — without them a replan would plan blind.
+        if state.get("replan_count", 0) > 0:
+            feedback = state.get("verification_notes") or state.get("verifier_report", "")
+            if feedback:
+                user_parts.append(
+                    f"## Verifier report — replan pass (address these gaps)\n{feedback}"
+                )
 
         user_task = "\n".join(user_parts)
 
@@ -138,7 +158,7 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_task),
         ]
-        
+
         log_event("orchestrator_agent_start", user_task=user_task)
 
         response = llm.invoke(messages)
@@ -153,6 +173,17 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
                 return {"plan": plan, "results": {}, "current_step": 0}
 
             plan = validate_plan(plan, set(roster), set(index))
+
+            # Effort cap enforced AFTER validation so dependency/cycle errors
+            # keep their precise messages. Never silently truncate a plan —
+            # truncation would break ``depends_on`` references.
+            if len(plan) > policy.max_plan_steps:
+                raise ValueError(
+                    f"Plan has {len(plan)} steps, but effort preset "
+                    f"'{policy.preset}' allows at most {policy.max_plan_steps}. "
+                    f"Merge or drop steps to fit the budget; never truncate "
+                    f"dependency references."
+                )
 
             return {"plan": plan, "results": {}, "current_step": 0}
         except Exception as e:

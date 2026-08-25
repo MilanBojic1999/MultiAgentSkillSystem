@@ -1,15 +1,26 @@
 from agents.agent_states import ExecutionStatus, PipelineResult
+from execution_policy import DEFAULT_EFFORT
 
 
-def derive_status(failed_steps: list[int], step_stats: list[dict]) -> ExecutionStatus:
+def derive_status(
+    failed_steps: list[int],
+    step_stats: list[dict],
+    verification_exhausted: bool = False,
+) -> ExecutionStatus:
     """Terminal execution status, derived once at assembly (Slice 4).
 
-    ``completed`` when no step failed or was skipped; ``partial`` when
-    containment failed or skipped steps while assembly still produced usable
-    output. ``failed`` and ``running`` never describe an assembled result —
-    they are transport/lifecycle states handled by the API layer.
+    ``completed`` when no step failed or was skipped and verification was
+    resolved; ``partial`` when containment failed or skipped steps while
+    assembly still produced usable output, or when the verification budget
+    was exhausted (effort slider — the writer still synthesized the best
+    available result). ``failed`` and ``running`` never describe an assembled
+    result — they are transport/lifecycle states handled by the API layer.
     """
-    if failed_steps or any(s.get("status") == "skipped" for s in step_stats):
+    if (
+        failed_steps
+        or any(s.get("status") == "skipped" for s in step_stats)
+        or verification_exhausted
+    ):
         return "partial"
     return "completed"
 
@@ -28,18 +39,29 @@ def pipeline_result(state: dict) -> PipelineResult:
 
     Presentation boundaries (CLI, API) read exactly this shape:
     ``status``, ``final_output``, ``failed_steps``, ``skipped_steps`` and
-    step-ordered ``step_stats``. ``skipped_steps`` is derived from the final
-    stats, and ``status`` falls back to ``derive_status`` for graph modules
-    that do not write it themselves.
+    step-ordered ``step_stats``, plus the effort-slider metadata
+    (``effort``, ``verification``, ``verification_exhausted``,
+    ``replan_count``, ``safety_stop_reason`` — every one with a safe default
+    so graph modules that predate the feature stay compatible).
+    ``skipped_steps`` is derived from the final stats, and ``status`` falls
+    back to ``derive_status`` for graph modules that do not write it
+    themselves.
     """
     step_stats = sorted(state.get("step_stats", []), key=lambda s: s["step"])
     failed_steps = sorted(state.get("failed_steps", []))
+    verification_exhausted = bool(state.get("verification_exhausted"))
     return {
-        "status": state.get("status") or derive_status(failed_steps, step_stats),
+        "status": state.get("status")
+        or derive_status(failed_steps, step_stats, verification_exhausted),
         "final_output": state.get("final_output", "No final output produced."),
         "failed_steps": failed_steps,
         "skipped_steps": skipped_steps_from_stats(step_stats),
         "step_stats": step_stats,
+        "effort": state.get("effort") or DEFAULT_EFFORT,
+        "verification": state.get("verification_result") or None,
+        "verification_exhausted": verification_exhausted,
+        "replan_count": int(state.get("replan_count") or 0),
+        "safety_stop_reason": state.get("safety_stop_reason") or None,
     }
 
 
@@ -62,5 +84,9 @@ def assemble_node(state: dict) -> dict:
     ]
     return {
         "final_output": "\n\n".join(parts),
-        "status": derive_status(failed_steps, state.get("step_stats", [])),
+        "status": derive_status(
+            failed_steps,
+            state.get("step_stats", []),
+            bool(state.get("verification_exhausted")),
+        ),
     }

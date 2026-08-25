@@ -15,42 +15,85 @@ import uuid
 from graphs import build_graph, graph_descriptions
 from agents.agent_states import PipelineResult, get_current_datetime_str
 from assemble_node import pipeline_result
+from execution_policy import (
+    EFFORT_PRESETS,
+    DEFAULT_EFFORT,
+    graph_effort_compat_error,
+    normalize_effort,
+    resolve_execution_policy,
+)
+from utils.logger import log_event
 
-DEFAULT_GRAPH = "parallel"
+# The effort-aware default topology (effort slider): yotta provides the
+# planner -> workers -> verifier -> writer lifecycle; ``parallel`` and
+# ``sequential`` remain explicitly selectable compatibility graphs.
+DEFAULT_GRAPH = "yotta"
 
 
-def _run_config() -> dict:
+def _resolve_effort_and_graph(graph_name: str, effort: str | None) -> tuple[str, str]:
+    """Mirror the API boundary's compatibility contract for direct CLI runs.
+
+    - verification-promising efforts on legacy non-verifying graphs -> error;
+    - ``instant`` always executes on yotta (its only implementation);
+    - omitted effort resolves to ``unlimited`` (legacy behavior).
+    """
+    preset = normalize_effort(effort)
+    error = graph_effort_compat_error(graph_name, preset)
+    if error:
+        raise ValueError(error)
+    if preset == "instant":
+        log_event(
+            "instant_route_selected",
+            requested_graph=(graph_name or "").strip() or None,
+        )
+        return "yotta", preset
+    return graph_name, preset
+
+
+def _run_config(effort: str | None = None) -> dict:
     """Build the run config for one pipeline run.
 
     ``task_id`` keys the run's artifact directory (plan 4.5), so every CLI
     run writes generated files (e.g. plots) into its own ``artifacts/<id>/``
-    instead of overwriting the previous run's files.
+    instead of overwriting the previous run's files. ``effort`` resolves
+    through the shared policy module and travels under ``configurable``
+    (serializable only — checkpoint-safe).
     """
+    preset = normalize_effort(effort)
+    policy = resolve_execution_policy(preset)
+    log_event("execution_policy_resolved", effort=preset,
+              execution_policy=policy.as_dict())
     return {"configurable": {
         "thread_id": "test-run-1",
         "task_id": uuid.uuid4().hex[:12],
+        "effort": preset,
+        "execution_policy": policy.as_dict(),
     }}
 
 
-def run(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
+def run(task: str, graph_name: str = DEFAULT_GRAPH,
+        effort: str | None = None) -> PipelineResult:
     """Run the pipeline synchronously.
 
     Returns the typed result: ``status`` (``completed``/``partial``),
-    ``final_output``, ``failed_steps``, ``skipped_steps`` and ``step_stats``
-    (Slice 4).
+    ``final_output``, ``failed_steps``, ``skipped_steps``, ``step_stats``
+    (Slice 4) plus effort/verification metadata.
     """
+    graph_name, preset = _resolve_effort_and_graph(graph_name, effort)
     graph = build_graph(graph_name)
-    result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config())
+    result = graph.invoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config(preset))
     return pipeline_result(result)
 
 
-async def run_async(task: str, graph_name: str = DEFAULT_GRAPH) -> PipelineResult:
+async def run_async(task: str, graph_name: str = DEFAULT_GRAPH,
+                    effort: str | None = None) -> PipelineResult:
     """Run the pipeline asynchronously.
 
     Returns the same typed result as :func:`run` (Slice 4).
     """
+    graph_name, preset = _resolve_effort_and_graph(graph_name, effort)
     graph = build_graph(graph_name)
-    result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config())
+    result = await graph.ainvoke({"task": task, "current_datetime": get_current_datetime_str()}, config=_run_config(preset))
     return pipeline_result(result)
 
 
@@ -98,6 +141,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              f"See --list-graphs.",
     )
     parser.add_argument(
+        "--effort",
+        type=str.lower,
+        choices=list(EFFORT_PRESETS),
+        default=None,
+        metavar="{instant,light,standard,thorough,unlimited}",
+        help=f"Execution effort preset for this run (case-insensitive; "
+             f"default: {DEFAULT_EFFORT}). Per-run only — never persisted.",
+    )
+    parser.add_argument(
         "--list-graphs",
         action="store_true",
         help="List the graphs discovered in graphs/ and exit.",
@@ -119,9 +171,16 @@ if __name__ == "__main__":
         "Then write a short summary of what the calculation means."
     )
 
-    print(f"Running pipeline '{args.graph}' with task:\n  {task}\n")
+    # Same compatibility contract as the API boundary: verification-promising
+    # efforts require yotta; instant always executes on yotta.
+    try:
+        graph, effort = _resolve_effort_and_graph(args.graph, args.effort)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    print(f"Running pipeline '{graph}' (effort: {effort}) with task:\n  {task}\n")
     print("=" * 60)
-    result = asyncio.run(run_async(task, args.graph))
+    result = asyncio.run(run_async(task, graph, effort))
     print("=" * 60)
     print(f"Status: {result['status']}")
     print(result["final_output"])

@@ -13,10 +13,12 @@ import json
 
 import pytest
 from langgraph.types import Send
+from langgraph.errors import NodeCancelledError
 
 from agents.agent_states import RESULTS_RESET, YottaState
+from execution_policy import ExecutionPolicy, resolve_execution_policy
 from graphs.yotta_graph import _latest_retry_note, after_verify, fan_out_router
-from tests.plans import DIAMOND_PLAN, step
+from tests.plans import DIAMOND_PLAN, LINEAR_PLAN, step
 
 CONFIG = {"configurable": {"thread_id": "test-yotta-graph"}}
 
@@ -59,7 +61,7 @@ class FakeLLMCall:
         return step["step"], f"out-{step['step']}", _STATS
 
 
-def _build_yotta(monkeypatch, fake, orchestrator=None):
+def _build_yotta(monkeypatch, fake, orchestrator=None, sub_agent=None):
     """The real yotta graph with every LLM-bearing call faked out.
 
     ``fake`` replaces ``run_sub_agent_async`` in BOTH modules: the graph
@@ -76,7 +78,7 @@ def _build_yotta(monkeypatch, fake, orchestrator=None):
 
     from graphs.yotta_graph import build
 
-    return build(orchestrator=orchestrator or stub_orchestrator)
+    return build(orchestrator=orchestrator or stub_orchestrator, sub_agent=sub_agent)
 
 
 def _invoke(graph, **extra):
@@ -352,3 +354,232 @@ def test_e2e_empty_plan_after_replan_skips_second_pass(monkeypatch):
     assert "good findings" in fake.writer_subtask       # direct-route grounding
     assert "## Sub-agent results" not in fake.writer_subtask
     assert "## Original plan" not in fake.writer_subtask
+
+
+# ---------------------------------------------------------------------------
+# Effort slider — instant route, policy caps, safety stops
+# ---------------------------------------------------------------------------
+
+def _policy(effort):
+    return resolve_execution_policy(effort).as_dict()
+
+
+FAILED_STEP2 = [
+    {"step": 1, "verification_result": "PASSED", "notes": ""},
+    {"step": 2, "verification_result": "FAILED", "notes": "recheck the numbers"},
+    {"step": 3, "verification_result": "PASSED", "notes": ""},
+]
+ALL_PASSED = [
+    {"step": 1, "verification_result": "PASSED", "notes": ""},
+    {"step": 2, "verification_result": "PASSED", "notes": ""},
+    {"step": 3, "verification_result": "PASSED", "notes": ""},
+]
+REPLAN_VERDICTS = [
+    {"step": 1, "verification_result": "FAILED", "notes": "REPLAN: add a step"},
+    {"step": 2, "verification_result": "PASSED", "notes": ""},
+    {"step": 3, "verification_result": "PASSED", "notes": ""},
+]
+
+
+def test_e2e_instant_single_writer_no_planner_no_verifier(monkeypatch):
+    """Instant guarantees: zero orchestrator invocations, exactly one writer
+    worker invocation, no tool-verifier, no replan, no synthesis call — and
+    one normal stats/result row."""
+    orchestrator_calls = {"n": 0}
+
+    def counting_orchestrator(state):
+        orchestrator_calls["n"] += 1
+        return {"plan": DIAMOND_PLAN, "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=counting_orchestrator)
+    out = _invoke(graph, effort="instant", execution_policy=_policy("instant"))
+
+    assert orchestrator_calls["n"] == 0                 # planner never ran
+    assert fake.worker_calls == [(1, "")]               # exactly one writer worker
+    assert fake.verifier_subtasks == []                 # verifier never ran
+    assert fake.writer_subtask == ""                    # no writer synthesis call
+    assert out["final_output"] == "out-1"               # the single answer IS the output
+    assert out["status"] == "completed"
+    assert out["effort"] == "instant"
+    assert out["replan_count"] == 0
+    assert out["verification_attempts"] == 0
+    (row,) = out["step_stats"]                          # one normal stats row
+    assert row["step"] == 1 and row["agent"] == "writer"
+    assert row["status"] == "completed" and row["tool_calls"] == 0
+
+
+def test_e2e_instant_writer_receives_attached_files(monkeypatch):
+    """Instant keeps file grounding: the synthetic writer step is assigned
+    every attached document and receives them through the Send payload."""
+    fake = FakeLLMCall(verdicts=[])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="instant", execution_policy=_policy("instant"),
+                  files={"a.txt": "doc text"})
+
+    (step_n, assigned, docs) = fake.worker_files[0]
+    assert step_n == 1
+    assert assigned == ["a.txt"]
+    assert docs == {"a.txt": "doc text"}
+    assert out["final_output"] == "out-1"
+
+
+def test_e2e_instant_contained_failure_is_partial(monkeypatch):
+    """A failing writer worker is contained exactly like a normal step: one
+    attempt (instant cap = 1), then a partial result — no infinite retry."""
+    from graphs.yotta_graph import make_yotta_sub_agent_node
+
+    calls = {"n": 0}
+
+    async def failing_run(s, results, current_datetime=""):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    worker = make_yotta_sub_agent_node(run_step=failing_run)
+
+    def no_orchestrator(state):
+        raise AssertionError("orchestrator must not run on instant")
+
+    graph = _build_yotta(monkeypatch, FakeLLMCall(verdicts=[]),
+                         orchestrator=no_orchestrator, sub_agent=worker)
+    out = _invoke(graph, effort="instant", execution_policy=_policy("instant"))
+
+    assert calls["n"] == 1                              # exactly one attempt
+    assert out["status"] == "partial"
+    assert out["failed_steps"] == [1]
+    assert "[STEP FAILED]" in out["final_output"]
+
+
+def test_e2e_instant_cancellation_escapes(monkeypatch):
+    """Cancellation on the instant route escapes the graph, never contained."""
+    from graphs.yotta_graph import make_yotta_sub_agent_node
+
+    async def cancel_run(s, results, current_datetime=""):
+        raise asyncio.CancelledError()
+
+    worker = make_yotta_sub_agent_node(run_step=cancel_run)
+    graph = _build_yotta(monkeypatch, FakeLLMCall(verdicts=[]),
+                         orchestrator=lambda s: None, sub_agent=worker)
+    with pytest.raises((asyncio.CancelledError, NodeCancelledError)):
+        _invoke(graph, effort="instant", execution_policy=_policy("instant"))
+
+
+def test_e2e_step_retry_cap_comes_from_policy(monkeypatch):
+    """Standard allows one step-verification retry: after the second FAILED
+    verdict the step degrades to PASSED WITH NOTES instead of a third retry,
+    and the verifier runs exactly once per pass (no duplicate invocation)."""
+    fake = FakeLLMCall(verdicts=[list(FAILED_STEP2), list(FAILED_STEP2), list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="standard", execution_policy=_policy("standard"))
+
+    assert [s for s, _ in fake.worker_calls].count(2) == 2   # initial + ONE retry
+    assert len(fake.verifier_subtasks) == 2                  # once per pass
+    assert out["step_verifications"][2]["retries"] == 1
+    assert out["step_verifications"][2]["verdict"] == "PASSED WITH NOTES"
+    assert out["verification_result"] == "PASSED WITH NOTES"
+    assert out["verification_exhausted"] is False
+    assert out["final_output"] == "FINAL"
+
+
+def test_e2e_explicit_unlimited_keeps_two_retries(monkeypatch):
+    """Unlimited is compatibility: the historical two-retry cap still applies
+    when the policy is present explicitly."""
+    fake = FakeLLMCall(verdicts=[list(FAILED_STEP2), list(FAILED_STEP2),
+                                 list(FAILED_STEP2)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="unlimited", execution_policy=_policy("unlimited"))
+
+    assert [s for s, _ in fake.worker_calls].count(2) == 3   # initial + two retries
+    assert out["step_verifications"][2]["retries"] == 2
+    assert out["final_output"] == "FINAL"
+
+
+def test_e2e_replan_exhaustion_is_partial_with_warning(monkeypatch):
+    """Standard allows one replan: the second replan demand hits the cap and
+    routes to the writer with an explicitly partial, warned result — never a
+    loop, never a transport error."""
+    orchestrator_calls = {"n": 0}
+
+    def counting_orchestrator(state):
+        orchestrator_calls["n"] += 1
+        return {"plan": DIAMOND_PLAN, "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[list(REPLAN_VERDICTS), list(REPLAN_VERDICTS)])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=counting_orchestrator)
+    out = _invoke(graph, effort="standard", execution_policy=_policy("standard"))
+
+    assert orchestrator_calls["n"] == 2            # initial + the one allowed replan
+    assert out["replan_count"] == 2
+    assert out["verification_exhausted"] is True
+    assert out["status"] == "partial"
+    assert out["verification_result"] == "FAILED"
+    assert "Partial result warning" in fake.writer_subtask
+    assert "verification budget" in fake.writer_subtask
+    assert out["final_output"] == "FINAL"
+
+
+def test_e2e_dispatch_ceiling_triggers_safety_stop(monkeypatch):
+    """A policy with max_graph_dispatches=1 stops after the first wave with a
+    structured safety_stop_reason — the run finalizes instead of looping."""
+    policy = _policy("light")
+    policy["max_graph_dispatches"] = 1
+    fake = FakeLLMCall(verdicts=[])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="light", execution_policy=policy)
+
+    assert out["safety_stop_reason"] == "max_graph_dispatches=1 exceeded"
+    assert out["dispatch_count"] == 2
+    assert sorted(s for s, _ in fake.worker_calls) == [1, 2]  # only the first wave ran
+    assert out["status"] == "partial"
+    assert "Partial result warning" in fake.writer_subtask
+    assert "max_graph_dispatches" in fake.writer_subtask
+
+
+def test_e2e_deadline_safety_stop_before_any_dispatch(monkeypatch):
+    """An already-expired deadline stops the run before the first worker wave."""
+    policy = _policy("standard")
+    policy["deadline"] = 0.0
+    fake = FakeLLMCall(verdicts=[])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="standard", execution_policy=policy)
+
+    assert out["safety_stop_reason"] == "wall-clock deadline exceeded"
+    assert fake.worker_calls == []
+    assert out["status"] == "partial"
+
+
+def test_e2e_replan_feedback_reaches_the_planner_state(monkeypatch):
+    """On a replan pass the planner's state carries the verifier's structured
+    notes — the production orchestrator injects them into its prompt."""
+    seen_states = []
+
+    def recording_orchestrator(state):
+        seen_states.append(state)
+        return {"plan": DIAMOND_PLAN, "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[list(REPLAN_VERDICTS), list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=recording_orchestrator)
+    _invoke(graph, effort="unlimited", execution_policy=_policy("unlimited"))
+
+    assert len(seen_states) == 2
+    assert seen_states[0].get("verification_notes", "") == ""   # first pass: no notes
+    assert "REPLAN" in seen_states[1].get("verification_notes", "")
+
+
+def test_e2e_verification_attempts_counter_increments_per_pass(monkeypatch):
+    fake = FakeLLMCall(verdicts=[list(FAILED_STEP2), list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="unlimited", execution_policy=_policy("unlimited"))
+    assert out["verification_attempts"] == 2
+
+
+def test_effort_policy_round_trips_through_state_and_entry(monkeypatch):
+    """The entry router stamps the policy into state; the returned state is
+    serializable (it went through graph channels/checkpointing)."""
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="thorough", execution_policy=_policy("thorough"))
+    assert out["effort"] == "thorough"
+    again = ExecutionPolicy.from_dict(out["execution_policy"])
+    assert again.preset == "thorough"
+    assert again.max_replans == 2

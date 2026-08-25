@@ -134,3 +134,68 @@ def test_pipeline_result_falls_back_to_derived_status():
     assert pipeline_result(state)["status"] == "partial"
     state = {"final_output": "x", "failed_steps": [], "step_stats": [_row(1, "completed")]}
     assert pipeline_result(state)["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Effort slider — verification exhaustion and response metadata
+# ---------------------------------------------------------------------------
+
+def test_derive_status_partial_on_verification_exhaustion():
+    """An exhausted verification budget is a partial result even when no step
+    failed or was skipped — the writer still synthesized the best available
+    output, but it was never fully verified."""
+    stats = [_row(1, "completed")]
+    assert derive_status([], stats) == "completed"
+    assert derive_status([], stats, verification_exhausted=True) == "partial"
+    assert derive_status([2], stats, verification_exhausted=True) == "partial"
+
+
+def test_assemble_writes_partial_on_verification_exhaustion():
+    out = assemble_node({
+        "plan": LINEAR_PLAN,
+        "results": {1: "one", 2: "two", 3: "three"},
+        "verification_exhausted": True,
+    })
+    assert out["status"] == "partial"
+
+
+def test_pipeline_result_carries_effort_metadata_with_safe_defaults():
+    """Graph modules that predate the effort slider still normalize cleanly."""
+    state = {"final_output": "done", "failed_steps": [], "step_stats": []}
+    result = pipeline_result(state)
+    assert result["effort"] == "unlimited"
+    assert result["verification"] is None
+    assert result["verification_exhausted"] is False
+    assert result["replan_count"] == 0
+    assert result["safety_stop_reason"] is None
+
+
+def test_pipeline_result_normalizes_effort_metadata_from_state():
+    state = {
+        "final_output": "done",
+        "status": "partial",
+        "failed_steps": [],
+        "step_stats": [],
+        "effort": "standard",
+        "verification_result": "PASSED WITH NOTES",
+        "verification_exhausted": True,
+        "replan_count": 1,
+        "safety_stop_reason": None,
+    }
+    result = pipeline_result(state)
+    assert result["effort"] == "standard"
+    assert result["verification"] == "PASSED WITH NOTES"
+    assert result["verification_exhausted"] is True
+    assert result["replan_count"] == 1
+    assert result["safety_stop_reason"] is None
+
+
+def test_pipeline_result_surfaces_safety_stop_reason():
+    state = {
+        "final_output": "best available",
+        "status": "partial",
+        "failed_steps": [],
+        "step_stats": [],
+        "safety_stop_reason": "max_graph_dispatches=16 exceeded",
+    }
+    assert pipeline_result(state)["safety_stop_reason"] == "max_graph_dispatches=16 exceeded"

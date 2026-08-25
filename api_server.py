@@ -21,7 +21,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from execution_policy import (
+    DEFAULT_EFFORT,
+    EFFORT_PRESETS,
+    graph_effort_compat_error,
+    normalize_effort,
+    resolve_execution_policy,
+)
 
 from dotenv import load_dotenv
 
@@ -46,8 +54,10 @@ from pipeline_entry import (
 from streaming import stream_pipeline
 from yotta_tool import call_yotta, parse_yotta_results
 
-# Graph used when a request does not name one.
-DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "parallel").strip() or "parallel"
+# Graph used when a request does not name one. The effort-aware default is
+# yotta (planner -> workers -> verifier -> writer); ``parallel`` and
+# ``sequential`` remain explicitly selectable compatibility topologies.
+DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "yotta").strip() or "yotta"
 
 # When true, API error responses include the full traceback; otherwise clients
 # get a generic message + id and the traceback stays in the server log.
@@ -88,6 +98,29 @@ class RunRequest(BaseModel):
         examples=["parallel", "sequential"],
     )
 
+    effort: str | None = Field(
+        default=None,
+        description=(
+            "Execution effort preset for this run: "
+            f"{', '.join(EFFORT_PRESETS)}. "
+            "Per-run only — never persisted as a preference. Omitted means "
+            f"'{DEFAULT_EFFORT}' (compatibility with the current high-effort "
+            "behavior). Case-insensitive; invalid names get a 422."
+        ),
+        examples=["instant", "standard"],
+    )
+
+    @field_validator("effort")
+    @classmethod
+    def _normalize_effort(cls, value: str | None) -> str | None:
+        """Normalize once at the boundary; invalid names become a 422."""
+        if value is None:
+            return None
+        try:
+            return normalize_effort(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
 
 class StepStatsModel(BaseModel):
     """One typed per-step statistics row (Slice 4)."""
@@ -118,6 +151,13 @@ class RunResponse(BaseModel):
     skipped_steps: list[int] = []
     step_stats: list[StepStatsModel] = []
     task_id: str = ""
+    # Effort and verification metadata (effort slider). Every field has a
+    # safe default so old clients keep working unchanged.
+    effort: str = DEFAULT_EFFORT
+    verification: str | None = None
+    verification_exhausted: bool = False
+    replan_count: int = 0
+    safety_stop_reason: str | None = None
 
 
 class GraphInfo(BaseModel):
@@ -149,6 +189,11 @@ class StatusResponse(BaseModel):
     skipped_steps: list[int] = []
     step_stats: list[StepStatsModel] = []
     error: str | None = None
+    effort: str = DEFAULT_EFFORT
+    verification: str | None = None
+    verification_exhausted: bool = False
+    replan_count: int = 0
+    safety_stop_reason: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -189,7 +234,7 @@ def _get_graph(name: str | None):
     if name not in _graph_cache:
         _graph_cache[name] = build_graph(name, checkpointer=_checkpointer)
         log_event("api_graph_compiled", graph=name)
-    print("graph name:", name)
+
     return _graph_cache[name]
 
 
@@ -234,15 +279,44 @@ app.add_middleware(
 # Pipeline runner (shared by sync and async endpoints)
 # ---------------------------------------------------------------------------
 
-def _resolve_graph_or_400(graph_name: str | None) -> None:
-    """Compile the requested graph early so a bad name is a 400, not a 500."""
+def _resolve_effort_and_graph_or_400(
+    graph_name: str | None, effort: str | None
+) -> tuple[str, str]:
+    """Validate effort/graph compatibility and return ``(effective_graph, effort)``.
+
+    The effort value already passed the request model's 422 normalization, so
+    this re-normalization is a no-op for HTTP callers; it exists so the helper
+    is also safe to call from non-HTTP paths.
+
+    Compatibility contract (effort_plan.md step 7):
+
+    - ``light``/``standard``/``thorough`` promise verification, which the
+      legacy ``parallel``/``sequential`` graphs do not provide -> 422;
+    - ``unlimited`` on a legacy graph is the backwards-compatible legacy mode;
+    - ``instant`` has exactly one implementation and is always executed on
+      the ``yotta`` graph, whatever topology the caller named.
+
+    An unknown graph name stays a 400.
+    """
+    preset = normalize_effort(effort)
+    error = graph_effort_compat_error(graph_name, preset)
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+    if preset == "instant":
+        log_event(
+            "instant_route_selected",
+            requested_graph=(graph_name or "").strip() or None,
+        )
+    effective_graph = "yotta" if preset == "instant" else graph_name
     try:
-        _get_graph(graph_name)
+        _get_graph(effective_graph)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    return effective_graph, preset
 
 
 async def _run_pipeline(task: str, files: list[FileInput] | None, graph_name: str | None = None,
+                        effort: str | None = None,
                         task_id: str | None = None) -> RunResponse:
     """Run the selected LangGraph pipeline and return its typed result.
 
@@ -254,13 +328,24 @@ async def _run_pipeline(task: str, files: list[FileInput] | None, graph_name: st
     ``task_id`` keys the run's artifact directory (plan 4.5); a fresh one is
     generated for synchronous runs and returned in the response so the client
     can fetch generated files from ``GET /artifacts/{task_id}/{filename}``.
+
+    ``effort`` resolves through the shared policy module and travels under
+    ``config["configurable"]`` (serializable only — checkpoint-safe) beside
+    ``thread_id`` and ``task_id``. The selection is per run and is never
+    persisted as a preference.
     """
+    preset = normalize_effort(effort)
+    policy = resolve_execution_policy(preset)
     graph = _get_graph(graph_name)
     run_id = task_id or uuid.uuid4().hex[:12]
     config = {"configurable": {
         "thread_id": f"api-{uuid.uuid4().hex[:8]}",
         "task_id": run_id,
+        "effort": preset,
+        "execution_policy": policy.as_dict(),
     }}
+    log_event("execution_policy_resolved", effort=preset,
+              execution_policy=policy.as_dict())
 
     files_state = build_files_state(files)
 
@@ -268,7 +353,11 @@ async def _run_pipeline(task: str, files: list[FileInput] | None, graph_name: st
         {"task": task, "current_datetime": get_current_datetime_str(), "files": files_state,},
         config=config,
     )
-    return RunResponse(task_id=run_id, **pipeline_result(result))
+    # The request's resolved effort is authoritative; the graph state's copy
+    # (when present) is dropped so it cannot collide with the explicit kwarg.
+    result_data = pipeline_result(result)
+    result_data.pop("effort", None)
+    return RunResponse(task_id=run_id, effort=preset, **result_data)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +392,9 @@ async def run_pipeline(req: RunRequest):
     usable assembled output; only a fatal planner/graph/configuration error
     is an HTTP 500 (Slice 4).
     """
-    _resolve_graph_or_400(req.graph)
+    effective_graph, preset = _resolve_effort_and_graph_or_400(req.graph, req.effort)
     try:
-        return await _run_pipeline(req.task, req.files, req.graph)
+        return await _run_pipeline(req.task, req.files, effective_graph, preset)
     except UnsupportedFileTypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except EmptyExtractedTextError as exc:
@@ -329,10 +418,12 @@ async def run_pipeline_async(req: RunRequest):
 
     Poll ``GET /status/{task_id}`` to check progress and retrieve the result.
     """
-    _resolve_graph_or_400(req.graph)
+    effective_graph, preset = _resolve_effort_and_graph_or_400(req.graph, req.effort)
     task_id = uuid.uuid4().hex[:12]
 
     async with _task_lock:
+        # ``effort`` is kept in the task store for status reporting only —
+        # it is never turned into a persisted server/user preference.
         _task_store[task_id] = {
             "status": "running",
             "final_output": None,
@@ -340,6 +431,11 @@ async def run_pipeline_async(req: RunRequest):
             "skipped_steps": [],
             "step_stats": [],
             "error": None,
+            "effort": preset,
+            "verification": None,
+            "verification_exhausted": False,
+            "replan_count": 0,
+            "safety_stop_reason": None,
         }
 
     async def _background():
@@ -347,7 +443,8 @@ async def run_pipeline_async(req: RunRequest):
             # The task id also keys the run's artifact directory (plan 4.5),
             # so the client can fetch generated files from
             # GET /artifacts/{task_id}/{filename} with the id it already has.
-            result = await _run_pipeline(req.task, req.files, req.graph, task_id)
+            result = await _run_pipeline(req.task, req.files, effective_graph,
+                                         preset, task_id)
             async with _task_lock:
                 # Terminal "completed" or "partial" — both preserve the
                 # assembled output and per-step statistics (Slice 4).
@@ -358,6 +455,11 @@ async def run_pipeline_async(req: RunRequest):
                     "skipped_steps": result.skipped_steps,
                     "step_stats": [s.model_dump() for s in result.step_stats],
                     "error": None,
+                    "effort": result.effort,
+                    "verification": result.verification,
+                    "verification_exhausted": result.verification_exhausted,
+                    "replan_count": result.replan_count,
+                    "safety_stop_reason": result.safety_stop_reason,
                 }
         except Exception as exc:
             log_event("api_async_task_failed", task_id=task_id, error=str(exc),
@@ -375,6 +477,11 @@ async def run_pipeline_async(req: RunRequest):
                     "skipped_steps": [],
                     "step_stats": [],
                     "error": error,
+                    "effort": preset,
+                    "verification": None,
+                    "verification_exhausted": False,
+                    "replan_count": 0,
+                    "safety_stop_reason": None,
                 }
 
     asyncio.create_task(_background())
@@ -401,6 +508,11 @@ async def task_status(task_id: str):
         skipped_steps=entry.get("skipped_steps", []),
         step_stats=entry.get("step_stats", []),
         error=entry.get("error"),
+        effort=entry.get("effort", DEFAULT_EFFORT),
+        verification=entry.get("verification"),
+        verification_exhausted=entry.get("verification_exhausted", False),
+        replan_count=entry.get("replan_count", 0),
+        safety_stop_reason=entry.get("safety_stop_reason"),
     )
 
 

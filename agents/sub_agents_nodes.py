@@ -1,9 +1,11 @@
 import asyncio
 import time
 from functools import partial
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler, CallbackManager
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda, RunnableConfig
 from skill_loader import load_skills, load_skills_body
@@ -18,6 +20,7 @@ from pipeline_entry import render_files_block
 from agents import AGENT_ROSTER
 from agents.agent_states import get_current_datetime_str, WorkerState
 from config_loader import AGENT_CONFIG, get_max_attempts
+from execution_policy import effective_worker_attempts
 
 load_dotenv()
 
@@ -25,6 +28,114 @@ _SKILL_INDEX, _SKILL_DICTIONARY_PAIRS = load_skills()
 
 # Whitelist for per-agent llm config blocks (Phase 4.3)
 _LLM_CONFIG_KEYS = {"model", "url", "api_key_env", "temperature", "max_tokens"}
+
+
+class ToolBudgetExceededError(RuntimeError):
+    """Raised when a ReAct attempt requests more tool calls than its effort
+    budget allows. Raised *in flight* (from a callback inside the agent loop,
+    before the offending tool ever executes) so ``run_sub_agent_async`` can
+    convert the exhaustion into a finalize pass — the agent is re-invoked on
+    the same checkpointer thread with a strict no-more-tools instruction and
+    finishes with the information already retrieved. Only if that finalize
+    pass still requests tools does the error escape to
+    ``run_step_with_attempts`` — the pipeline's single retry owner — which
+    decides whether to retry with a fresh per-attempt budget or contain the
+    step.
+    """
+
+
+class _ToolBudgetGuard(BaseCallbackHandler):
+    """Callback that counts requested tool calls during ReAct execution.
+
+    Fires on every model call inside the agent loop (``on_llm_end``) and
+    raises ``ToolBudgetExceededError`` the moment the cumulative count would
+    exceed the cap — the tool that broke the budget never executes.
+    ``raise_error = True`` is what makes the raise propagate out of
+    ``agent.ainvoke`` instead of being logged and swallowed by langchain's
+    callback manager. The exception is *not* fatal to the step: the runner
+    catches it and resumes the conversation with a finalize instruction (see
+    ``_finalize_after_budget_exhaustion``).
+    """
+
+    raise_error = True
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.count = 0
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        for generation in (response.generations or []):
+            for gen in generation:
+                message = gen.message if hasattr(gen, "message") else None
+                tool_calls = getattr(message, "tool_calls", None) or []
+                self.count += len(tool_calls)
+                if self.count > self.cap:
+                    raise ToolBudgetExceededError(
+                        f"Tool budget exceeded: the attempt requested "
+                        f"{self.count} tool calls, the effort policy allows "
+                        f"{self.cap}. The offending call was not executed."
+                    )
+
+
+_FINALIZE_INSTRUCTION = (
+    "Your tool-call budget for this attempt is exhausted — you must not call "
+    "any more tools. Finalize your answer now, using the information you have "
+    "already retrieved and the context in this conversation. Reply with your "
+    "final answer as plain text only."
+)
+
+
+async def _finalize_after_budget_exhaustion(
+    agent: Any,
+    saver: InMemorySaver,
+    invoke_config: dict,
+    parent_handlers: list,
+    step_num: int,
+    agent_name: str,
+    subtask: str,
+    cap: int,
+) -> dict:
+    """One strict finalize pass on the same checkpointer thread.
+
+    The failed attempt's checkpoint already holds the conversation up to the
+    last committed superstep; invoking again on the same thread appends the
+    finalize instruction via the messages reducer and re-runs the agent node
+    with the full history (langgraph resume-after-error semantics — the input
+    checkpoint is committed before the first model call, and the failed
+    node's writes are stored as an ERROR control signal, not merged).
+
+    A fresh, strict cap-0 guard replaces the exhausted one, so any further
+    tool request raises ``ToolBudgetExceededError`` again and escapes to the
+    bounded attempt loop as before. ``parent_handlers`` are the caller's
+    pre-existing callback handlers, kept so the parent run's callbacks fire
+    on this pass too.
+
+    Defensive seed: if the thread has no checkpoint (it always has one in
+    langgraph 1.2.4 — the input checkpoint is committed before the first
+    model call), start a fresh conversation with the subtask so the agent
+    never finalizes blind.
+    """
+    finalize_config = dict(invoke_config)
+    finalize_config["callbacks"] = [*parent_handlers, _ToolBudgetGuard(0)]
+    if await saver.aget_tuple(finalize_config) is None:
+        payload = {
+            "messages": [
+                ("user", subtask),
+                SystemMessage(content=_FINALIZE_INSTRUCTION),
+            ]
+        }
+    else:
+        payload = {"messages": [SystemMessage(content=_FINALIZE_INSTRUCTION)]}
+    try:
+        return await agent.ainvoke(payload, config=finalize_config or None)
+    except ToolBudgetExceededError:
+        log_event(
+            "tool_budget_finalize_failed",
+            step_num=step_num,
+            agent_name=agent_name,
+            max_tool_calls_per_attempt=cap,
+        )
+        raise
 
 
 def _llm_kwargs(llm_block: dict, agent_name: str) -> dict:
@@ -71,6 +182,7 @@ async def run_sub_agent_async(
     streaming: bool = False,
     files: dict[str, str] | None = None,
     feedback: str = "",
+    policy: dict | None = None,
 ) -> tuple[int, str, dict]:
     """Run one sub-agent step. Returns (step_number, output_text, stats_dict).
 
@@ -87,7 +199,54 @@ async def run_sub_agent_async(
     ``config`` is the run config threaded through from the graph invocation and
     forwarded to the sub-agent, so tools can read ``configurable`` (plan 4.5,
     artifact paths). ``None`` is fine — the sub-agent runs with a fresh config.
+
+    ``policy`` (effort slider) is the run's serialized execution policy, or
+    ``None`` for callers without one (legacy graphs, standalone nodes — no
+    budget is enforced then, preserving current behavior). When present it
+    enforces, *in flight*:
+
+    - ``max_tool_calls_per_attempt`` — a callback guard raises
+      ``ToolBudgetExceededError`` before the tool that would exceed the cap
+      ever executes; on exhaustion the agent is re-invoked once on the same
+      checkpointer thread with a strict finalize instruction (no more tools),
+      so the step succeeds with the information already retrieved. The error
+      escapes ``agent.ainvoke`` — and the bounded attempt loop decides whether
+      to retry (fresh per-attempt budget) or contain the step — only if that
+      finalize pass itself requests tools;
+    - ``react_recursion_limit`` — merged into the inner invocation config, so
+      the ReAct model/tool loop is bounded even when no tool is called.
     """
+    cap = policy.get("max_tool_calls_per_attempt") if policy else None
+    budget = _ToolBudgetGuard(cap) if cap is not None else None
+    invoke_config: dict = dict(config) if config else {}
+    if policy:
+        recursion_limit = policy.get("react_recursion_limit")
+        if recursion_limit is not None:
+            invoke_config["recursion_limit"] = recursion_limit
+    saver = None
+    parent_handlers: list = []
+    if budget is not None:
+        # The graph runtime stashes its own callback manager under the
+        # config's ``callbacks`` key — never splat it into a list. Merge its
+        # handlers with the budget guard so the inner invocation keeps the
+        # parent run's callbacks.
+        existing = invoke_config.get("callbacks")
+        if isinstance(existing, list):
+            handlers = existing
+        elif isinstance(existing, (CallbackManager, AsyncCallbackManager)):
+            handlers = existing.handlers
+        else:
+            handlers = []
+        parent_handlers = handlers
+        invoke_config["callbacks"] = [*handlers, budget]
+        # The checkpointer enables the budget-exhaustion finalize pass below:
+        # it must re-invoke the SAME thread, so a thread_id is required —
+        # setdefault, never overwrite a caller-provided one. Each attempt
+        # builds a fresh saver, so threads never collide across retries or
+        # parallel workers.
+        saver = InMemorySaver()
+        configurable = invoke_config.setdefault("configurable", {})
+        configurable.setdefault("thread_id", f"subagent-step-{step['step']}")
     agent_name   = step["agent"]
     step_num     = step["step"]
     llm          = llm or create_llm(**_llm_kwargs(AGENT_CONFIG.get(agent_name, {}).get("llm", {}), agent_name))
@@ -142,16 +301,44 @@ async def run_sub_agent_async(
             model=llm,
             tools=all_tools,
             prompt=SystemMessage(content=system_prompt),
+            checkpointer=saver,
         )
-        result = await agent.ainvoke({"messages": [("user", step["subtask"])]}, config=config)
     else:
         agent = create_react_agent(
                 model=llm,
                 tools=native_tools,
                 prompt=SystemMessage(content=system_prompt),
+                checkpointer=saver,
             )
-        result = await agent.ainvoke({"messages": [("user", step["subtask"])]}, config=config)
 
+    budget_finalized = False
+    try:
+        # ``subtask`` here carries the verifier feedback block when present
+        # (F2) — the raw step text would silently drop it.
+        result = await agent.ainvoke(
+            {"messages": [("user", subtask)]}, config=invoke_config or None
+        )
+    except ToolBudgetExceededError:
+        log_event(
+            "tool_budget_exhausted",
+            step_num=step_num,
+            agent_name=agent_name,
+            tool_calls=budget.count if budget is not None else None,
+            max_tool_calls_per_attempt=cap,
+        )
+        if saver is None:  # defensive: a guard is always paired with a saver
+            raise
+        result = await _finalize_after_budget_exhaustion(
+            agent, saver, invoke_config, parent_handlers,
+            step_num, agent_name, subtask, cap,
+        )
+        budget_finalized = True
+        log_event(
+            "tool_budget_finalized",
+            step_num=step_num,
+            agent_name=agent_name,
+            tool_calls=budget.count if budget is not None else None,
+        )
 
     tools_used = [
         call
@@ -171,7 +358,12 @@ async def run_sub_agent_async(
     stats = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "tool_calls": len(tools_used),
+        # With an in-flight budget guard the counter is the authoritative
+        # count of requested tool calls; without one, count from the messages.
+        "tool_calls": budget.count if budget is not None else len(tools_used),
+        # True when the attempt hit the budget and finished via the finalize
+        # pass instead of a normal tool-less completion.
+        "budget_exhausted": budget_finalized,
     }
 
     log_event("run_sub_agent_end", step_num=step_num, agent_name=agent_name,
@@ -315,10 +507,16 @@ def make_sub_agent_node(run_step=None, llm=None):
         t0 = time.monotonic()
         try:
             step_runner = _bind_config(run_step, takes_config, config)
+            # Production runner: thread the effort policy (tool budget +
+            # recursion limit). Legacy payloads carry none — behavior unchanged.
+            if takes_config:
+                step_runner = partial(step_runner, policy=state.get("execution_policy"))
             step_num, output, inner_stats = await run_step_with_attempts(
                 step,
                 partial(_run_guarded_attempt, step, step_runner, results, current_datetime),
-                get_max_attempts(step["agent"]),
+                effective_worker_attempts(
+                    state.get("execution_policy"), get_max_attempts(step["agent"])
+                ),
                 graph_name="sequential",
             )
             stats = {
@@ -336,8 +534,10 @@ def make_sub_agent_node(run_step=None, llm=None):
             # step failures — they escape to the caller (Slice 3).
             raise
         except Exception as e:
+            import traceback
+            error_string = traceback.format_exc()
             duration = round(time.monotonic() - t0, 3)
-            log_event("sub_agent_step_failed", step=state["step"]["step"], error=str(e))
+            log_event("sub_agent_step_failed", step=state["step"]["step"], error=error_string)
             return {
                 "results": {state["step"]["step"]: f"[STEP FAILED] {e}"},
                 "failed_steps": [state["step"]["step"]],
@@ -380,10 +580,16 @@ def make_parallel_sub_agent_node(run_step=None, llm=None):
         t0 = time.monotonic()
         try:
             step_runner = _bind_config(run_step, takes_config, config)
+            # Production runner: thread the effort policy (tool budget +
+            # recursion limit). Legacy payloads carry none — behavior unchanged.
+            if takes_config:
+                step_runner = partial(step_runner, policy=state.get("execution_policy"))
             step_num, output, inner_stats = await run_step_with_attempts(
                 step,
                 partial(step_runner, step, state["results"], state.get("current_datetime", "")),
-                get_max_attempts(step["agent"]),
+                effective_worker_attempts(
+                    state.get("execution_policy"), get_max_attempts(step["agent"])
+                ),
                 graph_name="parallel",
             )
             stats = {

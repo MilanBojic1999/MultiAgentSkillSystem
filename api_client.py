@@ -46,6 +46,9 @@ DEFAULT_URL = "http://localhost:8999"
 POLL_INTERVAL = 2  # seconds between async status checks
 DEFAULT_MAX_FILE_CHARS = 50_000  # ~12.5k tokens by the 4-char/token heuristic
 TOKEN_ESTIMATE_CHARS = 4         # rough chars-per-token for English text
+# Effort presets mirrored from execution_policy.py so this stdlib-only client
+# stays import-free; the server normalizes/validates authoritatively.
+EFFORT_CHOICES = ["instant", "light", "standard", "thorough", "unlimited"]
 
 
 # ---------------------------------------------------------------------------
@@ -158,21 +161,17 @@ def list_graphs(base_url: str) -> bool:
     return True
 
 
-def run_task(task: str, base_url: str, files: list[dict] | None = None, graph: Optional[str] = None) -> Optional[str]:
+def run_task(task: str, base_url: str, files: list[dict] | None = None, graph: Optional[str] = None,
+             effort: Optional[str] = None) -> Optional[str]:
     """Run a task synchronously and return the final output."""
     print(f"🚀 Running task:\n   {task}\n")
+    if effort:
+        print(f"⚡ Effort: {effort}")
     if files:
         print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run ...")
 
-    body: dict[str, Any] = {"task": task}
-    if files:
-        body["files"] = files
-    
-    if graph:
-        body["graph"] = graph
-
-    result = _request("POST", "/run", base_url, body=body)
+    result = _request("POST", "/run", base_url, body=_run_body(task, files, graph, effort))
 
     if result.get("error"):
         print(f"❌ Error: {result.get('detail', 'Unknown error')}")
@@ -187,24 +186,31 @@ def run_task(task: str, base_url: str, files: list[dict] | None = None, graph: O
     return result.get("final_output", "")
 
 
-def _run_body(task: str, files: Optional[list[dict]], graph: Optional[str]) -> dict[str, Any]:
-    """Request body for /run and /run-async; omit `graph` to take the server default."""
+def _run_body(task: str, files: Optional[list[dict]], graph: Optional[str],
+              effort: Optional[str] = None) -> dict[str, Any]:
+    """Request body for /run and /run-async; omit `graph`/`effort` to take the
+    server defaults (default graph; ``unlimited`` effort)."""
     body: dict[str, Any] = {"task": task}
     if graph:
         body["graph"] = graph
+    if effort:
+        body["effort"] = effort
     if files:
         body["files"] = files
     return body
 
 
-def run_task_async(task: str, base_url: str, files: Optional[list[dict]], graph: Optional[str] = None) -> Optional[str]:
+def run_task_async(task: str, base_url: str, files: Optional[list[dict]], graph: Optional[str] = None,
+                   effort: Optional[str] = None) -> Optional[str]:
     """Start an async task and poll until completion."""
     print(f"🚀 Starting async task:\n   {task}\n")
+    if effort:
+        print(f"⚡ Effort: {effort}")
     if files:
         print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run-async ...")
 
-    start_result = _request("POST", "/run-async", base_url, body=_run_body(task, files, graph))
+    start_result = _request("POST", "/run-async", base_url, body=_run_body(task, files, graph, effort))
     if start_result.get("error"):
         print(f"❌ Error starting task: {start_result.get('detail', 'Unknown error')}")
         return None
@@ -486,6 +492,13 @@ Examples:
         help="Which graph the server should run (default: the server's own default)",
     )
     parser.add_argument(
+        "--effort",
+        type=str.lower,
+        choices=EFFORT_CHOICES,
+        help="Execution effort preset for this run (case-insensitive). "
+             "Omit to let the server resolve 'unlimited'.",
+    )
+    parser.add_argument(
         "--list-graphs",
         action="store_true",
         help="List the graphs available on the server and exit",
@@ -539,9 +552,9 @@ Examples:
     if args.stream_mode:
         output = run_task_stream(args.task, args.url, files)
     elif args.async_mode:
-        output = run_task_async(args.task, args.url, files)
+        output = run_task_async(args.task, args.url, files, args.graph, args.effort)
     else:
-        output = run_task(args.task, args.url, files, args.graph)
+        output = run_task(args.task, args.url, files, args.graph, args.effort)
 
     if output is None:
         sys.exit(1)

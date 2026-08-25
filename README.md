@@ -220,7 +220,92 @@ docker compose down
 2. Each step is dispatched to the best **specialist sub-agent** (mathematician, researcher, writer)
 3. Independent steps run in parallel via LangGraph's `Send` API
 4. Sub-agents execute using their assigned **tools** and activated **skills**
-5. The **Assembler** merges all step outputs into the final result
+5. The **Verifier** checks every step's output and routes corrections (step retry / replan)
+6. The **Writer** synthesizes all results plus verifier notes into one artifact
+
+### Effort presets (effort slider)
+
+Every run takes an optional **effort preset** — a per-run execution-policy
+contract, never a persisted preference:
+
+```text
+Instant → Light → Standard → Thorough → Unlimited
+```
+
+| Preset | Planner | Plan steps | Worker attempts | Tool calls / attempt | Step-verif. retries | Full replans | Verifier attempts | Timeout |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `instant`  | no — one writer call | 1 (synthetic) | 1 | 0 | 0 | 0 | 0 | 2 min |
+| `light`    | yes | 3  | 1 | 2  | 0 | 0 | 1 | 5 min |
+| `standard` | yes | 8  | 2 | 5  | 1 | 1 | 1 | 15 min |
+| `thorough` | yes | 16 | 3 | 10 | 2 | 2 | 2 | 30 min |
+| `unlimited` | yes | 64 (hard ceiling) | per-agent config (≤10) | 100 (ceiling) | 2 | 2 | per-agent config (≤10) | 60 min |
+
+Guarantees and semantics:
+
+- **`instant`** bypasses planning and makes **exactly one writer-worker
+  invocation** with the original task — zero orchestrator calls, zero tools,
+  zero verifier/replan passes. Attached files still ground the writer. The
+  result is the single answer, one stats row, `completed`/`partial` as usual.
+- **`light`/`standard`/`thorough`** always include a real verification and
+  correction loop. Worker retries, step-verification retries and full replans
+  are **separate budgets**.
+- **`unlimited`** means compatibility with the historical high-effort
+  behavior — **not** literal unbounded execution. Every preset keeps finite
+  hard safety ceilings (64 plan steps, the validated 1–10 worker-attempt cap,
+  bounded ReAct recursion, a dispatch-wave counter and a wall-clock deadline);
+  a pathological run stops with a structured `safety_stop_reason` and a
+  `partial` result instead of looping.
+- Effective worker attempts are `min(agent_config.max_attempts,
+  policy.max_worker_attempts)` — static agent configuration stays an upper
+  limit, and effort never touches model/temperature/`max_tokens` settings.
+- When a worker exceeds its per-attempt tool budget, the agent is told to
+  finalize with the information it already retrieved (a strict finalize pass
+  with **no further tool calls**) instead of failing the step — the step fails
+  only if the agent still requests tools on that finalize pass.
+- When the verification budget is exhausted, the writer still synthesizes the
+  best available result with an explicit `partial` status and a
+  "Partial result warning" block (verifier notes included) — never a loop,
+  never a 500 for a usable result.
+
+The **default graph is `yotta`** (planner → workers → verifier → writer);
+`parallel` and `sequential` remain explicitly selectable compatibility
+topologies. They do not verify, so they accept only `unlimited` (legacy
+behavior) and `instant` (always executed on yotta) — `light`/`standard`/
+`thorough` on a legacy graph are rejected with a 422.
+
+CLI examples:
+
+```bash
+# Direct CLI (case-insensitive preset names; default unlimited)
+python run_pipeline.py --graph yotta --effort instant "Summarize this task"
+python run_pipeline.py --graph yotta --effort standard "Research and explain X"
+python run_pipeline.py --graph yotta --effort thorough "Research and explain X"
+
+# HTTP client — omission lets the server resolve unlimited
+python api_client.py --graph yotta --effort thorough "Research and explain X"
+```
+
+API request example:
+
+```json
+POST /run
+{"task": "Research and explain X", "effort": "standard"}
+
+{
+  "status": "completed",
+  "final_output": "...",
+  "task_id": "ab12cd34ef56",
+  "effort": "standard",
+  "verification": "PASSED WITH NOTES",
+  "verification_exhausted": false,
+  "replan_count": 1,
+  "safety_stop_reason": null,
+  ...
+}
+```
+
+`/run-async` + `GET /status/{task_id}` preserve the same metadata. All new
+response fields have safe defaults, so old clients keep working.
 
 ## Running the tests
 

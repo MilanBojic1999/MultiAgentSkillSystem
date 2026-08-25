@@ -107,7 +107,8 @@ def test_worker_node_passes_run_config_to_the_real_runner(monkeypatch, factory_n
 
     seen = {}
 
-    async def spy_run(step, results, current_datetime="", llm=None, config=None):
+    async def spy_run(step, results, current_datetime="", llm=None, config=None,
+                      policy=None):
         seen["config"] = config
         return step["step"], f"out-{step['step']}", {
             "input_tokens": 0, "output_tokens": 0, "tool_calls": 0,
@@ -118,6 +119,6 @@ def test_worker_node_passes_run_config_to_the_real_runner(monkeypatch, factory_n
     cfg = {"configurable": {"task_id": "task-42"}}
 
     out = asyncio.run(node.afunc(STEP, config=cfg))
-
+    print(seen)
     assert seen["config"] is cfg, "the run config was not threaded to the sub-agent"
     assert out["results"] == {1: "out-1"}

@@ -1,5 +1,5 @@
 """Yotta pipeline: Send fan-out with per-step verification, bounded retries,
-replan, and LLM writer synthesis.
+replan, and LLM writer synthesis — the effort-aware default topology.
 
 Registered automatically as the graph named ``"yotta"`` (see
 ``graphs/__init__.py``) — the module name minus its ``_graph`` suffix.
@@ -10,6 +10,12 @@ Capabilities (moved from the old root ``yotta_graph.py``):
 - per-step verification with retry / replan routing (``verify_node``);
 - LLM writer synthesis, including the direct (empty-plan) route where yotta
   search results were already sufficient;
+- **effort slider** (``execution_policy``): an entry router resolves the
+  per-run policy from config/state and stamps it; every cap below (plan
+  steps, worker/verifier attempts, step retries, replans, dispatch waves,
+  wall-clock deadline) is policy-derived. ``instant`` is a graph route that
+  guarantees exactly one writer-worker invocation with zero tools, zero
+  verifier and zero replan passes;
 - ``citatitaion_node`` — Phase 4 placeholder, defined but not wired.
 """
 
@@ -25,14 +31,23 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 
 from agents.agent_states import YottaState, RESULTS_RESET
-from agents.orchestrator_node import make_orchestrator_agent, _MAX_REPLANS
+from agents.orchestrator_node import make_orchestrator_agent
 from agents.sub_agents_nodes import (
     _bind_config,
     _resolve_run_step,
     run_step_with_attempts,
     run_sub_agent_async,  # module-global name — tests monkeypatch this
 )
+from assemble_node import derive_status
 from config_loader import get_max_attempts
+from execution_policy import (
+    deadline_exceeded,
+    effective_verification_attempts,
+    effective_worker_attempts,
+    policy_from_config,
+    policy_from_state,
+    stamp_deadline,
+)
 from graphs.parallel_pipeline_graph import scheduler_node
 from pipeline_entry import render_files_block
 from utils.json_utils import extract_json
@@ -40,14 +55,166 @@ from utils.logger import log_event
 
 GRAPH_DESCRIPTION = (
     "Parallel fan-out with per-step verification, bounded retries, "
-    "replan, and LLM writer synthesis"
+    "replan, and LLM writer synthesis (effort-aware default)"
 )
 
 
+# ---------------------------------------------------------------------------
+# Effort policy — entry routing and dispatch accounting
+# ---------------------------------------------------------------------------
+
+def effort_router(state: dict, config: RunnableConfig = None) -> dict:
+    """Graph entry: resolve and stamp the per-run effort policy into state.
+
+    The API/CLI boundary already resolved the policy into
+    ``config["configurable"]``; when present it wins (it is the transport
+    authority). Otherwise the policy comes from hand-seeded state, or the
+    ``unlimited`` default — exactly what plain old callers got before the
+    slider existed. A policy without a deadline (hand-built test state) is
+    stamped here so every real run has wall-clock protection.
+
+    For ``instant`` the one synthetic writer step becomes the whole plan —
+    planning, verification, retries and replans are all skipped by routing.
+    """
+    configurable = (config or {}).get("configurable") or {}
+    if configurable.get("execution_policy") is not None or configurable.get("effort") is not None:
+        policy = policy_from_config(config)
+    else:
+        policy = policy_from_state(state)
+        log_event("execution_policy_resolved", effort=policy.preset,
+                  execution_policy=policy.as_dict())
+    if policy.deadline is None:
+        policy = stamp_deadline(policy)
+
+    updates: dict = {
+        "effort": policy.preset,
+        "execution_policy": policy.as_dict(),
+        "dispatch_count": state.get("dispatch_count", 0),
+    }
+    if policy.instant_writer_only:
+        log_event("instant_route_selected", effort=policy.preset)
+        # Normalize never-written channels: a fresh run has files/results as
+        # None, and the synthetic step + worker payload need real dicts.
+        files = state.get("files") or {}
+        updates["results"] = state.get("results") or {}
+        updates["plan"] = [_instant_writer_step(state.get("task", ""), files)]
+        # Instant skips the orchestrator and verifier, so the counters those
+        # nodes own on normal routes are initialized here instead.
+        updates["replan_count"] = state.get("replan_count", 0)
+        updates["verification_attempts"] = state.get("verification_attempts", 0)
+    return updates
+
+
+def _instant_writer_step(task: str, files: dict[str, str]) -> dict:
+    """The one synthetic step of an Instant run: the original task, assigned
+    to the configured writer agent, with no tools (the policy caps tool calls
+    at zero and the writer owns none anyway). Any attached documents ride
+    along so the writer still gets file grounding."""
+    return {
+        "step": 1,
+        "subtask": task,
+        "agent": "writer",
+        "skills_needed": ["answer-writer"],
+        "depends_on": [],
+        "files": sorted(files.keys()),
+    }
+
+
+def route_from_entry(state: dict):
+    """After the entry router: instant dispatches its single writer step
+    directly to the worker machinery; everything else plans normally."""
+    policy = policy_from_state(state)
+    if policy.instant_writer_only:
+        return [
+            Send("sub_agent", {
+                "step": state["plan"][0],
+                "results": state.get("results") or {},
+                "current_datetime": state.get("current_datetime", ""),
+                "step_verifications": {},
+                "streaming": state.get("streaming", False),
+                "files": state.get("files") or {},
+                "effort": policy.preset,
+                "execution_policy": policy.as_dict(),
+            })
+        ]
+    return "orchestrator"
+
+
+def after_sub_agent(state: dict) -> str:
+    """After a worker task: instant finalizes its single answer directly;
+    normal runs re-enter the scheduler barrier."""
+    policy = policy_from_state(state)
+    if policy.instant_writer_only:
+        return "instant_finalize"
+    return "scheduler"
+
+
+def instant_finalize(state: dict) -> dict:
+    """Instant terminal node: the single writer-worker output IS the answer.
+
+    Same presentation semantics as the assemble nodes: a contained worker
+    failure surfaces as ``partial`` with the failure marker in the output;
+    cancellation already escaped at the worker.
+    """
+    results = state.get("results", {})
+    output = results.get(1, "")
+    status = derive_status(
+        state.get("failed_steps", []), state.get("step_stats", [])
+    )
+    return {"final_output": output, "status": status}
+
+
+def _wave_or_route(state: dict) -> str:
+    """fan_out_router's decision as a node name: a ``Send`` list means a
+    worker dispatch wave ("sub_agent"). Pure — safe to call twice."""
+    route = fan_out_router(state)
+    return "sub_agent" if isinstance(route, list) else route
+
+
+def _yotta_scheduler(state: dict) -> dict:
+    """Scheduler barrier plus effort dispatch/deadline accounting.
+
+    Runs the shared skip-marker barrier, then decides — on the projected
+    state the router will actually see — whether the next move is a worker
+    dispatch wave. Only dispatch waves consume the ``max_graph_dispatches``
+    and wall-clock deadline budgets, so a pathological replan/retry cycle
+    always terminates with a structured ``safety_stop_reason`` (never an
+    unbounded loop) while a legitimate run's verification passes never
+    consume wave budget.
+    """
+    updates = scheduler_node(state)
+
+    projected_results = dict(state.get("results", {}))
+    projected_results.update(updates.get("results") or {})
+    projected = {**state, **updates, "results": projected_results}
+
+    dispatch_count = state.get("dispatch_count", 0)
+    safety = state.get("safety_stop_reason", "") or ""
+
+    if _wave_or_route(projected) == "sub_agent":
+        dispatch_count += 1
+        policy = policy_from_state(state)
+        if dispatch_count > policy.max_graph_dispatches:
+            safety = (
+                f"max_graph_dispatches={policy.max_graph_dispatches} exceeded"
+            )
+        elif deadline_exceeded(policy):
+            safety = "wall-clock deadline exceeded"
+        if safety:
+            log_event("effort_safety_stop", reason=safety,
+                      effort=policy.preset, dispatch_count=dispatch_count)
+
+    out = dict(updates)
+    out["dispatch_count"] = dispatch_count
+    if safety:
+        out["safety_stop_reason"] = safety
+    return out
+
+
 def _latest_retry_note(step_verifications: dict[int, dict], step_num: int) -> str:
-    """Extract the most recent ``[Retry k/2] ...`` note for a step, so a
-    retried worker sees only the latest actionable feedback, not the whole
-    accumulated history (fixes F2).
+    """Extract the most recent ``[Retry k/N] ...`` note for a step (N is the
+    policy-derived retry cap), so a retried worker sees only the latest
+    actionable feedback, not the whole accumulated history (fixes F2).
     """
     entry = step_verifications.get(step_num)
     if not entry:
@@ -67,8 +234,12 @@ def fan_out_router(state: dict):
     Mirrors ``graphs.parallel_pipeline_graph.fan_out_router`` plus the yotta
     routes:
 
+    - an effort **safety stop** (dispatch ceiling or deadline exceeded)
+      → ``"writer"`` — finalize the best result available instead of
+      dispatching another wave;
     - empty plan → ``"writer"`` (direct route — yotta search results were
-      already sufficient, no sub-agents needed);
+      already sufficient, no sub-agents needed; distinct from Instant, which
+      never reaches this router);
     - ``ready`` = steps not in results with satisfied deps **plus**
       ``pending_retries`` — a retried step is dispatched even though its old
       result is still in ``results`` (intentional re-execution, overwritten
@@ -77,6 +248,9 @@ def fan_out_router(state: dict):
     - deadlock → ``RuntimeError`` naming every blocked step (same detail
       message as the parallel graph).
     """
+    if state.get("safety_stop_reason"):
+        return "writer"
+
     plan = state["plan"]
     results = state.get("results", {})
     current_datetime = state.get("current_datetime", "")
@@ -103,7 +277,10 @@ def fan_out_router(state: dict):
         # (F2) — feedback is NOT the payload itself (see the worker factory).
         # ``files`` (the run's attached documents) rides along too: a Send
         # payload is the ONLY state a worker sees, so without it a step the
-        # orchestrator assigned documents to would receive filenames but no text.
+        # orchestrator assigned documents to would receive filenames but no
+        # text. The effort policy rides along for the same reason — budget
+        # enforcement must mean the same thing in every worker wave, retry
+        # pass and replan execution.
         return [
             Send("sub_agent", {
                 "step": s,
@@ -112,6 +289,8 @@ def fan_out_router(state: dict):
                 "step_verifications": state.get("step_verifications", {}),
                 "streaming": state.get("streaming", False),
                 "files": state.get("files", {}),
+                "effort": state.get("effort", ""),
+                "execution_policy": state.get("execution_policy", {}),
             })
             for s in ready
         ]
@@ -142,18 +321,24 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
     Mirrors ``make_parallel_sub_agent_node`` — dual-mode ``RunnableLambda``
     (sync body = ``asyncio.run(async body)``), ``_resolve_run_step`` injection,
     the bounded ``run_step_with_attempts`` loop
-    (``get_max_attempts(step["agent"])``, ``graph_name="yotta"``), identical
+    (``graph_name="yotta"``), identical
     stats/containment returns (``results`` / ``step_stats`` / ``failed_steps``)
     — with two differences:
 
     - **no "already done" guard** — a retried step is dispatched even though
       its old result is still in ``results`` (intentional re-execution);
     - the **production runner** reads ``step_verifications`` from its input to
-      bind ``feedback=`` (F2 — the latest ``[Retry k/2]`` note) plus
-      ``streaming=`` and ``files=`` (the run's attached documents, keyed by
-      filename — the runner injects the ones this step was assigned) via
-      ``partial``; injected 3-arg test stubs keep their signature and never
-      receive any of those keywords.
+      bind ``feedback=`` (F2 — the latest ``[Retry k/N]`` note) plus
+      ``streaming=``, ``files=`` (the run's attached documents, keyed by
+      filename — the runner injects the ones this step was assigned) and the
+      run's effort ``policy`` via ``partial``; injected 3-arg test stubs keep
+      their signature and never receive any of those keywords.
+
+    The attempt cap is policy-aware: the effective count is
+    ``min(agent-configured max_attempts, policy.max_worker_attempts)`` — the
+    Send payload carries the policy, and a payload without one (legacy
+    callers, older tests) resolves to ``unlimited``, preserving today's
+    per-agent behavior exactly.
     """
     run_step, takes_config = _resolve_run_step(run_step, llm)
 
@@ -163,7 +348,8 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
         try:
             step_runner = _bind_config(run_step, takes_config, config)
             if takes_config:
-                # production runner — bind verifier feedback + streaming
+                # production runner — bind verifier feedback + streaming +
+                # the run's effort policy (tool budget, recursion limit)
                 feedback = _latest_retry_note(
                     state.get("step_verifications", {}), step["step"]
                 )
@@ -175,6 +361,7 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
                     streaming=state.get("streaming", False),
                     files=state.get("files", {}),
                     feedback=feedback,
+                    policy=state.get("execution_policy"),
                 )
             else:
                 run = partial(
@@ -186,7 +373,9 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
             step_num, output, inner_stats = await run_step_with_attempts(
                 step,
                 run,
-                get_max_attempts(step["agent"]),
+                effective_worker_attempts(
+                    state.get("execution_policy"), get_max_attempts(step["agent"])
+                ),
                 graph_name="yotta",
             )
             stats = {
@@ -210,6 +399,8 @@ def make_yotta_sub_agent_node(run_step=None, llm=None):
             # step failures — they escape to the caller (Slice 3).
             raise
         except Exception as e:
+            # import traceback
+            # traceback.print_exc()
             duration = round(time.monotonic() - t0, 3)
             log_event("sub_agent_step_failed", step=step["step"], error=str(e))
             return {
@@ -277,11 +468,12 @@ def _match_subquery_to_step(subquery: str, plan: list[dict]) -> int | None:
     return None
 
 
-def _build_verifier_context(step_verifications: dict[int, dict]) -> str:
+def _build_verifier_context(step_verifications: dict[int, dict],
+                            max_step_verification_retries: int) -> str:
     """Build a context block showing previous verification results per step.
 
-    The verifier uses this to respect the retry cap defined in SKILL.md
-    and to avoid repeating notes it already raised in a prior pass.
+    The verifier uses this to respect the retry cap (policy-derived) and to
+    avoid repeating notes it already raised in a prior pass.
     """
     if not step_verifications:
         return ""
@@ -294,7 +486,7 @@ def _build_verifier_context(step_verifications: dict[int, dict]) -> str:
         notes_short = (notes[:120] + "..") if len(notes) > 120 else notes
         lines.append(
             f"- Step {sid}: {verdict}"
-            + (f" (retries used: {retries}/2)" if retries > 0 else "")
+            + (f" (retries used: {retries}/{max_step_verification_retries})" if retries > 0 else "")
             + f" — {notes_short}"
         )
     return "\n".join(lines)
@@ -313,11 +505,18 @@ async def verify_node(state: dict) -> dict:
     (their old result stays in ``results`` — overwritten on re-execution);
     on ``"replan"`` results are wiped via the ``RESULTS_RESET`` sentinel so
     the orchestrator's new plan replaces the research wholesale.
+
+    Effort policy: the verifier's LLM call attempts, the per-step retry cap
+    and the replan cap all come from the policy. When the replan budget is
+    spent, ``verification_exhausted`` is set deterministically (no LLM
+    involved) so the writer produces an explicitly partial result instead of
+    looping or raising a transport error for an otherwise usable result.
     """
     plan = state.get("plan", [])
     results = state.get("results", {})
     replan_count = state.get("replan_count", 0)
     step_verifications = state.get("step_verifications", {})
+    policy = policy_from_state(state)
 
     # Build a synthetic step that describes the verification task
     plan_summary = "\n".join(
@@ -325,8 +524,10 @@ async def verify_node(state: dict) -> dict:
         for s in plan
     )
 
-    log_event("verify_node_start", plan_steps=[s["step"] for s in plan],
-              result_steps=sorted(k for k in results.keys() if isinstance(k, int)))
+    log_event("verification_started", plan_steps=[s["step"] for s in plan],
+              result_steps=sorted(k for k in results.keys() if isinstance(k, int)),
+              verification_attempts=state.get("verification_attempts", 0) + 1,
+              effort=policy.preset)
 
     results_summary = "\n\n".join(
         f"--- Step {step_num} output ---\n{output}"
@@ -342,7 +543,9 @@ async def verify_node(state: dict) -> dict:
             "In your output, reference each result by its numeric `step` "
             "(the N in `--- Step N output ---`) — not by a paraphrase of the subquery.\n\n"
             f"## Original plan\n{plan_summary}\n\n"
-            + _build_verifier_context(step_verifications)
+            + _build_verifier_context(
+                step_verifications, policy.max_step_verification_retries
+            )
             + f"\n\n## Sub-agent results\n{results_summary}\n\n"
         ),
         "skills_needed": ["information-verifier"],
@@ -351,6 +554,8 @@ async def verify_node(state: dict) -> dict:
 
     # Bounded attempt loop (Slice 3): the verifier's single LLM call runs
     # through the same helper as the workers — no graph-level RetryPolicy.
+    # The attempt cap is the policy's verification budget intersected with
+    # the static config (min()), so ``unlimited`` keeps today's behavior.
     _, output, _ = await run_step_with_attempts(
         verify_step,
         partial(
@@ -359,8 +564,9 @@ async def verify_node(state: dict) -> dict:
             results,
             state.get("current_datetime", ""),
             streaming=state.get("streaming", False),
+            policy=state.get("execution_policy"),
         ),
-        get_max_attempts("verifier"),
+        effective_verification_attempts(policy, get_max_attempts("verifier")),
         graph_name="yotta",
     )
 
@@ -382,6 +588,11 @@ async def verify_node(state: dict) -> dict:
         # verdicts (the SKILL.md spec) with a single-object fallback.
         parsed = extract_json(output)
         if not isinstance(parsed, list):
+            print(type(parsed))
+            print('-'*50)
+            print(parsed)
+            print('-'*50)
+
             parsed = [parsed]
         log_event("verify_node_parsed", result_count=len(results),
                   verdict_count=len(parsed))
@@ -452,12 +663,15 @@ async def verify_node(state: dict) -> dict:
                     any_replan = True
                     acc_notes.append(f"[Replan] {notes}")
                 else:
-                    # ---- RETRY — re-run the worker (cap at 2) ----------------
-                    if current_retries < 2:
+                    # ---- RETRY — re-run the worker, bounded by the policy ----
+                    if current_retries < policy.max_step_verification_retries:
                         any_retry = True
                         steps_to_remove.add(sid)   # re-dispatched via pending_retries
                         current_retries += 1
-                        acc_notes.append(f"[Retry {current_retries}/2] {notes}")
+                        acc_notes.append(
+                            f"[Retry {current_retries}/"
+                            f"{policy.max_step_verification_retries}] {notes}"
+                        )
                     else:
                         # At retry cap: treat as PASSED WITH NOTES
                         verdict = "PASSED WITH NOTES"
@@ -545,6 +759,26 @@ async def verify_node(state: dict) -> dict:
     new_replan_count = replan_count
     if route == "replan":
         new_replan_count = replan_count + 1
+        if new_replan_count <= policy.max_replans:
+            log_event("replan_scheduled", replan_count=new_replan_count,
+                      max_replans=policy.max_replans, effort=policy.preset)
+    if route == "retry":
+        log_event("step_retry_scheduled", steps=sorted(steps_to_remove),
+                  effort=policy.preset)
+
+    # Deterministic verification exhaustion: when the replan budget is spent,
+    # ``after_verify`` routes to the writer — and this flag (no LLM involved)
+    # makes that result explicitly partial instead of pretending verification
+    # succeeded. Never an infinite loop, never a 500 for a usable result.
+    verification_exhausted = bool(state.get("verification_exhausted"))
+    if route == "replan" and new_replan_count > policy.max_replans:
+        verification_exhausted = True
+        log_event("replan_exhausted", replan_count=new_replan_count,
+                  max_replans=policy.max_replans, effort=policy.preset)
+
+    log_event("verification_finished", verdict=aggregate_verdict, route=route,
+              effort=policy.preset,
+              verification_exhausted=verification_exhausted)
 
     # ---- routing payload --------------------------------------------------
     # retry:  re-dispatch the failed steps via pending_retries (their old
@@ -565,6 +799,8 @@ async def verify_node(state: dict) -> dict:
         "replan_count": new_replan_count,
         "step_verifications": accumulated,
         "verification_route": route,
+        "verification_attempts": state.get("verification_attempts", 0) + 1,
+        "verification_exhausted": verification_exhausted,
         **updates,
     }
 
@@ -573,16 +809,25 @@ def after_verify(state: dict) -> str:
     """Thin reader: route purely on ``verification_route``, computed once in
     ``verify_node``. No note re-parsing here (fixes F5).
 
-    route == "retry"                          → scheduler (never gated by replan cap — fixes F4)
-    route == "replan" and replan_count < cap  → orchestrator
-    otherwise                                  → writer (proceed, or replan cap exhausted)
+    safety stop                             → writer (finalize best result)
+    route == "retry"                        → scheduler (never gated by the
+                                               replan cap — fixes F4)
+    route == "replan" and replan <= cap     → orchestrator
+    otherwise                               → writer (proceed, replan cap
+                                               exhausted, or safety stop)
     """
+    if state.get("safety_stop_reason"):
+        return "writer"
     route = state.get("verification_route", "proceed")
     replan_count = state.get("replan_count", 0)
 
     if route == "retry":
         return "scheduler"
-    if route == "replan" and replan_count < _MAX_REPLANS:
+    # ``max_replans`` counts actual replan passes: replan_count is already the
+    # number of replan requests made, so pass N (1-based) is allowed while
+    # N <= max. Unlimited (2) reproduces the historical three-planner-pass
+    # ceiling exactly.
+    if route == "replan" and replan_count <= policy_from_state(state).max_replans:
         return "orchestrator"
     return "writer"
 
@@ -600,6 +845,15 @@ async def writer_node(state: dict) -> dict:
        ``plan`` is ``[]``, ``results`` is ``{}``, ``search_results`` has the
        findings. If files were attached, this route sees their raw content
        directly (there are no document-reader steps to have read them).
+
+    (Instant never reaches this node — its single writer-worker output is the
+    final answer and ``instant_finalize`` emits it directly, keeping the
+    guarantee of exactly one writer invocation.)
+
+    Effort policy: the attempt cap is policy-derived; a safety stop or
+    exhausted verification budget is surfaced to the reader as an explicit
+    human-readable warning (never raw hidden state, prompts or credentials)
+    and the run's status becomes ``partial``.
     """
     results = state.get("results", {})
     verification_notes = state.get("verification_notes", "")
@@ -607,6 +861,9 @@ async def writer_node(state: dict) -> dict:
     task = state.get("task", "")
     search_results = state.get("search_results", "")
     files = state.get("files", {})
+    safety_stop_reason = state.get("safety_stop_reason", "") or ""
+    verification_exhausted = bool(state.get("verification_exhausted"))
+    policy = policy_from_state(state)
 
     log_event("writer_node_start", plan_steps=[s["step"] for s in plan],
               result_steps=sorted(k for k in results.keys() if isinstance(k, int)))
@@ -658,6 +915,25 @@ async def writer_node(state: dict) -> dict:
             f"## Verifier notes (incorporate these)\n{verification_notes}"
         )
 
+    # Effort warnings: the writer must tell the reader when the result is
+    # partial *because of a budget decision*, in plain words — never raw
+    # hidden state.
+    partial_reasons: list[str] = []
+    if safety_stop_reason:
+        partial_reasons.append(
+            f"Execution stopped by the selected effort budget: "
+            f"{safety_stop_reason}. The document below is the best result "
+            f"available within that budget and is partial."
+        )
+    if verification_exhausted:
+        partial_reasons.append(
+            "The verification budget was exhausted before every finding "
+            "could be fully confirmed. The document below incorporates all "
+            "available results and verification notes, and is partial."
+        )
+    if partial_reasons:
+        blocks.append("## Partial result warning\n" + "\n\n".join(partial_reasons))
+
     subtask = (
         "Combine the following information into one comprehensive, "
         "well-structured artefact. Resolve any contradictions and synthesise "
@@ -673,7 +949,8 @@ async def writer_node(state: dict) -> dict:
         "depends_on": list(results.keys()),
     }
 
-    # Bounded attempt loop (Slice 3), same as the workers and verifier.
+    # Bounded attempt loop (Slice 3), same as the workers and verifier —
+    # policy-derived effective cap.
     _, output, _ = await run_step_with_attempts(
         write_step,
         partial(
@@ -682,15 +959,19 @@ async def writer_node(state: dict) -> dict:
             results,
             state.get("current_datetime", ""),
             streaming=state.get("streaming", False),
+            policy=state.get("execution_policy"),
         ),
-        get_max_attempts("writer"),
+        effective_worker_attempts(policy, get_max_attempts("writer")),
         graph_name="yotta",
     )
 
     # The assembled document is the terminal product — results must not be
     # repopulated with it (the old ``{"assemble": ...}`` entry polluted the
     # results channel for no reader).
-    return {"final_output": output}
+    updates: dict = {"final_output": output}
+    if partial_reasons:
+        updates["status"] = "partial"
+    return updates
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +1018,7 @@ async def citatitaion_node(state: dict) -> dict:
         results,
         state.get("current_datetime", ""),
         streaming=state.get("streaming", False),
+        policy=state.get("execution_policy"),
     )
 
     try:
@@ -761,7 +1043,6 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     orchestrator = orchestrator or make_orchestrator_agent()
     sub_agent = sub_agent or make_yotta_sub_agent_node()
 
-    print("inside yotta_graph")
     builder = StateGraph(YottaState)
     # ValueError from plan validation (1.2) should re-plan, not kill the run —
     # same as the parallel graph. No worker/verify RetryPolicy (Slice 3): the
@@ -770,18 +1051,27 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     builder.add_node("orchestrator", orchestrator,
                      retry_policy=RetryPolicy(max_attempts=2, retry_on=(ValueError,)))
     builder.add_node("sub_agent", sub_agent)
-    builder.add_node("scheduler", scheduler_node)
+    builder.add_node("scheduler", _yotta_scheduler)
     builder.add_node("verify", verify_node)
     builder.add_node("writer", writer_node)
+    builder.add_node("effort_router", effort_router)
+    builder.add_node("instant_finalize", instant_finalize)
 
-    builder.set_entry_point("orchestrator")
+    # Entry: resolve the effort policy first; instant dispatches its single
+    # writer step straight to the worker, everything else plans normally.
+    builder.set_entry_point("effort_router")
+    builder.add_conditional_edges("effort_router", route_from_entry,
+                                  ["orchestrator", "sub_agent"])
+    # Workers: instant finalizes directly; normal runs re-enter the barrier.
+    builder.add_conditional_edges("sub_agent", after_sub_agent,
+                                  ["scheduler", "instant_finalize"])
     builder.add_edge("orchestrator", "scheduler")
-    builder.add_edge("sub_agent", "scheduler")
     builder.add_conditional_edges("scheduler", fan_out_router,
                                   ["writer", "verify", "sub_agent"])
     builder.add_conditional_edges("verify", after_verify,
                                   ["scheduler", "orchestrator", "writer"])
     builder.add_edge("writer", END)
+    builder.add_edge("instant_finalize", END)
 
     # Compiled with MemorySaver for interactive use (run_pipeline.py,
     # streaming.py); the API server compiles without a checkpointer.

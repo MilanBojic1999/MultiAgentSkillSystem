@@ -369,3 +369,143 @@ def test_response_models_accept_typed_partial_result():
     assert resp.step_stats[0].files[0].filename == "notes.md"
     assert resp.step_stats[2].status == "skipped"
     assert resp.step_stats[2].files is None
+
+
+# ---------------------------------------------------------------------------
+# Effort slider — API boundary
+# ---------------------------------------------------------------------------
+
+VERIFIED_STATE = {
+    **COMPLETED_STATE,
+    "effort": "standard",
+    "verification_result": "PASSED WITH NOTES",
+    "verification_exhausted": False,
+    "replan_count": 1,
+    "safety_stop_reason": None,
+}
+
+
+@pytest.fixture()
+def recording_client(monkeypatch):
+    """TestClient whose graph lookup records every requested graph name.
+
+    Resolves an omitted name through ``DEFAULT_GRAPH`` exactly like the real
+    ``_get_graph``, so tests can assert which default the server picked.
+    """
+    fake = _FakeGraph(COMPLETED_STATE)
+    seen: list[str] = []
+
+    def _get(name=None):
+        seen.append(name or api_server.DEFAULT_GRAPH)
+        return fake
+
+    monkeypatch.setattr(api_server, "DEBUG", False)
+    monkeypatch.setattr(api_server, "_get_graph", _get)
+    with TestClient(api_server.app) as c:
+        yield c, seen, fake
+
+
+def test_run_omitting_graph_defaults_to_yotta(recording_client):
+    """Effort-aware default: a request naming no graph runs on yotta."""
+    c, seen, _ = recording_client
+    resp = c.post("/run", json={"task": "t"})
+    assert resp.status_code == 200
+    assert seen[-1] == "yotta"  # lifespan precompiles the default too
+
+
+def test_run_effort_normalized_and_propagated_into_configurable(recording_client):
+    """Case-insensitive input, canonical output, serializable config payload."""
+    c, seen, fake = recording_client
+    resp = c.post("/run", json={"task": "t", "effort": "Instant"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["effort"] == "instant"
+
+    configurable = fake.last_config["configurable"]
+    assert configurable["effort"] == "instant"
+    policy = configurable["execution_policy"]
+    assert policy["preset"] == "instant"
+    assert policy["max_plan_steps"] == 1
+    assert policy["max_worker_attempts"] == 1
+    assert isinstance(policy["deadline"], float)
+    # task_id / thread_id config preservation (plan 4.5) is untouched
+    assert configurable["task_id"] == body["task_id"]
+    assert configurable["thread_id"].startswith("api-")
+
+
+def test_run_invalid_effort_returns_422(recording_client):
+    c, _, _ = recording_client
+    resp = c.post("/run", json={"task": "t", "effort": "extreme"})
+    assert resp.status_code == 422
+    assert "instant" in resp.json()["detail"][0]["msg"]
+
+
+def test_run_verification_effort_on_legacy_graph_returns_422(recording_client):
+    """light/standard/thorough promise verification — parallel cannot claim it."""
+    c, _, _ = recording_client
+    resp = c.post("/run", json={"task": "t", "graph": "parallel", "effort": "standard"})
+    assert resp.status_code == 422
+    assert "verification" in resp.json()["detail"]
+
+
+def test_run_instant_on_legacy_graph_is_executed_on_yotta(recording_client):
+    """Instant has one implementation — the named topology is overridden."""
+    c, seen, _ = recording_client
+    resp = c.post("/run", json={"task": "t", "graph": "parallel", "effort": "instant"})
+    assert resp.status_code == 200
+    assert resp.json()["effort"] == "instant"
+    assert seen[-1] == "yotta"
+
+
+def test_run_unlimited_on_legacy_graph_stays_legacy(recording_client):
+    """Unlimited is the backwards-compatible legacy mode — graph honored."""
+    c, seen, _ = recording_client
+    resp = c.post("/run", json={"task": "t", "graph": "parallel", "effort": "unlimited"})
+    assert resp.status_code == 200
+    assert seen[-1] == "parallel"
+
+
+def test_run_response_carries_verification_metadata(recording_client, monkeypatch):
+    """Sync responses expose the verification outcome with safe defaults."""
+    c, seen, fake = recording_client
+    fake._state = VERIFIED_STATE
+    resp = c.post("/run", json={"task": "t", "effort": "standard"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["effort"] == "standard"
+    assert body["verification"] == "PASSED WITH NOTES"
+    assert body["verification_exhausted"] is False
+    assert body["replan_count"] == 1
+    assert body["safety_stop_reason"] is None
+
+
+def test_run_response_effort_metadata_defaults_keep_old_clients_compatible(recording_client):
+    """A graph state with no effort metadata still yields safe defaults."""
+    c, _, _ = recording_client
+    resp = c.post("/run", json={"task": "t"})
+    body = resp.json()
+    assert body["effort"] == "unlimited"
+    assert body["verification"] is None
+    assert body["verification_exhausted"] is False
+    assert body["replan_count"] == 0
+    assert body["safety_stop_reason"] is None
+
+
+def test_async_status_preserves_effort_and_verification_metadata(recording_client):
+    c, _, fake = recording_client
+    fake._state = VERIFIED_STATE
+    resp = c.post("/run-async", json={"task": "t", "effort": "Light"})
+    assert resp.status_code == 202
+    task_id = resp.json()["task_id"]
+
+    status = _wait_terminal(c, task_id)
+    assert status["status"] == "completed"
+    assert status["effort"] == "light"
+    assert status["verification"] == "PASSED WITH NOTES"
+    assert status["replan_count"] == 1
+
+
+def test_response_models_default_effort_is_unlimited():
+    """Old clients (and old graph states) see the legacy-compatible default."""
+    assert api_server.RunResponse(status="completed", final_output="x").effort == "unlimited"
+    assert api_server.StatusResponse(task_id="t", status="running").effort == "unlimited"
