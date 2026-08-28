@@ -252,18 +252,24 @@ def run_task_async(task: str, base_url: str, files: Optional[list[dict]], graph:
         print(f"\r   Running{'.' * dots}{' ' * (3 - dots)}", end="", flush=True)
 
 
-def run_task_stream(task: str, base_url: str, files: list[dict] | None = None) -> str | None:
+def run_task_stream(task: str, base_url: str, files: list[dict] | None = None,
+                    effort: Optional[str] = None) -> str | None:
     """Run a task via the /run-stream SSE endpoint and print tokens as they arrive.
 
-    Returns the full assembled output, or None on error.
+    ``effort`` is sent like the other endpoints and validated/normalized by
+    the server. Returns the full assembled output, or None on error.
     """
     print(f"🚀 Starting stream task:\n   {task}\n")
+    if effort:
+        print(f"⚡ Effort: {effort}")
     if files:
         print(f"📎 Attached files: {', '.join(f['filename'] for f in files)}")
     print(f"📡 POST {base_url}/run-stream ...\n")
 
     url = f"{base_url.rstrip('/')}/run-stream"
     body: dict[str, Any] = {"task": task}
+    if effort:
+        body["effort"] = effort
     if files:
         body["files"] = files
     data = json.dumps(body).encode("utf-8")
@@ -550,7 +556,7 @@ Examples:
     # Task supplied — run once
     files = _read_files(args.files, args.max_file_chars) if args.files else None
     if args.stream_mode:
-        output = run_task_stream(args.task, args.url, files)
+        output = run_task_stream(args.task, args.url, files, args.effort)
     elif args.async_mode:
         output = run_task_async(args.task, args.url, files, args.graph, args.effort)
     else:

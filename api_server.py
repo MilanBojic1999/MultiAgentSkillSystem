@@ -541,10 +541,15 @@ async def get_artifact(task_id: str, filename: str):
 
 @app.post("/run-stream")
 async def run_pipeline_stream(req: RunRequest):
-    """Stream the pipeline using the marker protocol as Server-Sent Events."""
+    """Stream the pipeline using the marker protocol as Server-Sent Events.
+
+    ``effort`` works exactly like the other endpoints (validated/normalized by
+    ``RunRequest``; 422 on an invalid preset) and is passed through to
+    ``stream_pipeline`` so streamed runs enforce the same effort budgets.
+    """
     async def event_source():
         try:
-            async for token in stream_pipeline(req.task, req.files):
+            async for token in stream_pipeline(req.task, req.files, req.effort):
                 token = token.replace('\n','\\n')
                 yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
         except Exception as exc:

@@ -2,7 +2,9 @@
 import json
 import uuid
 from agents.agent_states import get_current_datetime_str
+from execution_policy import normalize_effort, resolve_execution_policy
 from pipeline_entry import build_task_string, build_files_state
+from utils.logger import log_event
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: ChatOpenAI._convert_delta_to_message_chunk drops
@@ -73,7 +75,7 @@ def _visible_delta(chunk) -> str:
     return ""
 
 
-async def stream_pipeline(task: str, files: list | None = None):
+async def stream_pipeline(task: str, files: list | None = None, effort: str | None = None):
     """
     Async generator yielding the old marker protocol:
     <thinking_step>, <think>/<non_think>, token text, TOOL name(args), stop.
@@ -85,7 +87,20 @@ async def stream_pipeline(task: str, files: list | None = None):
     (filename -> content) rather than embedded in the task string — the planner
     routes filenames to the steps that need them (same as the non-streaming
     path — see ``pipeline_entry.build_task_string`` / ``build_files_state``).
+
+    ``effort`` resolves through the shared policy module exactly like the
+    CLI (``run_pipeline.py``) and API (``/run``, ``/run-async``) boundaries:
+    the normalized preset and its resolved ``execution_policy`` travel under
+    ``config["configurable"]``, so the graph's entry router enforces the same
+    budgets (plan steps, worker attempts, tool calls, verification, replans,
+    wall-clock deadline) on streamed runs. Omitted effort resolves to
+    ``unlimited`` (legacy behavior).
     """
+    preset = normalize_effort(effort)
+    policy = resolve_execution_policy(preset)
+    log_event("execution_policy_resolved", effort=preset,
+              execution_policy=policy.as_dict())
+
     # Decode/extract file text first — fail fast on a bad upload before
     # spending a search call on it.
     files_state = build_files_state(files)
@@ -97,7 +112,8 @@ async def stream_pipeline(task: str, files: list | None = None):
     task_string = build_task_string(task, files)
 
     # Unique thread_id per invocation — prevents checkpoint collision across calls
-    config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}", "recursion_limit": 64}}
+    config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}", "recursion_limit": 64,
+                               "effort": preset, "execution_policy": policy.as_dict()}}
     state_in = {
         "task": task_string,
         "search_results": clean_findings,
