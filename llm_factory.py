@@ -19,6 +19,7 @@ def create_llm(
     api_key_env: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    streaming: Optional[bool] = False
 ) -> ChatOpenAI:
     """Build (and cache) a ChatOpenAI client for an OpenAI-compatible endpoint.
 
@@ -47,4 +48,5 @@ def create_llm(
         openai_api_base=url,
         temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
         max_tokens=DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens,
+        streaming=streaming
     )

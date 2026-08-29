@@ -249,7 +249,7 @@ async def run_sub_agent_async(
         configurable.setdefault("thread_id", f"subagent-step-{step['step']}")
     agent_name   = step["agent"]
     step_num     = step["step"]
-    llm          = llm or create_llm(**_llm_kwargs(AGENT_CONFIG.get(agent_name, {}).get("llm", {}), agent_name))
+    llm          = llm or create_llm(**_llm_kwargs(AGENT_CONFIG.get(agent_name, {}).get("llm", {}), agent_name), streaming=streaming)
 
     # Activate only the skills this step needs
     requested   = step.get("skills_needed", [])

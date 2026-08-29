@@ -543,20 +543,33 @@ async def get_artifact(task_id: str, filename: str):
 async def run_pipeline_stream(req: RunRequest):
     """Stream the pipeline using the marker protocol as Server-Sent Events.
 
+    Every stream is terminated by a single ``<stop>`` frame — on success, or
+    after an in-band ``[error]`` frame on failure.
+
     ``effort`` works exactly like the other endpoints (validated/normalized by
     ``RunRequest``; 422 on an invalid preset) and is passed through to
     ``stream_pipeline`` so streamed runs enforce the same effort budgets.
     """
     async def event_source():
+        gen = stream_pipeline(req.task, req.files, req.effort)
         try:
-            async for token in stream_pipeline(req.task, req.files, req.effort):
+            async for token in gen:
                 token = token.replace('\n','\\n')
                 yield f"data: {token}\n\n"   # SSE frame; client strips "data: "
+        except GeneratorExit:
+            # Client disconnected — close the stream so its finally cleanup
+            # (checkpointer thread deletion) runs now, not at GC time.
+            await gen.aclose()
+            raise
+        except asyncio.CancelledError:
+            await gen.aclose()
+            raise
         except Exception as exc:
-            print(traceback.format_exc())
+            # Safety net: stream_pipeline emits its own [error] + <stop> on
+            # failure, so this only fires if the generator itself misbehaves.
+            log_event("stream_endpoint_error", error=traceback.format_exc())
             yield f"data: [error] {exc}\n\n"
-        finally:
-            yield "data: <stop>\n\n"          # replaces the old None sentinel
+            yield "data: <stop>\n\n"
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 

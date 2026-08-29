@@ -52,7 +52,7 @@ _AGENT_NODES = {"orchestrator", "sub_agent", "verify", "writer", "citatitaion"}
 def _reasoning_delta(chunk) -> str | None:
     """Vendor reasoning tokens live in additional_kwargs, NOT chunk.content.
     Returns the raw token delta string (may be a single token or a few tokens).
-    Confirm the exact key against your endpoint (see §6.1)."""
+    Confirm the exact key against your endpoint."""
     ak = getattr(chunk, "additional_kwargs", {}) or {}
     val = ak.get("reasoning_content") or ak.get("reasoning")
     if isinstance(val, dict):                 # some providers nest it
@@ -77,8 +77,14 @@ def _visible_delta(chunk) -> str:
 
 async def stream_pipeline(task: str, files: list | None = None, effort: str | None = None):
     """
-    Async generator yielding the old marker protocol:
+    Async generator yielding the marker protocol:
     <thinking_step>, <think>/<non_think>, token text, TOOL name(args), stop.
+
+    Every run ends with ``<stop>``: on success after the last
+    ``<thinking_step>`` is closed with a blank line, and on failure after a
+    single-line ``[error] <message>`` frame. The per-stream checkpointer
+    thread is deleted when the generator finishes, whatever the outcome —
+    including a client disconnect (the SSE endpoint acalls ``aclose``).
 
     Each call uses a unique thread_id so the MemorySaver checkpointer never
     resumes a previous run — every request starts fresh.
@@ -96,75 +102,100 @@ async def stream_pipeline(task: str, files: list | None = None, effort: str | No
     wall-clock deadline) on streamed runs. Omitted effort resolves to
     ``unlimited`` (legacy behavior).
     """
-    preset = normalize_effort(effort)
-    policy = resolve_execution_policy(preset)
-    log_event("execution_policy_resolved", effort=preset,
-              execution_policy=policy.as_dict())
+    thread_id = f"stream-{uuid.uuid4().hex}"
+    try:
+        preset = normalize_effort(effort)
+        policy = resolve_execution_policy(preset)
+        log_event("execution_policy_resolved", effort=preset,
+                  execution_policy=policy.as_dict())
 
-    # Decode/extract file text first — fail fast on a bad upload before
-    # spending a search call on it.
-    files_state = build_files_state(files)
+        # Decode/extract file text first — fail fast on a bad upload before
+        # spending a search call on it.
+        files_state = build_files_state(files)
 
-    # Search on the bare task — file contents never reach the search call.
-    yotta_results = await call_yotta(task)
-    clean_findings = parse_yotta_results(yotta_results)
+        # Search on the bare task — file contents never reach the search call.
+        yotta_results = await call_yotta(task)
+        clean_findings = parse_yotta_results(yotta_results)
 
-    task_string = build_task_string(task, files)
+        task_string = build_task_string(task, files)
 
-    # Unique thread_id per invocation — prevents checkpoint collision across calls
-    config = {"configurable": {"thread_id": f"stream-{uuid.uuid4().hex}", "recursion_limit": 64,
-                               "effort": preset, "execution_policy": policy.as_dict()}}
-    state_in = {
-        "task": task_string,
-        "search_results": clean_findings,
-        "current_datetime": get_current_datetime_str(),
-        "streaming": True,                    # see §5.3 — must reach the LLM constructors
-        "files": files_state,
-    }
+        # Unique thread_id per invocation — prevents checkpoint collision across calls
+        config = {"configurable": {"thread_id": thread_id,
+                                   "effort": preset,
+                                   "execution_policy": policy.as_dict()},
+                  "recursion_limit": 64}
+        state_in = {
+            "task": task_string,
+            "search_results": clean_findings,
+            "current_datetime": get_current_datetime_str(),
+            "streaming": True,                # must reach the LLM constructors
+            "files": files_state,
+        }
 
-    is_thinking = None                        # None = undecided for this step
-    open_step = False
-    current_agent = None
-    async for event in _get_graph().astream_events(state_in, config=config, version="v2"):
-        kind = event["event"]
+        is_thinking = None                    # None = undecided for this step
+        open_step = False
+        current_agent = None
+        async for event in _get_graph().astream_events(state_in, config=config, version="v2"):
+            kind = event["event"]
 
-        agent_name = event.get("name", "unknown_agent")
-        # --- New agent turn -> <thinking_step> ---------------------------
-        if kind == "on_chain_start" and agent_name in _AGENT_NODES:
-            current_agent = agent_name
-            if open_step:
-                yield "\n\n"                  # close previous iteration (old l. 220)
-            yield "<thinking_step>"
-            yield f"{current_agent}\n"
-            open_step = True
-            is_thinking = None                # reset toggle each step
-            continue
-
-        if kind == "on_tool_start":
-            tool_name = event.get("name", "unknown_tool")
-            tool_args = event.get("data", {})
-            if tool_args:
-                tool_args = tool_args.get("input", tool_args)  # some providers nest it
-            yield "<tool>"
-            yield f"{tool_name}"
-            yield f"({json.dumps(tool_args)})"
-            yield "</tool>"
-            continue
-
-        # --- Streaming LLM tokens ----------------------------------------
-        if kind == "on_chat_model_stream":
-            chunk = event["data"]["chunk"]
-            reasoning = _reasoning_delta(chunk)
-            if reasoning:
-                if is_thinking is not True:
-                    is_thinking = True
-                    yield "<think>"
-                yield reasoning        # raw token delta — yield as-is
+            agent_name = event.get("name", "unknown_agent")
+            # --- New agent turn -> <thinking_step> ---------------------------
+            if kind == "on_chain_start" and agent_name in _AGENT_NODES:
+                current_agent = agent_name
+                if open_step:
+                    yield "\n\n"              # close previous iteration
+                yield "<thinking_step>"
+                yield f"{current_agent}\n"
+                open_step = True
+                is_thinking = None            # reset toggle each step
                 continue
-            visible = _visible_delta(chunk)
-            if visible:
-                if is_thinking is not False:
-                    is_thinking = False
-                    yield "<non_think>"
-                yield visible          # raw token delta — yield as-is
-            continue
+
+            if kind == "on_tool_start":
+                tool_name = event.get("name", "unknown_tool")
+                tool_args = event.get("data", {})
+                if tool_args:
+                    tool_args = tool_args.get("input", tool_args)  # some providers nest it
+                yield "<tool>"
+                yield f"{tool_name}"
+                yield f"({json.dumps(tool_args)})"
+                yield "</tool>"
+                continue
+
+            # --- Streaming LLM tokens ----------------------------------------
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                reasoning = _reasoning_delta(chunk)
+                if reasoning:
+                    if is_thinking is not True:
+                        is_thinking = True
+                        yield "<think>"
+                    yield reasoning        # raw token delta — yield as-is
+                    continue
+                visible = _visible_delta(chunk)
+                if visible:
+                    if is_thinking is not False:
+                        is_thinking = False
+                        yield "<non_think>"
+                    yield visible          # raw token delta — yield as-is
+                continue
+
+        # Normal completion: close the last <thinking_step>, then terminate.
+        if open_step:
+            yield "\n\n"
+        yield "<stop>"
+    except Exception as exc:
+        # One frame per error; newlines are escaped so the SSE transport (and
+        # any line-based parser) keeps the message inside a single frame.
+        log_event("stream_error", error=str(exc))
+        yield "[error] " + str(exc).replace("\n", "\\n")
+        yield "<stop>"
+    finally:
+        # Drop this run's checkpoints — MemorySaver never evicts, so a
+        # finished/aborted stream would otherwise leak its super-steps forever.
+        graph = _graph_cache.get("yotta")
+        checkpointer = getattr(graph, "checkpointer", None) if graph is not None else None
+        if checkpointer is not None:
+            try:
+                await checkpointer.adelete_thread(thread_id)
+            except Exception as exc:
+                log_event("stream_cleanup_failed", error=str(exc))

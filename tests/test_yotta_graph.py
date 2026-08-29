@@ -383,8 +383,8 @@ REPLAN_VERDICTS = [
 
 def test_e2e_instant_single_writer_no_planner_no_verifier(monkeypatch):
     """Instant guarantees: zero orchestrator invocations, exactly one writer
-    worker invocation, no tool-verifier, no replan, no synthesis call — and
-    one normal stats/result row."""
+    synthesis call (the direct-route branch), no worker dispatch, no
+    tool-verifier, no replan."""
     orchestrator_calls = {"n": 0}
 
     def counting_orchestrator(state):
@@ -396,70 +396,52 @@ def test_e2e_instant_single_writer_no_planner_no_verifier(monkeypatch):
     out = _invoke(graph, effort="instant", execution_policy=_policy("instant"))
 
     assert orchestrator_calls["n"] == 0                 # planner never ran
-    assert fake.worker_calls == [(1, "")]               # exactly one writer worker
+    assert fake.worker_calls == []                      # no worker dispatch
     assert fake.verifier_subtasks == []                 # verifier never ran
-    assert fake.writer_subtask == ""                    # no writer synthesis call
-    assert out["final_output"] == "out-1"               # the single answer IS the output
-    assert out["status"] == "completed"
+    assert fake.writer_subtask                          # exactly one writer synthesis call
+    assert out["final_output"] == "FINAL"               # the writer's answer IS the output
+    assert out["plan"] == []                            # empty plan → direct-route branch
     assert out["effort"] == "instant"
     assert out["replan_count"] == 0
     assert out["verification_attempts"] == 0
-    (row,) = out["step_stats"]                          # one normal stats row
-    assert row["step"] == 1 and row["agent"] == "writer"
-    assert row["status"] == "completed" and row["tool_calls"] == 0
+    assert out.get("status") is None                    # status derived at the boundary
+    assert out.get("step_stats") is None                # no worker rows on this route
 
 
 def test_e2e_instant_writer_receives_attached_files(monkeypatch):
-    """Instant keeps file grounding: the synthetic writer step is assigned
-    every attached document and receives them through the Send payload."""
+    """Instant keeps file grounding: the writer's direct-route branch renders
+    the attached documents into its prompt."""
     fake = FakeLLMCall(verdicts=[])
     graph = _build_yotta(monkeypatch, fake)
     out = _invoke(graph, effort="instant", execution_policy=_policy("instant"),
                   files={"a.txt": "doc text"})
 
-    (step_n, assigned, docs) = fake.worker_files[0]
-    assert step_n == 1
-    assert assigned == ["a.txt"]
-    assert docs == {"a.txt": "doc text"}
-    assert out["final_output"] == "out-1"
+    assert fake.worker_files == []                      # no worker dispatch
+    assert "doc text" in fake.writer_subtask            # files rendered into the writer prompt
+    assert out["final_output"] == "FINAL"
 
 
-def test_e2e_instant_contained_failure_is_partial(monkeypatch):
-    """A failing writer worker is contained exactly like a normal step: one
-    attempt (instant cap = 1), then a partial result — no infinite retry."""
-    from graphs.yotta_graph import make_yotta_sub_agent_node
-
-    calls = {"n": 0}
-
-    async def failing_run(s, results, current_datetime=""):
-        calls["n"] += 1
+def test_e2e_instant_writer_failure_propagates(monkeypatch):
+    """A failing writer on the instant route is NOT contained: the writer
+    node owns no containment (same as the normal route), so the error
+    escapes the run rather than producing a partial answer."""
+    async def failing_writer(step, results, current_datetime="", **kwargs):
         raise RuntimeError("boom")
-
-    worker = make_yotta_sub_agent_node(run_step=failing_run)
 
     def no_orchestrator(state):
         raise AssertionError("orchestrator must not run on instant")
 
-    graph = _build_yotta(monkeypatch, FakeLLMCall(verdicts=[]),
-                         orchestrator=no_orchestrator, sub_agent=worker)
-    out = _invoke(graph, effort="instant", execution_policy=_policy("instant"))
-
-    assert calls["n"] == 1                              # exactly one attempt
-    assert out["status"] == "partial"
-    assert out["failed_steps"] == [1]
-    assert "[STEP FAILED]" in out["final_output"]
+    graph = _build_yotta(monkeypatch, failing_writer, orchestrator=no_orchestrator)
+    with pytest.raises(RuntimeError, match="boom"):
+        _invoke(graph, effort="instant", execution_policy=_policy("instant"))
 
 
 def test_e2e_instant_cancellation_escapes(monkeypatch):
     """Cancellation on the instant route escapes the graph, never contained."""
-    from graphs.yotta_graph import make_yotta_sub_agent_node
-
-    async def cancel_run(s, results, current_datetime=""):
+    async def cancel_writer(step, results, current_datetime="", **kwargs):
         raise asyncio.CancelledError()
 
-    worker = make_yotta_sub_agent_node(run_step=cancel_run)
-    graph = _build_yotta(monkeypatch, FakeLLMCall(verdicts=[]),
-                         orchestrator=lambda s: None, sub_agent=worker)
+    graph = _build_yotta(monkeypatch, cancel_writer, orchestrator=lambda s: None)
     with pytest.raises((asyncio.CancelledError, NodeCancelledError)):
         _invoke(graph, effort="instant", execution_policy=_policy("instant"))
 

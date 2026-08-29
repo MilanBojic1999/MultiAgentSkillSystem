@@ -14,8 +14,8 @@ Capabilities (moved from the old root ``yotta_graph.py``):
   per-run policy from config/state and stamps it; every cap below (plan
   steps, worker/verifier attempts, step retries, replans, dispatch waves,
   wall-clock deadline) is policy-derived. ``instant`` is a graph route that
-  guarantees exactly one writer-worker invocation with zero tools, zero
-  verifier and zero replan passes;
+  guarantees exactly one writer invocation with zero tools, zero verifier
+  and zero replan passes;
 - ``citatitaion_node`` — Phase 4 placeholder, defined but not wired.
 """
 
@@ -38,7 +38,6 @@ from agents.sub_agents_nodes import (
     run_step_with_attempts,
     run_sub_agent_async,  # module-global name — tests monkeypatch this
 )
-from assemble_node import derive_status
 from config_loader import get_max_attempts
 from execution_policy import (
     deadline_exceeded,
@@ -73,8 +72,10 @@ def effort_router(state: dict, config: RunnableConfig = None) -> dict:
     slider existed. A policy without a deadline (hand-built test state) is
     stamped here so every real run has wall-clock protection.
 
-    For ``instant`` the one synthetic writer step becomes the whole plan —
-    planning, verification, retries and replans are all skipped by routing.
+    For ``instant`` the graph routes straight to the writer node — planning,
+    verification, retries and replans are all skipped by routing, and the
+    writer's direct-route branch renders the task and any attached documents
+    itself.
     """
     configurable = (config or {}).get("configurable") or {}
     if configurable.get("execution_policy") is not None or configurable.get("effort") is not None:
@@ -93,75 +94,26 @@ def effort_router(state: dict, config: RunnableConfig = None) -> dict:
     }
     if policy.instant_writer_only:
         log_event("instant_route_selected", effort=policy.preset)
-        # Normalize never-written channels: a fresh run has files/results as
-        # None, and the synthetic step + worker payload need real dicts.
-        files = state.get("files") or {}
+        # Instant skips the orchestrator, workers and verifier: the writer
+        # node runs the single LLM call itself, and its empty-plan branch
+        # renders any attached documents from the raw ``files`` channel
+        # (the same handling the direct route gets). Normalize never-written
+        # channels and zero the counters the skipped nodes own.
         updates["results"] = state.get("results") or {}
-        updates["plan"] = [_instant_writer_step(state.get("task", ""), files)]
-        # Instant skips the orchestrator and verifier, so the counters those
-        # nodes own on normal routes are initialized here instead.
+        updates["plan"] = []
         updates["replan_count"] = state.get("replan_count", 0)
         updates["verification_attempts"] = state.get("verification_attempts", 0)
     return updates
 
 
-def _instant_writer_step(task: str, files: dict[str, str]) -> dict:
-    """The one synthetic step of an Instant run: the original task, assigned
-    to the configured writer agent, with no tools (the policy caps tool calls
-    at zero and the writer owns none anyway). Any attached documents ride
-    along so the writer still gets file grounding."""
-    return {
-        "step": 1,
-        "subtask": task,
-        "agent": "writer",
-        "skills_needed": ["answer-writer"],
-        "depends_on": [],
-        "files": sorted(files.keys()),
-    }
-
-
 def route_from_entry(state: dict):
-    """After the entry router: instant dispatches its single writer step
-    directly to the worker machinery; everything else plans normally."""
+    """After the entry router: instant routes straight to the writer node —
+    the same "writer" target ``fan_out_router`` uses for its direct route;
+    everything else plans normally."""
     policy = policy_from_state(state)
     if policy.instant_writer_only:
-        return [
-            Send("sub_agent", {
-                "step": state["plan"][0],
-                "results": state.get("results") or {},
-                "current_datetime": state.get("current_datetime", ""),
-                "step_verifications": {},
-                "streaming": state.get("streaming", False),
-                "files": state.get("files") or {},
-                "effort": policy.preset,
-                "execution_policy": policy.as_dict(),
-            })
-        ]
+        return "writer"
     return "orchestrator"
-
-
-def after_sub_agent(state: dict) -> str:
-    """After a worker task: instant finalizes its single answer directly;
-    normal runs re-enter the scheduler barrier."""
-    policy = policy_from_state(state)
-    if policy.instant_writer_only:
-        return "instant_finalize"
-    return "scheduler"
-
-
-def instant_finalize(state: dict) -> dict:
-    """Instant terminal node: the single writer-worker output IS the answer.
-
-    Same presentation semantics as the assemble nodes: a contained worker
-    failure surfaces as ``partial`` with the failure marker in the output;
-    cancellation already escaped at the worker.
-    """
-    results = state.get("results", {})
-    output = results.get(1, "")
-    status = derive_status(
-        state.get("failed_steps", []), state.get("step_stats", [])
-    )
-    return {"final_output": output, "status": status}
 
 
 def _wave_or_route(state: dict) -> str:
@@ -836,7 +788,7 @@ async def writer_node(state: dict) -> dict:
     """Assemble sub-agent results (or direct yotta findings) plus verifier notes
     into one comprehensive artefact.
 
-    Two routes reach this node:
+    Three routes reach this node:
     1. **Normal** — orchestrator → sub_agents → verify → writer.
        ``plan`` has steps, ``results`` has sub-agent outputs, and
        ``verification_notes`` may be present.
@@ -845,10 +797,11 @@ async def writer_node(state: dict) -> dict:
        ``plan`` is ``[]``, ``results`` is ``{}``, ``search_results`` has the
        findings. If files were attached, this route sees their raw content
        directly (there are no document-reader steps to have read them).
-
-    (Instant never reaches this node — its single writer-worker output is the
-    final answer and ``instant_finalize`` emits it directly, keeping the
-    guarantee of exactly one writer invocation.)
+    3. **Instant** — the effort entry router sends the run here with an empty
+       plan (``route_from_entry`` returns ``"writer"``, the same target the
+       fan-out router uses for the direct route), so handling is exactly the
+       direct route's: original task + any attached files, one writer
+       invocation.
 
     Effort policy: the attempt cap is policy-derived; a safety stop or
     exhausted verification budget is surfaced to the reader as an explicit
@@ -940,6 +893,10 @@ async def writer_node(state: dict) -> dict:
         "the information into a cohesive final document.\n\n"
         + "\n\n".join(blocks)
     )
+
+    print('&'*50)
+    print(subtask)
+    print('&'*50)
 
     write_step = {
         "step": "assemble",
@@ -1055,23 +1012,20 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     builder.add_node("verify", verify_node)
     builder.add_node("writer", writer_node)
     builder.add_node("effort_router", effort_router)
-    builder.add_node("instant_finalize", instant_finalize)
 
-    # Entry: resolve the effort policy first; instant dispatches its single
-    # writer step straight to the worker, everything else plans normally.
+    # Entry: resolve the effort policy first; instant goes straight to the
+    # writer (its direct-route branch), everything else plans normally.
     builder.set_entry_point("effort_router")
     builder.add_conditional_edges("effort_router", route_from_entry,
-                                  ["orchestrator", "sub_agent"])
-    # Workers: instant finalizes directly; normal runs re-enter the barrier.
-    builder.add_conditional_edges("sub_agent", after_sub_agent,
-                                  ["scheduler", "instant_finalize"])
+                                  ["orchestrator", "writer"])
+    # Workers re-enter the scheduler barrier (no-op skip-marker pass).
+    builder.add_edge("sub_agent", "scheduler")
     builder.add_edge("orchestrator", "scheduler")
     builder.add_conditional_edges("scheduler", fan_out_router,
                                   ["writer", "verify", "sub_agent"])
     builder.add_conditional_edges("verify", after_verify,
                                   ["scheduler", "orchestrator", "writer"])
     builder.add_edge("writer", END)
-    builder.add_edge("instant_finalize", END)
 
     # Compiled with MemorySaver for interactive use (run_pipeline.py,
     # streaming.py); the API server compiles without a checkpointer.

@@ -96,8 +96,11 @@ def _describe_attached_files(files: dict[str, str]) -> str:
 
 def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
     # The orchestrator only emits strict JSON, so it runs at low temperature —
-    # creative sampling here is the main source of malformed plans.
-    llm = llm or create_llm(temperature=float(os.getenv("ORCHESTRATOR_TEMPERATURE", "0.1")))
+    # creative sampling here is the main source of malformed plans. The client
+    # is resolved per node call (not here) so the run's ``streaming`` flag can
+    # reach the constructor — see orchestrator_agent below. ``create_llm`` is
+    # lru_cached by parameter tuple, so repeat calls are a dict lookup.
+    default_llm = llm
     roster = agent_roster or AGENT_ROSTER
     index = skill_index or SKILL_INDEX
 
@@ -113,6 +116,17 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
         agent_roster_str = "\n".join([f"- {name}: {desc}" for name, desc in AGENT_ROSTER.items() if name not in _PIPELINE_RESERVED_AGENTS])
 
         streaming = state.get("streaming", False)
+        # The run's streaming flag must reach the LLM constructor: only a
+        # client built with streaming=True emits the on_chat_model_stream
+        # events that streaming.py's astream_events forwards to the caller
+        # (same convention as the worker/verify nodes). An injected llm is
+        # always used as-is.
+        llm = default_llm
+        if llm is None:
+            llm = create_llm(
+                temperature=float(os.getenv("ORCHESTRATOR_TEMPERATURE", "0.1")),
+                streaming=streaming,
+            )
         search_results = state.get("search_results", "")
         files = state.get("files", {})
         policy = policy_from_state(state)
