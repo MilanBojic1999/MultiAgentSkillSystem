@@ -252,12 +252,99 @@ def run_task_async(task: str, base_url: str, files: Optional[list[dict]], graph:
         print(f"\r   Running{'.' * dots}{' ' * (3 - dots)}", end="", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# /run-stream marker protocol (see streaming.py's module docstring)
+# ---------------------------------------------------------------------------
+
+_FRAME_TAGS = ("plan", "agent_start", "agent_end", "verification", "tool")
+
+
+def _split_frame(payload: str) -> tuple[str, str] | None:
+    """Split a ``<tag>body</tag>`` protocol frame into ``(tag, body)``."""
+    for tag in _FRAME_TAGS:
+        opener, closer = f"<{tag}>", f"</{tag}>"
+        if payload.startswith(opener) and payload.endswith(closer):
+            return tag, payload[len(opener):-len(closer)]
+    return None
+
+
+def _unescape(text: str) -> str:
+    """Undo the SSE transport's newline escaping (api_server keeps every frame
+    on one ``data:`` line). Only for free text — a JSON frame's newlines are
+    already JSON escapes and must reach ``json.loads`` untouched."""
+    return text.replace("\\n", "\n")
+
+
+def _frame_json(body: str) -> dict:
+    """Parse a frame payload, tolerating anything unexpected."""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _shorten(text: Any, limit: int = 100) -> str:
+    collapsed = " ".join(str(text).split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+
+
+def _render_frame(tag: str, body: str) -> None:
+    """Print one protocol frame: the plan, a step's start/finish, the verifier
+    report, or a writer tool call. Answer text is handled by the caller."""
+    if tag == "plan":
+        steps = _frame_json(body).get("plan") or []
+        if not steps:
+            print("\n📋 Plan: none — the search results already answer the query.\n")
+            return
+        print(f"\n📋 Plan ({len(steps)} step(s)):")
+        for step in steps:
+            deps = step.get("depends_on") or []
+            suffix = f"   ← depends on {deps}" if deps else ""
+            number = str(step.get("step", "?"))
+            agent = str(step.get("agent", ""))
+            print(f"   {number:>2}  {agent:<24} {_shorten(step.get('subtask', ''))}{suffix}")
+        print()
+        return
+
+    if tag == "agent_start":
+        step = _frame_json(body)
+        print(f"   ▶  step {step.get('step', '?')} ({step.get('agent', '')}) started "
+              f"— {_shorten(step.get('subtask', ''), 70)}")
+        return
+
+    if tag == "agent_end":
+        step = _frame_json(body)
+        status = step.get("status", "finished")
+        duration = step.get("duration_s")
+        took = f" in {duration}s" if duration is not None else ""
+        mark = "✖" if status == "failed" else "✔"
+        print(f"   {mark}  step {step.get('step', '?')} ({step.get('agent', '')}) "
+              f"{status}{took}")
+        return
+
+    if tag == "verification":
+        print("\n🔍 Verification")
+        print(_unescape(body).strip())
+        print()
+        return
+
+    if tag == "tool":
+        call = _frame_json(body)
+        args = _shorten(json.dumps(call.get("args", {}), ensure_ascii=False), 120)
+        print(f"\n   🔧 {call.get('name', '?')}({args})")
+        return
+
+
 def run_task_stream(task: str, base_url: str, files: list[dict] | None = None,
                     effort: Optional[str] = None) -> str | None:
-    """Run a task via the /run-stream SSE endpoint and print tokens as they arrive.
+    """Run a task via the /run-stream SSE endpoint and render the marker protocol.
 
-    ``effort`` is sent like the other endpoints and validated/normalized by
-    the server. Returns the full assembled output, or None on error.
+    Prints the orchestrator's plan, each sub-agent's start/finish, the verifier
+    report and the writer's answer as it streams. ``effort`` is sent like the
+    other endpoints and validated/normalized by the server. Returns **only the
+    writer's answer text** (protocol frames are rendered, never accumulated),
+    or None on error.
     """
     print(f"🚀 Starting stream task:\n   {task}\n")
     if effort:
@@ -278,37 +365,67 @@ def run_task_stream(task: str, base_url: str, files: list[dict] | None = None,
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "text/event-stream")
 
-    full_output: list[str] = []
+    answer_parts: list[str] = []
+    in_answer = False
+    saw_stop = False
 
     try:
         with urllib.request.urlopen(req) as resp:
             # Read SSE line by line
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace")
-                if not line:
+                if not line.strip():
                     continue  # skip empty lines (SSE framing)
-                # if not line.startswith("data: "):
-                #     continue
 
-                payload = line.replace("data: ", "", 1).rstrip("\n\n")
+                # The server escapes newlines so one frame stays one SSE line
+                # (api_server.run_pipeline_stream); they are restored per
+                # payload below — never on a JSON frame, whose own newlines
+                # are already JSON escapes.
+                payload = line.replace("data: ", "", 1).rstrip("\n")
+
                 if payload == "<stop>":
+                    saw_stop = True
                     break
                 if payload.startswith("[error] "):
-                    error_msg = payload.removeprefix("[error] ")
+                    error_msg = _unescape(payload.removeprefix("[error] "))
                     print(f"\n❌ Stream error: {error_msg}")
                     return None
 
-                # Normal token — print in-place and accumulate
-                full_output.append(payload)
-                # print(repr(payload), end="", flush=True)
-                print(payload, end="", flush=True)
-                if payload == "<thinking_step>":
-                    print("\n")
-                if payload == "<think>" or payload == "<non_think>":
-                    print("")
+                # --- writer answer window -------------------------------
+                if payload == "<answer>":
+                    in_answer = True
+                    print("\n" + "─" * 60)
+                    print("📝 Answer")
+                    print("─" * 60)
+                    continue
+                if payload == "</answer>":
+                    in_answer = False
+                    print()
+                    continue
+                if payload == "<answer_restart>":
+                    answer_parts.clear()
+                    print("\n\n⟲  writer restarted — discard the partial answer above\n")
+                    continue
+                if payload in ("<think>", "</think>"):
+                    print()  # reasoning is off by default; frame it if enabled
+                    continue
+
+                # --- typed frames ---------------------------------------
+                frame = _split_frame(payload)
+                if frame is not None:
+                    _render_frame(*frame)
+                    continue
+
+                # --- answer tokens --------------------------------------
+                if in_answer:
+                    text = _unescape(payload)
+                    answer_parts.append(text)
+                    print(text, end="", flush=True)
 
         print()  # final newline after stream
-        assembled = "".join(full_output)
+        if not saw_stop:
+            print("⚠️  Stream ended without <stop> — the output may be truncated.")
+        assembled = "".join(answer_parts)
         return assembled if assembled else None
 
     except urllib.error.HTTPError as exc:

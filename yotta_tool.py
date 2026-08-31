@@ -125,7 +125,7 @@ def parse_yotta_results(yotta_raw: str) -> str:
     return "\n".join(blocks) if blocks else yotta_raw
 
 
-async def call_yotta(question: str, answers_returned: int=10, sents_per_answer: int=1) -> str:
+async def call_yotta(question: str, answers_returned: int=5, sents_per_answer: int=3) -> str:
     """Get paragraph answer for a question. There is no Knowledge date cuttoff, as it is connected to the internet. Answering system is great for simple (one-hop) factual questions (e.g. 'What is the difference between Apple and google' is a bad question, better is to ask seperatly 'What is Apple?' and 'What is google?' and then reason over the question; 'What is history of Machine learning and its applications?' is also one of bad examples, it would be better to ask 'What is history of Machine learning' and 'What are applications of Machine learning? and then combine those answers), because it has a lot of information, but has no reasoning capability. Use it for retrieving information that are not changing (e.g. 'how old is somone?' is a bad question, better is 'when was someone born?') System uses English as primary language.
     Args:
         question: The simple factual question that needs to be answered (in English)

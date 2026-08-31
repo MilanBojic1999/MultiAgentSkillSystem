@@ -540,10 +540,10 @@ async def verify_node(state: dict) -> dict:
         # verdicts (the SKILL.md spec) with a single-object fallback.
         parsed = extract_json(output)
         if not isinstance(parsed, list):
-            print(type(parsed))
-            print('-'*50)
-            print(parsed)
-            print('-'*50)
+            # print(type(parsed))
+            # print('-'*50)
+            # print(parsed)
+            # print('-'*50)
 
             parsed = [parsed]
         log_event("verify_node_parsed", result_count=len(results),
@@ -935,8 +935,8 @@ async def writer_node(state: dict) -> dict:
 # Citation node (Phase 4 — citation pipeline)
 # NOTE: This node is defined but not wired into the graph yet.  It will be
 # properly integrated in Phase 4 once the source_map threading and
-# structured worker outputs are in place. ``streaming.py``'s ``_AGENT_NODES``
-# still references the name.
+# structured worker outputs are in place. When it is wired, give it a branch
+# in ``streaming._ProtocolTranslator`` so its result reaches the client too.
 # ---------------------------------------------------------------------------
 
 async def citatitaion_node(state: dict) -> dict:

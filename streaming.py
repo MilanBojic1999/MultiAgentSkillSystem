@@ -1,4 +1,51 @@
 # streaming.py
+"""Marker-protocol streaming for the ``yotta`` graph.
+
+``astream_events`` reports every LLM token of every node, including the
+sub-agents the yotta graph fans out in parallel — raw, that is an unreadable
+interleaving of several workers, the planner's JSON and the verifier's report.
+This module translates that event firehose into a small, ordered frame
+protocol so a client can render *what is happening* and read only the writer's
+answer.
+
+Frames (each one is a single ``yield``, so one SSE ``data:`` line carries one
+complete frame; payloads are JSON, since a subtask may contain any character):
+
+.. code-block:: text
+
+    <plan>{"plan":[{"step":1,"agent":"research-worker","subtask":"…",…}]}</plan>
+    <agent_start>{"step":1,"agent":"research-worker","subtask":"…"}</agent_start>
+    <agent_end>{"step":1,"agent":"…","status":"completed","duration_s":12.4,…}</agent_end>
+    <verification>…raw verifier report…</verification>
+    <answer>                                ← writer node started
+    …visible tokens, raw, one yield per chunk…
+    <answer_restart>                        ← writer attempt restarted; drop what came before
+    </answer>                               ← writer node ended
+    <tool>{"name":"…","args":{…}}</tool>    ← the writer's tool calls only
+    [error] <message>                       ← one frame, newlines escaped
+    <stop>                                  ← always the last frame
+
+Per node:
+
+- ``orchestrator`` — the plan, whole, once, when the node ends. Its raw LLM
+  text is not retained anywhere (``agents/orchestrator_node.py`` parses it and
+  returns the validated plan), so the frame carries that validated plan.
+- ``sub_agent`` — lifecycle only: one ``<agent_start>`` per dispatched step and
+  one ``<agent_end>`` when it finishes (or fails). No tokens, no tool frames.
+- ``verify`` — the verifier's raw report, whole, once, when the node ends.
+- ``writer`` — visible answer tokens, streamed live. Reasoning tokens are
+  suppressed unless ``STREAM_WRITER_REASONING`` is turned on.
+
+Node attribution cannot use ``metadata["langgraph_node"]`` alone: every worker
+and the writer run a nested ``create_react_agent`` Pregel whose own tasks
+overwrite that key with the inner graph's node names. A node's *own* chain
+event is the one whose runnable name equals it (``_node_of`` — the same check
+langgraph makes in ``pregel/_messages.py``), and token gating rides on the
+writer node's own start/end because the writer never shares a super-step with
+another node (``fan_out_router`` and ``after_verify`` each return a single
+target, and only ``sub_agent`` tasks run concurrently).
+"""
+
 import json
 import uuid
 from agents.agent_states import get_current_datetime_str
@@ -45,8 +92,17 @@ def _get_graph():
     return _graph_cache["yotta"]
 
 
-# Nodes that represent an "agent turn"; each opens a new <thinking_step>.
-_AGENT_NODES = {"orchestrator", "sub_agent", "verify", "writer", "citatitaion"}
+# Graph node names this protocol reacts to (graphs/yotta_graph.py's build()).
+# ``citatitaion`` is deliberately absent: the node exists but is not wired.
+ORCHESTRATOR_NODE = "orchestrator"
+WORKER_NODE = "sub_agent"
+VERIFY_NODE = "verify"
+WRITER_NODE = "writer"
+
+# The writer's reasoning tokens are suppressed by default (the reader wants the
+# answer, not the deliberation). Flip this to stream them inside <think> frames
+# — the monkeypatch above is what makes them visible at all.
+STREAM_WRITER_REASONING = False
 
 
 def _reasoning_delta(chunk) -> str | None:
@@ -75,16 +131,204 @@ def _visible_delta(chunk) -> str:
     return ""
 
 
+def _node_of(event) -> str | None:
+    """The graph node an event belongs to — but only for the node's **own**
+    chain event.
+
+    Nested runnables inherit ``langgraph_node`` from the task config, and the
+    inner ReAct graph overwrites it with its own node names, so the metadata
+    key alone attributes nothing. The runnable-name match is what makes this
+    exact (langgraph's own message streaming makes the same check).
+    Returns ``None`` for every nested/framework event.
+    """
+    metadata = event.get("metadata") or {}
+    node = metadata.get("langgraph_node")
+    if node and event.get("name") == node:
+        return node
+    return None
+
+
+def _frame(tag: str, body: str) -> str:
+    return f"<{tag}>{body}</{tag}>"
+
+
+def _json_frame(tag: str, payload) -> str:
+    return _frame(tag, json.dumps(payload, ensure_ascii=False, default=str))
+
+
+class _ProtocolTranslator:
+    """One ``astream_events`` event in, zero or more protocol frames out.
+
+    Pure and synchronous — no I/O, no graph, no LLM — so the protocol is unit
+    testable against hand-written event dicts (tests/test_streaming_protocol.py).
+    All state is the writer gate: whether the writer node is running, and
+    whether it has already emitted answer text.
+    """
+
+    def __init__(self):
+        self.writer_active = False
+        self.answer_chars = 0
+        self.in_think = False
+
+    # -- public -------------------------------------------------------------
+
+    def handle(self, event) -> list[str]:
+        kind = event.get("event")
+        if kind == "on_chain_start":
+            return self._node_start(_node_of(event), event)
+        if kind == "on_chain_end":
+            return self._node_end(_node_of(event), event)
+        if kind == "on_chat_model_start":
+            return self._model_start()
+        if kind == "on_chat_model_stream":
+            return self._model_stream(event)
+        if kind == "on_tool_start":
+            return self._tool_start(event)
+        return []
+
+    def finish(self) -> list[str]:
+        """Close an ``<answer>`` the writer never closed (error, cancellation)."""
+        if self.writer_active:
+            return self._close_answer()
+        return []
+
+    # -- node lifecycle -----------------------------------------------------
+
+    def _node_start(self, node, event) -> list[str]:
+        if node == WORKER_NODE:
+            step = self._input(event).get("step")
+            if not isinstance(step, dict):
+                step = {}
+            return [_json_frame("agent_start", {
+                "step": step.get("step"),
+                "agent": step.get("agent", ""),
+                "subtask": step.get("subtask", ""),
+                "depends_on": step.get("depends_on", []),
+            })]
+        if node == WRITER_NODE:
+            self.writer_active = True
+            self.answer_chars = 0
+            self.in_think = False
+            return ["<answer>"]
+        return []
+
+    def _node_end(self, node, event) -> list[str]:
+        if node == ORCHESTRATOR_NODE:
+            plan = self._output(event).get("plan")
+            if not isinstance(plan, list):
+                plan = []
+            return [_json_frame("plan", {"plan": plan})]
+        if node == WORKER_NODE:
+            stats = self._output(event).get("step_stats")
+            entry = stats[0] if isinstance(stats, list) and stats else {}
+            if not isinstance(entry, dict):
+                entry = {}
+            return [_json_frame("agent_end", entry)]
+        if node == VERIFY_NODE:
+            output = self._output(event)
+            report = output.get("verifier_report") or output.get("verification_notes") or ""
+            return [_frame("verification", str(report))]
+        if node == WRITER_NODE:
+            if not self.writer_active:
+                # No start event was seen (never expected) — still deliver the
+                # document rather than swallowing the whole answer.
+                final = self._output(event).get("final_output") or ""
+                return ["<answer>", str(final), "</answer>"] if final else []
+            frames: list[str] = []
+            if self.answer_chars == 0:
+                # The writer produced no streamed token — a non-streaming
+                # client, or the budget-exhaustion finalize pass. Emit the
+                # assembled document itself so the reader is never left with
+                # an empty answer.
+                final = self._output(event).get("final_output") or ""
+                if final:
+                    frames.append(str(final))
+            frames.extend(self._close_answer())
+            return frames
+        return []
+
+    # -- token / tool stream ------------------------------------------------
+
+    def _model_start(self) -> list[str]:
+        # A second LLM call while the writer is streaming means the bounded
+        # attempt loop re-invoked it: everything sent so far is a dead draft.
+        if self.writer_active and self.answer_chars:
+            frames = self._close_think()
+            frames.append("<answer_restart>")
+            self.answer_chars = 0
+            return frames
+        return []
+
+    def _model_stream(self, event) -> list[str]:
+        if not self.writer_active:
+            return []
+        chunk = (event.get("data") or {}).get("chunk")
+        if chunk is None:
+            return []
+        if STREAM_WRITER_REASONING:
+            reasoning = _reasoning_delta(chunk)
+            if reasoning:
+                if self.in_think:
+                    return [reasoning]
+                self.in_think = True
+                return ["<think>", reasoning]
+        visible = _visible_delta(chunk)
+        if not visible:
+            return []
+        frames = self._close_think()
+        self.answer_chars += len(visible)
+        frames.append(visible)
+        return frames
+
+    def _tool_start(self, event) -> list[str]:
+        # Sub-agent tool calls are deliberately invisible: a step reports only
+        # that it started and that it finished.
+        if not self.writer_active:
+            return []
+        data = event.get("data") or {}
+        args = data.get("input", data)
+        return [_json_frame("tool", {
+            "name": event.get("name", "unknown_tool"),
+            "args": args,
+        })]
+
+    # -- helpers ------------------------------------------------------------
+
+    def _close_think(self) -> list[str]:
+        if self.in_think:
+            self.in_think = False
+            return ["</think>"]
+        return []
+
+    def _close_answer(self) -> list[str]:
+        frames = self._close_think()
+        frames.append("</answer>")
+        self.writer_active = False
+        self.answer_chars = 0
+        return frames
+
+    @staticmethod
+    def _input(event) -> dict:
+        data = (event.get("data") or {}).get("input")
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _output(event) -> dict:
+        data = (event.get("data") or {}).get("output")
+        return data if isinstance(data, dict) else {}
+
+
 async def stream_pipeline(task: str, files: list | None = None, effort: str | None = None):
     """
-    Async generator yielding the marker protocol:
-    <thinking_step>, <think>/<non_think>, token text, TOOL name(args), stop.
+    Async generator yielding the marker protocol documented at module level:
+    ``<plan>``, ``<agent_start>``/``<agent_end>``, ``<verification>``,
+    ``<answer>`` + the writer's visible tokens, ``<tool>``, ``<stop>``.
 
-    Every run ends with ``<stop>``: on success after the last
-    ``<thinking_step>`` is closed with a blank line, and on failure after a
-    single-line ``[error] <message>`` frame. The per-stream checkpointer
-    thread is deleted when the generator finishes, whatever the outcome —
-    including a client disconnect (the SSE endpoint acalls ``aclose``).
+    Every run ends with ``<stop>``: on success after any open ``<answer>`` is
+    closed, and on failure after a single-line ``[error] <message>`` frame. The
+    per-stream checkpointer thread is deleted when the generator finishes,
+    whatever the outcome — including a client disconnect (the SSE endpoint
+    acalls ``aclose``).
 
     Each call uses a unique thread_id so the MemorySaver checkpointer never
     resumes a previous run — every request starts fresh.
@@ -132,56 +376,14 @@ async def stream_pipeline(task: str, files: list | None = None, effort: str | No
             "files": files_state,
         }
 
-        is_thinking = None                    # None = undecided for this step
-        open_step = False
-        current_agent = None
+        translator = _ProtocolTranslator()
         async for event in _get_graph().astream_events(state_in, config=config, version="v2"):
-            kind = event["event"]
+            for frame in translator.handle(event):
+                yield frame
 
-            agent_name = event.get("name", "unknown_agent")
-            # --- New agent turn -> <thinking_step> ---------------------------
-            if kind == "on_chain_start" and agent_name in _AGENT_NODES:
-                current_agent = agent_name
-                if open_step:
-                    yield "\n\n"              # close previous iteration
-                yield "<thinking_step>"
-                yield f"{current_agent}\n"
-                open_step = True
-                is_thinking = None            # reset toggle each step
-                continue
-
-            if kind == "on_tool_start":
-                tool_name = event.get("name", "unknown_tool")
-                tool_args = event.get("data", {})
-                if tool_args:
-                    tool_args = tool_args.get("input", tool_args)  # some providers nest it
-                yield "<tool>"
-                yield f"{tool_name}"
-                yield f"({json.dumps(tool_args)})"
-                yield "</tool>"
-                continue
-
-            # --- Streaming LLM tokens ----------------------------------------
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                reasoning = _reasoning_delta(chunk)
-                if reasoning:
-                    if is_thinking is not True:
-                        is_thinking = True
-                        yield "<think>"
-                    yield reasoning        # raw token delta — yield as-is
-                    continue
-                visible = _visible_delta(chunk)
-                if visible:
-                    if is_thinking is not False:
-                        is_thinking = False
-                        yield "<non_think>"
-                    yield visible          # raw token delta — yield as-is
-                continue
-
-        # Normal completion: close the last <thinking_step>, then terminate.
-        if open_step:
-            yield "\n\n"
+        # Normal completion: close anything still open, then terminate.
+        for frame in translator.finish():
+            yield frame
         yield "<stop>"
     except Exception as exc:
         # One frame per error; newlines are escaped so the SSE transport (and
