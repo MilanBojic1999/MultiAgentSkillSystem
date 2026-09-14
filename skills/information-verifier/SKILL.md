@@ -37,7 +37,7 @@ This is different from "no source" — it's content that looks sourced but proba
 - A URL that doesn't match the claimed content — wrong domain for the supposed publisher, or a path that looks generated rather than like a real article slug.
 - A "quote" that reads like a paraphrase someone dressed up in quotation marks — overly clean, uses vocabulary the source wouldn't plausibly use, or is suspiciously on-the-nose for the question being asked.
 
-If you have live tools available (web fetch/search) and a specific claim's sourcing looks questionable, a quick spot-check of that one claim is fair game. That's different from redoing the worker's research — you're allowed to verify a red flag, not to go find the missing information yourself.
+Flags for fabrication are not always definitive proof, but they are enough to fail a finding and send it back for a retry or replan. Because you don't have the ability to check every source, you have to err on the side of caution: if it looks like fabrication, treat it as such. But do not be too strict — a finding that is sourced and answers the subquery is fine even if it has a minor red flag (e.g. a slightly off URL or a quote that reads a little too cleanly). Only fail it if the red flag is strong enough to make you doubt the finding's trustworthiness.
 
 ## Deciding the verdict
 
