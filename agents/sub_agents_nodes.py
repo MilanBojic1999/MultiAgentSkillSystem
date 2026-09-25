@@ -1,5 +1,6 @@
 import asyncio
 import time
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Awaitable, Callable
 
@@ -8,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler, CallbackManager
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda, RunnableConfig
+from langchain_core.runnables.config import var_child_runnable_config
 from skill_loader import load_skills, load_skills_body
 from tools.agent_tools import AGENT_TOOLS
 from utils.validator import validate_step_output
@@ -84,6 +86,47 @@ _FINALIZE_INSTRUCTION = (
     "final answer as plain text only."
 )
 
+# LangGraph task-internal keys carried by a node's config. Forwarding them to
+# the inner ReAct agent makes it run as a *subgraph* of the pipeline: it
+# checkpoints into the parent's saver (which overrides its own) under a task
+# namespace, so the budget-finalize pass can never find the conversation.
+_PARENT_TASK_CONFIG_KEYS = frozenset({"checkpoint_ns", "checkpoint_id", "checkpoint_map"})
+
+
+def _detach_configurable(configurable: dict | None) -> dict:
+    """A fresh ``configurable`` for the inner agent: user-level keys
+    (``thread_id``, ``task_id``, ``effort``, …) survive; langgraph's
+    ``__pregel_*`` internals and checkpoint addressing keys do not."""
+    return {
+        k: v for k, v in (configurable or {}).items()
+        if not k.startswith("__pregel_") and k not in _PARENT_TASK_CONFIG_KEYS
+    }
+
+
+@contextmanager
+def _detached_from_parent_task():
+    """Detach the inner agent from the parent task's *context-var* config too.
+
+    Stripping the explicit ``configurable`` is not enough: langgraph's own
+    ``ensure_config`` (``langgraph/_internal/_config.py``, 1.2.4) shallow-
+    MERGES the invoke-time ``configurable`` onto the one inherited from
+    ``var_child_runnable_config``, so the parent's ``__pregel_*`` keys would
+    come straight back. For the duration of the block the context var holds a
+    copy whose ``configurable`` is detached; callbacks, tags and metadata are
+    kept, so streaming (``astream_events``) and tracing still nest.
+    """
+    parent = var_child_runnable_config.get()
+    if not parent:
+        yield
+        return
+    token = var_child_runnable_config.set(
+        {**parent, "configurable": _detach_configurable(parent.get("configurable"))}
+    )
+    try:
+        yield
+    finally:
+        var_child_runnable_config.reset(token)
+
 
 async def _finalize_after_budget_exhaustion(
     agent: Any,
@@ -110,14 +153,21 @@ async def _finalize_after_budget_exhaustion(
     pre-existing callback handlers, kept so the parent run's callbacks fire
     on this pass too.
 
-    Defensive seed: if the thread has no checkpoint (it always has one in
+    Defensive seed: if the thread has no checkpoint, start a fresh
+    conversation with the subtask so the agent never finalizes blind. A
+    *detached* agent (see ``_detach_configurable``) always has one in
     langgraph 1.2.4 — the input checkpoint is committed before the first
-    model call), start a fresh conversation with the subtask so the agent
-    never finalizes blind.
+    model call — so the seed path is logged as ``tool_budget_finalize_seeded``
+    to make any regression visible.
     """
     finalize_config = dict(invoke_config)
     finalize_config["callbacks"] = [*parent_handlers, _ToolBudgetGuard(0)]
     if await saver.aget_tuple(finalize_config) is None:
+        log_event(
+            "tool_budget_finalize_seeded",
+            step_num=step_num,
+            agent_name=agent_name,
+        )
         payload = {
             "messages": [
                 ("user", subtask),
@@ -198,7 +248,11 @@ async def run_sub_agent_async(
 
     ``config`` is the run config threaded through from the graph invocation and
     forwarded to the sub-agent, so tools can read ``configurable`` (plan 4.5,
-    artifact paths). ``None`` is fine — the sub-agent runs with a fresh config.
+    artifact paths). Only user-level ``configurable`` keys are forwarded —
+    langgraph's task internals are stripped (``_detach_configurable``) so the
+    inner agent runs standalone on its own checkpointer, never as a nested
+    subgraph of the pipeline. ``None`` is fine — the sub-agent runs with a
+    fresh config.
 
     ``policy`` (effort slider) is the run's serialized execution policy, or
     ``None`` for callers without one (legacy graphs, standalone nodes — no
@@ -219,6 +273,10 @@ async def run_sub_agent_async(
     cap = policy.get("max_tool_calls_per_attempt") if policy else None
     budget = _ToolBudgetGuard(cap) if cap is not None else None
     invoke_config: dict = dict(config) if config else {}
+    # Strip the parent task's langgraph internals from the explicit config;
+    # the context-var copy is detached around the invokes below
+    # (``_detached_from_parent_task``) — see FINALIZE_HISTORY_FIX_PLAN.md.
+    invoke_config["configurable"] = _detach_configurable(invoke_config.get("configurable"))
     if policy:
         recursion_limit = policy.get("react_recursion_limit")
         if recursion_limit is not None:
@@ -240,13 +298,13 @@ async def run_sub_agent_async(
         parent_handlers = handlers
         invoke_config["callbacks"] = [*handlers, budget]
         # The checkpointer enables the budget-exhaustion finalize pass below:
-        # it must re-invoke the SAME thread, so a thread_id is required —
-        # setdefault, never overwrite a caller-provided one. Each attempt
-        # builds a fresh saver, so threads never collide across retries or
-        # parallel workers.
+        # it re-invokes the same thread on this saver — the caller's
+        # thread_id when present, else ``subagent-step-N``. Isolation comes
+        # from the per-attempt saver plus ``_detach_configurable`` (the agent
+        # never writes to the pipeline's saver), not from the thread id, so
+        # threads never collide across retries or parallel workers.
         saver = InMemorySaver()
-        configurable = invoke_config.setdefault("configurable", {})
-        configurable.setdefault("thread_id", f"subagent-step-{step['step']}")
+        invoke_config["configurable"].setdefault("thread_id", f"subagent-step-{step['step']}")
     agent_name   = step["agent"]
     step_num     = step["step"]
     llm          = llm or create_llm(**_llm_kwargs(AGENT_CONFIG.get(agent_name, {}).get("llm", {}), agent_name), streaming=streaming)
@@ -312,33 +370,34 @@ async def run_sub_agent_async(
             )
 
     budget_finalized = False
-    try:
-        # ``subtask`` here carries the verifier feedback block when present
-        # (F2) — the raw step text would silently drop it.
-        result = await agent.ainvoke(
-            {"messages": [("user", subtask)]}, config=invoke_config or None
-        )
-    except ToolBudgetExceededError:
-        log_event(
-            "tool_budget_exhausted",
-            step_num=step_num,
-            agent_name=agent_name,
-            tool_calls=budget.count if budget is not None else None,
-            max_tool_calls_per_attempt=cap,
-        )
-        if saver is None:  # defensive: a guard is always paired with a saver
-            raise
-        result = await _finalize_after_budget_exhaustion(
-            agent, saver, invoke_config, parent_handlers,
-            step_num, agent_name, subtask, cap,
-        )
-        budget_finalized = True
-        log_event(
-            "tool_budget_finalized",
-            step_num=step_num,
-            agent_name=agent_name,
-            tool_calls=budget.count if budget is not None else None,
-        )
+    with _detached_from_parent_task():
+        try:
+            # ``subtask`` here carries the verifier feedback block when present
+            # (F2) — the raw step text would silently drop it.
+            result = await agent.ainvoke(
+                {"messages": [("user", subtask)]}, config=invoke_config
+            )
+        except ToolBudgetExceededError:
+            log_event(
+                "tool_budget_exhausted",
+                step_num=step_num,
+                agent_name=agent_name,
+                tool_calls=budget.count if budget is not None else None,
+                max_tool_calls_per_attempt=cap,
+            )
+            if saver is None:  # defensive: a guard is always paired with a saver
+                raise
+            result = await _finalize_after_budget_exhaustion(
+                agent, saver, invoke_config, parent_handlers,
+                step_num, agent_name, subtask, cap,
+            )
+            budget_finalized = True
+            log_event(
+                "tool_budget_finalized",
+                step_num=step_num,
+                agent_name=agent_name,
+                tool_calls=budget.count if budget is not None else None,
+            )
 
     tools_used = [
         call

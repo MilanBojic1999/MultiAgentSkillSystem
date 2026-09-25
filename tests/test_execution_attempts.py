@@ -18,17 +18,22 @@ is covered by ``tests/test_config_loader.py``.
 
 import asyncio
 from collections import Counter
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 
 from agents import sub_agents_nodes as worker_mod
 from agents.sub_agents_nodes import (
     ToolBudgetExceededError,
     _ToolBudgetGuard,
+    _detach_configurable,
     make_parallel_sub_agent_node,
     make_sub_agent_node,
     run_step_with_attempts,
@@ -516,15 +521,18 @@ def test_run_sub_agent_finalize_failure_escapes_to_attempt_loop(monkeypatch):
         asyncio.run(run_sub_agent_async(step(1), {}, policy=policy))
 
     assert len(_ExplodingAgent.invoke_configs) == 2
+    # _ExplodingAgent never checkpoints, so the finalize pass takes the
+    # (logged) seed path.
     assert [event for event, _ in events] == [
         "run_sub_agent_start",
         "tool_budget_exhausted",
+        "tool_budget_finalize_seeded",
         "tool_budget_finalize_failed",
     ]
     _, kw = events[1]
     assert kw["agent_name"] == "researcher"
     assert kw["max_tool_calls_per_attempt"] == 2
-    assert events[2][1]["max_tool_calls_per_attempt"] == 2
+    assert events[3][1]["max_tool_calls_per_attempt"] == 2
 
 
 def test_run_sub_agent_merges_recursion_limit_and_guard_into_config(monkeypatch):
@@ -595,6 +603,7 @@ def test_run_sub_agent_finalizes_after_budget_exhaustion(monkeypatch):
     assert [event for event, _ in events] == [
         "run_sub_agent_start",
         "tool_budget_exhausted",
+        "tool_budget_finalize_seeded",  # the fake never checkpoints
         "tool_budget_finalized",
         "run_sub_agent_end",
     ]
@@ -612,14 +621,20 @@ def test_run_sub_agent_finalizes_after_budget_exhaustion(monkeypatch):
 def test_run_sub_agent_finalize_seeds_subtask_when_no_checkpoint(monkeypatch):
     """With no checkpoint on the thread (a stand-in agent never checkpoints),
     the finalize pass seeds the conversation with the subtask so the agent
-    never finalizes blind."""
+    never finalizes blind — and the seed path is logged so it is visible."""
     _script_exploding_agent(raise_times=1, answer="SEEDED")
     monkeypatch.setattr(worker_mod, "create_react_agent", _ExplodingAgent)
     monkeypatch.setattr(worker_mod, "create_mcp_client", lambda agent: None)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        worker_mod, "log_event", lambda event, **kw: events.append((event, kw))
+    )
     policy = {"max_tool_calls_per_attempt": 2, "react_recursion_limit": 7}
 
     _, output, _ = asyncio.run(run_sub_agent_async(step(1), {}, policy=policy))
     assert output == "SEEDED"
+    seeded = [kw for event, kw in events if event == "tool_budget_finalize_seeded"]
+    assert seeded == [{"step_num": 1, "agent_name": "researcher"}]
 
     finalize_payload = _ExplodingAgent.invoke_payloads[1]
     messages = finalize_payload["messages"]
@@ -698,3 +713,112 @@ def test_run_sub_agent_real_graph_resume_after_budget_raise(monkeypatch):
         "tool_budget_finalized",
         "run_sub_agent_end",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Finalize pass keeps the attempt's tool history (FINALIZE_HISTORY_FIX_PLAN.md)
+# ---------------------------------------------------------------------------
+
+def test_detach_configurable_strips_pregel_task_keys():
+    """User-level keys survive; langgraph task internals and checkpoint
+    addressing keys are dropped, into a new dict."""
+    configurable = {
+        "thread_id": "t",
+        "task_id": "a",
+        "effort": "thorough",
+        "checkpoint_ns": "sub_agent:x",
+        "checkpoint_id": "c",
+        "checkpoint_map": {},
+        "__pregel_checkpointer": object(),
+        "__pregel_task_id": "x",
+    }
+    before = dict(configurable)
+
+    detached = _detach_configurable(configurable)
+
+    assert detached == {"thread_id": "t", "task_id": "a", "effort": "thorough"}
+    assert detached is not configurable
+    assert configurable == before
+    assert _detach_configurable(None) == {}
+
+
+@tool
+def fake() -> str:
+    """Scripted test tool."""
+    return "FAKE-RESULT"
+
+
+class _RecordingModel(BaseChatModel):
+    """Real BaseChatModel that records every call's messages. Script: call 1
+    requests one tool call (within the cap-1 budget, so it executes), call 2
+    requests another (trips the guard), every later call answers plain."""
+
+    calls: ClassVar[list] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "recording"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        _RecordingModel.calls.append(list(messages))
+        n = len(_RecordingModel.calls)
+        if n <= 2:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fake", "args": {}, "id": f"call-{n}", "type": "tool_call"},
+                ],
+            )
+        else:
+            message = AIMessage(content="DONE-WITH-HISTORY")
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _ParentState(TypedDict):
+    out: str
+
+
+def test_run_sub_agent_finalize_keeps_tool_history_when_nested(monkeypatch):
+    """Regression for the 2026-09-25 trace: a worker running *inside a node of
+    a checkpointed parent graph* must finalize on its own saver, with the
+    attempt's executed tool results in the finalize call — not on a blind,
+    seeded conversation."""
+    _RecordingModel.calls = []
+    monkeypatch.setitem(worker_mod.AGENT_TOOLS, step(1)["agent"], [fake])
+    monkeypatch.setattr(worker_mod, "create_mcp_client", lambda agent: None)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        worker_mod, "log_event", lambda event, **kw: events.append((event, kw))
+    )
+    policy = {"max_tool_calls_per_attempt": 1, "react_recursion_limit": 10}
+
+    async def node(state: _ParentState, config: RunnableConfig) -> dict:
+        _, output, _ = await run_sub_agent_async(
+            step(1), {}, config=config, llm=_RecordingModel(), policy=policy
+        )
+        return {"out": output}
+
+    builder = StateGraph(_ParentState)
+    builder.add_node("sub_agent", node)
+    builder.add_edge(START, "sub_agent")
+    builder.add_edge("sub_agent", END)
+    parent = builder.compile(checkpointer=MemorySaver())
+
+    result = asyncio.run(
+        parent.ainvoke({"out": ""}, {"configurable": {"thread_id": "parent-t"}})
+    )
+
+    assert result["out"] == "DONE-WITH-HISTORY"
+    assert len(_RecordingModel.calls) == 3
+    finalize_messages = _RecordingModel.calls[-1]
+    assert any(
+        isinstance(m, ToolMessage) and m.content == "FAKE-RESULT"
+        for m in finalize_messages
+    )
+    assert sum(isinstance(m, HumanMessage) for m in finalize_messages) == 1
+    assert isinstance(finalize_messages[-1], SystemMessage)
+    assert "tool-call budget" in finalize_messages[-1].content
+    assert "tool_budget_finalize_seeded" not in [event for event, _ in events]
