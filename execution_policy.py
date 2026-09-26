@@ -93,7 +93,10 @@ _UNLIMITED_TIMEOUT_SECONDS = 3600
 # instant_writer_only             guaranteed single writer-worker route
 # max_plan_steps                  steps allowed in a validated plan
 # max_worker_attempts             total worker executions per step (incl. first)
-# max_tool_calls_per_attempt      in-flight guard, enforced during ReAct
+# max_tool_calls_per_attempt      in-flight guard, enforced during ReAct: an
+#                                 oversized batch runs the calls that fit and
+#                                 skips the rest; asking for tools once it is
+#                                 spent triggers the finalize pass
 # max_verification_attempts       attempts of the verifier's single LLM call
 # max_step_verification_retries   re-dispatch a deficient step with feedback
 # max_replans                     return to the orchestrator with feedback

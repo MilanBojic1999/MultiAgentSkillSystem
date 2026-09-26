@@ -1,13 +1,24 @@
 """Tests for ``agent_mcp_tools`` — transport detection, server-map building,
-ownership validation, and client construction (Phase 4.6).
+ownership validation, client construction (Phase 4.6), and per-attempt MCP
+call serialization (``serialize_tool_calls``).
 
 No live MCP server is required — we assert on the dict passed to
 ``MultiServerMCPClient``.
 """
 
-import pytest
+import asyncio
+import inspect
+from typing import Annotated
 
-from agent_mcp_tools import _build_server_map, _check_mcp_ownership, create_mcp_client
+import pytest
+from langchain_core.tools import InjectedToolArg, StructuredTool
+
+from agent_mcp_tools import (
+    _build_server_map,
+    _check_mcp_ownership,
+    create_mcp_client,
+    serialize_tool_calls,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +151,79 @@ def test_create_mcp_client_rejects_duplicate_ownership(monkeypatch):
     )
     with pytest.raises(ValueError, match=r"\['shared'\].*declared by both"):
         create_mcp_client("alice")
+
+
+# ---------------------------------------------------------------------------
+# serialize_tool_calls — one MCP call at a time per agent attempt
+# ---------------------------------------------------------------------------
+
+def _mcp_like_tool(name="search", tracker=None):
+    """A StructuredTool shaped like a langchain_mcp_adapters tool: dict
+    ``args_schema``, ``content_and_artifact``, and a coroutine taking an
+    injected ``runtime`` plus ``**arguments``."""
+
+    async def call_tool(
+        runtime: Annotated[object | None, InjectedToolArg()] = None,
+        **arguments,
+    ):
+        if tracker is not None:
+            tracker["in_flight"] += 1
+            tracker["max_in_flight"] = max(tracker["max_in_flight"], tracker["in_flight"])
+            await asyncio.sleep(0.01)
+            tracker["in_flight"] -= 1
+        return "ok", None
+
+    return StructuredTool(
+        name=name,
+        description="Search.",
+        args_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        coroutine=call_tool,
+        response_format="content_and_artifact",
+        metadata={"server": "yotta"},
+    )
+
+
+def test_serialize_tool_calls_keeps_tool_and_leaves_original_untouched():
+    original = _mcp_like_tool()
+    original_coroutine = original.coroutine
+
+    [copy] = serialize_tool_calls([original])
+
+    assert copy is not original
+    assert copy.name == "search"
+    assert copy.args_schema == original.args_schema
+    assert copy.response_format == "content_and_artifact"
+    assert copy.metadata == {"server": "yotta"}
+    assert original.coroutine is original_coroutine
+    assert copy.coroutine is not original_coroutine
+    # functools.wraps keeps the original signature visible, so the injected
+    # ``runtime`` argument is still detected through the wrapper.
+    assert copy.coroutine.__wrapped__ is original_coroutine
+    assert "runtime" in inspect.signature(copy.coroutine).parameters
+
+
+def test_serialize_tool_calls_passes_tools_without_coroutine_through():
+    def echo(q: str) -> str:
+        """Echo."""
+        return q
+
+    sync_tool = StructuredTool.from_function(func=echo)
+    assert serialize_tool_calls([sync_tool])[0] is sync_tool
+
+
+def test_serialize_tool_calls_runs_one_call_at_a_time_across_tools():
+    """All copies from one call share one lock — even different tools."""
+    tracker = {"in_flight": 0, "max_in_flight": 0}
+    tools = serialize_tool_calls(
+        [_mcp_like_tool("a", tracker), _mcp_like_tool("b", tracker)]
+    )
+
+    async def run():
+        return await asyncio.gather(
+            *(t.coroutine(q="x") for t in tools for _ in range(2))
+        )
+
+    results = asyncio.run(run())
+
+    assert results == [("ok", None)] * 4
+    assert tracker["max_in_flight"] == 1

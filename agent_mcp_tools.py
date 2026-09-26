@@ -15,7 +15,13 @@ Three config shapes are accepted (detected per server by key, Phase 4.6):
 
 ``${VAR}`` expansion in URLs is handled elsewhere (see ``_expand_env_vars``
 in ``langchain_mcp_adapters.sessions``).
+
+``serialize_tool_calls`` makes an agent's MCP tools run one call at a time
+(TOOL_BUDGET_MCP_SERIAL_PLAN.md, Change 1).
 """
+
+import asyncio
+import functools
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -96,3 +102,41 @@ def create_mcp_client(agent_name: str) -> MultiServerMCPClient | None:
     client = MultiServerMCPClient(_build_server_map(server_map))
 
     return client
+
+
+def _locked(coroutine, lock: asyncio.Lock):
+    """Wrap *coroutine* so each call holds *lock* for its whole duration.
+
+    ``functools.wraps`` is load-bearing: it sets ``__wrapped__`` and copies
+    ``__annotations__``, so ``StructuredTool._arun``'s ``signature()`` check
+    for ``callbacks``/config params and langgraph's ``ToolNode`` detection of
+    the MCP adapter's injected ``runtime`` argument still see the original
+    signature through the wrapper.
+    """
+    @functools.wraps(coroutine)
+    async def locked(*args, **kwargs):
+        async with lock:
+            return await coroutine(*args, **kwargs)
+
+    return locked
+
+
+def serialize_tool_calls(tools: list) -> list:
+    """Copies of *tools* that share one asyncio.Lock, so at most one of them
+    executes at a time. One call = one lock scope (per agent attempt).
+
+    The caller creates a fresh set per ``run_sub_agent_async`` call, so the
+    limit is per agent attempt: different agents still run in parallel, but
+    one agent's batch of MCP calls is queued client-side instead of flooding
+    the server. The originals are not modified (``model_copy``); ``args_schema``,
+    ``response_format`` and ``metadata`` carry over. Tools without a
+    ``coroutine`` are returned unchanged (defensive — MCP adapter tools are
+    async-only).
+    """
+    lock = asyncio.Lock()
+    return [
+        tool.model_copy(update={"coroutine": _locked(tool.coroutine, lock)})
+        if getattr(tool, "coroutine", None) is not None
+        else tool
+        for tool in tools
+    ]

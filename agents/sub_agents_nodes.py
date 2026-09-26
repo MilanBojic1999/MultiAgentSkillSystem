@@ -7,13 +7,13 @@ from typing import Any, Awaitable, Callable
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler, CallbackManager
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda, RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from skill_loader import load_skills, load_skills_body
 from tools.agent_tools import AGENT_TOOLS
 from utils.validator import validate_step_output
-from agent_mcp_tools import create_mcp_client
+from agent_mcp_tools import create_mcp_client, serialize_tool_calls
 from dotenv import load_dotenv
 from llm_factory import create_llm
 from utils.logger import log_event
@@ -33,50 +33,106 @@ _LLM_CONFIG_KEYS = {"model", "url", "api_key_env", "temperature", "max_tokens"}
 
 
 class ToolBudgetExceededError(RuntimeError):
-    """Raised when a ReAct attempt requests more tool calls than its effort
-    budget allows. Raised *in flight* (from a callback inside the agent loop,
-    before the offending tool ever executes) so ``run_sub_agent_async`` can
-    convert the exhaustion into a finalize pass — the agent is re-invoked on
-    the same checkpointer thread with a strict no-more-tools instruction and
-    finishes with the information already retrieved. Only if that finalize
-    pass still requests tools does the error escape to
-    ``run_step_with_attempts`` — the pipeline's single retry owner — which
-    decides whether to retry with a fresh per-attempt budget or contain the
-    step.
+    """Raised when a ReAct attempt requests tool calls after its effort budget
+    is already fully spent. Raised *in flight* (from a callback inside the
+    agent node, before that response is committed or any of its tools run) so
+    ``run_sub_agent_async`` can convert the exhaustion into a finalize pass —
+    the agent is re-invoked on the same checkpointer thread with a strict
+    no-more-tools instruction and finishes with the information already
+    retrieved. A batch that merely *overshoots* the remaining budget does not
+    raise: ``_ToolBudgetGuard.post_model_hook`` runs the calls that fit and
+    answers the rest as skipped. Only if the finalize pass still requests
+    tools does the error escape to ``run_step_with_attempts`` — the pipeline's
+    single retry owner — which decides whether to retry with a fresh
+    per-attempt budget or contain the step.
     """
 
 
-class _ToolBudgetGuard(BaseCallbackHandler):
-    """Callback that counts requested tool calls during ReAct execution.
+_SKIPPED_TOOL_CALL = (
+    "Not executed: this attempt's tool-call budget ({cap}) is exhausted. Do "
+    "not call more tools; answer with the results you already have."
+)
 
-    Fires on every model call inside the agent loop (``on_llm_end``) and
-    raises ``ToolBudgetExceededError`` the moment the cumulative count would
-    exceed the cap — the tool that broke the budget never executes.
-    ``raise_error = True`` is what makes the raise propagate out of
-    ``agent.ainvoke`` instead of being logged and swallowed by langchain's
-    callback manager. The exception is *not* fatal to the step: the runner
-    catches it and resumes the conversation with a finalize instruction (see
-    ``_finalize_after_budget_exhaustion``).
+
+class _ToolBudgetGuard(BaseCallbackHandler):
+    """Per-attempt tool budget: ``count`` is the number of calls *granted*
+    (i.e. executed), ``skipped`` the number answered as not executed.
+
+    Two halves (TOOL_BUDGET_MCP_SERIAL_PLAN.md, Change 2):
+
+    - ``on_llm_end`` fires on every model call inside the agent loop and
+      raises ``ToolBudgetExceededError`` only when the response requests
+      tools **and** the budget is already fully spent (``count >= cap``). It
+      must raise here, inside the agent node: the node fails, its
+      ``AIMessage`` is never committed, and the finalize pass resumes a
+      transcript with no unanswered tool calls. ``raise_error = True`` is what
+      makes the raise propagate out of ``agent.ainvoke`` instead of being
+      logged and swallowed by langchain's callback manager. The exception is
+      *not* fatal to the step: the runner catches it and resumes the
+      conversation with a finalize instruction (see
+      ``_finalize_after_budget_exhaustion``).
+    - ``post_model_hook`` (passed to ``create_react_agent``) grants the first
+      ``cap - count`` calls of a batch and answers the rest with an error
+      ``ToolMessage``. The prebuilt router then dispatches only the calls
+      that have no ``ToolMessage`` yet, so every tool call id gets exactly one
+      response and the transcript stays valid for the OpenAI-style API.
     """
 
     raise_error = True
 
-    def __init__(self, cap: int) -> None:
+    def __init__(self, cap: int, step_num: int | None = None, agent_name: str = "") -> None:
         self.cap = cap
         self.count = 0
+        self.skipped = 0
+        self.step_num = step_num
+        self.agent_name = agent_name
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         for generation in (response.generations or []):
             for gen in generation:
                 message = gen.message if hasattr(gen, "message") else None
                 tool_calls = getattr(message, "tool_calls", None) or []
-                self.count += len(tool_calls)
-                if self.count > self.cap:
+                if tool_calls and self.count >= self.cap:
                     raise ToolBudgetExceededError(
                         f"Tool budget exceeded: the attempt requested "
-                        f"{self.count} tool calls, the effort policy allows "
-                        f"{self.cap}. The offending call was not executed."
+                        f"{len(tool_calls)} more tool call(s) after using all "
+                        f"{self.cap} the effort policy allows. None of them "
+                        f"were executed."
                     )
+
+    def post_model_hook(self, state: dict) -> dict:
+        """Truncate the last model turn's tool batch to the remaining budget."""
+        message = state["messages"][-1]
+        tool_calls = message.tool_calls if isinstance(message, AIMessage) else []
+        if not tool_calls:
+            return {}
+        allowed = max(self.cap - self.count, 0)
+        granted = tool_calls[:allowed]
+        dropped = tool_calls[allowed:]
+        self.count += len(granted)
+        self.skipped += len(dropped)
+        if not dropped:
+            return {}
+        log_event(
+            "tool_budget_batch_truncated",
+            step_num=self.step_num,
+            agent_name=self.agent_name,
+            requested=len(tool_calls),
+            granted=len(granted),
+            skipped=len(dropped),
+            max_tool_calls_per_attempt=self.cap,
+        )
+        return {
+            "messages": [
+                ToolMessage(
+                    content=_SKIPPED_TOOL_CALL.format(cap=self.cap),
+                    tool_call_id=call["id"],
+                    name=call["name"],
+                    status="error",
+                )
+                for call in dropped
+            ]
+        }
 
 
 _FINALIZE_INSTRUCTION = (
@@ -237,7 +293,8 @@ async def run_sub_agent_async(
     """Run one sub-agent step. Returns (step_number, output_text, stats_dict).
 
     ``stats_dict`` carries the token counts and tool-call count that only the
-    inner invocation can see: ``input_tokens``, ``output_tokens``, ``tool_calls``.
+    inner invocation can see: ``input_tokens``, ``output_tokens``, ``tool_calls``
+    (executed calls when a budget is enforced) and ``tool_calls_skipped``.
     The calling worker node adds timing, step identity and status to build the
     full ``StepStats`` entry (Phase 4.9).
 
@@ -259,19 +316,29 @@ async def run_sub_agent_async(
     budget is enforced then, preserving current behavior). When present it
     enforces, *in flight*:
 
-    - ``max_tool_calls_per_attempt`` — a callback guard raises
-      ``ToolBudgetExceededError`` before the tool that would exceed the cap
-      ever executes; on exhaustion the agent is re-invoked once on the same
-      checkpointer thread with a strict finalize instruction (no more tools),
-      so the step succeeds with the information already retrieved. The error
-      escapes ``agent.ainvoke`` — and the bounded attempt loop decides whether
-      to retry (fresh per-attempt budget) or contain the step — only if that
-      finalize pass itself requests tools;
+    - ``max_tool_calls_per_attempt`` — a batch that needs more calls than the
+      budget has left runs its first ``remaining`` calls; the rest are
+      answered with a "not executed, budget exhausted" ``ToolMessage`` and the
+      agent continues (``_ToolBudgetGuard.post_model_hook``). If the model
+      asks for tools once the budget is fully spent, a callback guard raises
+      ``ToolBudgetExceededError`` before that turn is committed, and the agent
+      is re-invoked once on the same checkpointer thread with a strict
+      finalize instruction (no more tools), so the step succeeds with the
+      information already retrieved. The error escapes ``agent.ainvoke`` —
+      and the bounded attempt loop decides whether to retry (fresh
+      per-attempt budget) or contain the step — only if that finalize pass
+      itself requests tools;
     - ``react_recursion_limit`` — merged into the inner invocation config, so
       the ReAct model/tool loop is bounded even when no tool is called.
+
+    MCP tools run one call at a time per attempt (``serialize_tool_calls``),
+    with or without a policy; native tools are unaffected.
     """
     cap = policy.get("max_tool_calls_per_attempt") if policy else None
-    budget = _ToolBudgetGuard(cap) if cap is not None else None
+    budget = (
+        _ToolBudgetGuard(cap, step_num=step["step"], agent_name=step["agent"])
+        if cap is not None else None
+    )
     invoke_config: dict = dict(config) if config else {}
     # Strip the parent task's langgraph internals from the explicit config;
     # the context-var copy is detached around the invokes below
@@ -351,8 +418,14 @@ async def run_sub_agent_async(
     if feedback:
         subtask = f"{subtask}\n\n## Verifier feedback on the previous attempt (address this)\n{feedback}"
 
+    # With a budget, the post-model hook truncates oversized tool batches
+    # to what the budget has left (TOOL_BUDGET_MCP_SERIAL_PLAN.md, Change 2).
+    post_model_hook = budget.post_model_hook if budget is not None else None
+
     if mcp_client is not None:
-        mcp_tools = await mcp_client.get_tools()
+        # One MCP call at a time per attempt: a fresh lock per call of this
+        # function, so different workers still run in parallel.
+        mcp_tools = serialize_tool_calls(await mcp_client.get_tools())
         all_tools = native_tools + mcp_tools
 
         agent = create_react_agent(
@@ -360,6 +433,7 @@ async def run_sub_agent_async(
             tools=all_tools,
             prompt=SystemMessage(content=system_prompt),
             checkpointer=saver,
+            post_model_hook=post_model_hook,
         )
     else:
         agent = create_react_agent(
@@ -367,6 +441,7 @@ async def run_sub_agent_async(
                 tools=native_tools,
                 prompt=SystemMessage(content=system_prompt),
                 checkpointer=saver,
+                post_model_hook=post_model_hook,
             )
 
     budget_finalized = False
@@ -383,6 +458,7 @@ async def run_sub_agent_async(
                 step_num=step_num,
                 agent_name=agent_name,
                 tool_calls=budget.count if budget is not None else None,
+                skipped=budget.skipped if budget is not None else None,
                 max_tool_calls_per_attempt=cap,
             )
             if saver is None:  # defensive: a guard is always paired with a saver
@@ -418,8 +494,11 @@ async def run_sub_agent_async(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         # With an in-flight budget guard the counter is the authoritative
-        # count of requested tool calls; without one, count from the messages.
+        # count of executed (granted) tool calls; without one, count the
+        # requested calls from the messages.
         "tool_calls": budget.count if budget is not None else len(tools_used),
+        # Calls answered "not executed" because the batch overshot the budget.
+        "tool_calls_skipped": budget.skipped if budget is not None else 0,
         # True when the attempt hit the budget and finished via the finalize
         # pass instead of a normal tool-less completion.
         "budget_exhausted": budget_finalized,

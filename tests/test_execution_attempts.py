@@ -25,7 +25,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool, tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -444,21 +444,90 @@ def _generation(tool_calls=0):
     return ChatGeneration(message=AIMessage(content="", tool_calls=calls))
 
 
-def test_tool_budget_guard_blocks_before_cap_plus_one():
-    """Cap 2: two requested calls pass, the third raises — in flight."""
+def test_tool_budget_guard_raises_only_once_the_budget_is_spent():
+    """Cap 2: tool requests pass while fewer than 2 calls were granted (the
+    guard no longer counts — ``post_model_hook`` grants); once the granted
+    count reaches the cap, any further tool request raises — in flight."""
     guard = _ToolBudgetGuard(2)
     guard.on_llm_end(LLMResult(generations=[[_generation(1)]]))
-    guard.on_llm_end(LLMResult(generations=[[_generation(1)]]))
-    assert guard.count == 2
+    assert guard.count == 0
+    guard.count = 2  # two calls granted by post_model_hook
+    guard.on_llm_end(LLMResult(generations=[[_generation(0)]]))  # plain answer ok
     with pytest.raises(ToolBudgetExceededError, match="Tool budget exceeded"):
         guard.on_llm_end(LLMResult(generations=[[_generation(1)]]))
 
 
-def test_tool_budget_guard_raises_within_a_single_response():
-    """A response requesting more calls than the cap fails on that response."""
+def test_tool_budget_guard_does_not_raise_on_a_single_oversized_response():
+    """A response requesting more calls than the cap does *not* raise — the
+    post-model hook truncates the batch instead."""
     guard = _ToolBudgetGuard(1)
+    guard.on_llm_end(LLMResult(generations=[[_generation(5)]]))
+    assert guard.count == 0
+
+
+def test_tool_budget_guard_cap_zero_raises_on_any_tool_request():
+    """Instant's cap (0): the budget is spent from the start, so any tool
+    request raises — unchanged from the old rule."""
     with pytest.raises(ToolBudgetExceededError):
-        guard.on_llm_end(LLMResult(generations=[[_generation(2)]]))
+        _ToolBudgetGuard(0).on_llm_end(LLMResult(generations=[[_generation(1)]]))
+
+
+def _tool_calls(*ids):
+    return [{"name": "t", "args": {}, "id": i, "type": "tool_call"} for i in ids]
+
+
+def test_tool_budget_post_model_hook_truncates_batch(monkeypatch):
+    """Cap 3 with 1 already granted, 4 requested: the first 2 are granted
+    (left for the tool node), ids 3 and 4 are answered as skipped."""
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        worker_mod, "log_event", lambda event, **kw: events.append((event, kw))
+    )
+    guard = _ToolBudgetGuard(3, step_num=1, agent_name="researcher")
+    guard.count = 1
+    state = {
+        "messages": [
+            HumanMessage(content="q"),
+            AIMessage(content="", tool_calls=_tool_calls("id1", "id2", "id3", "id4")),
+        ]
+    }
+
+    update = guard.post_model_hook(state)
+
+    skipped = update["messages"]
+    assert [m.tool_call_id for m in skipped] == ["id3", "id4"]
+    assert all(isinstance(m, ToolMessage) and m.status == "error" for m in skipped)
+    assert all(m.name == "t" for m in skipped)
+    assert "budget (3) is exhausted" in skipped[0].content
+    assert guard.count == 3
+    assert guard.skipped == 2
+    assert events == [(
+        "tool_budget_batch_truncated",
+        {
+            "step_num": 1,
+            "agent_name": "researcher",
+            "requested": 4,
+            "granted": 2,
+            "skipped": 2,
+            "max_tool_calls_per_attempt": 3,
+        },
+    )]
+
+
+def test_tool_budget_post_model_hook_grants_a_batch_that_fits(monkeypatch):
+    """A batch within the remaining budget is granted whole: no messages are
+    added, nothing is logged, and ``count`` grows by the batch size. A plain
+    answer (no tool calls) is a no-op."""
+    events: list = []
+    monkeypatch.setattr(worker_mod, "log_event", lambda event, **kw: events.append(event))
+    guard = _ToolBudgetGuard(3)
+
+    fits = {"messages": [AIMessage(content="", tool_calls=_tool_calls("a", "b"))]}
+    assert guard.post_model_hook(fits) == {}
+    assert guard.post_model_hook({"messages": [AIMessage(content="done")]}) == {}
+
+    assert (guard.count, guard.skipped) == (2, 0)
+    assert events == []
 
 
 def test_tool_budget_guard_without_tool_calls_never_raises():
@@ -483,7 +552,7 @@ class _ExplodingAgent:
     raise_times = float("inf")   # class-level script; set before each test
     answer = "finalized"
 
-    def __init__(self, *, model, tools, prompt, checkpointer=None):
+    def __init__(self, *, model, tools, prompt, checkpointer=None, post_model_hook=None):
         pass
 
     async def ainvoke(self, payload, config=None):
@@ -664,22 +733,29 @@ def test_run_sub_agent_finalize_preserves_caller_configurable(monkeypatch):
 
 class _ScriptedModel(BaseChatModel):
     """Real BaseChatModel with a call-by-call script: the first call requests
-    two tool calls (trips the cap-1 guard), every later call answers plain."""
+    ``batch`` ``fake`` tool calls in one turn, every later call answers plain.
+    Records every call's messages in ``seen``."""
 
     calls: ClassVar[int] = 0
+    batch: ClassVar[int] = 2
+    seen: ClassVar[list] = []
 
     @property
     def _llm_type(self) -> str:
         return "scripted"
 
+    def bind_tools(self, tools, **kwargs):
+        return self
+
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         _ScriptedModel.calls += 1
+        _ScriptedModel.seen.append(list(messages))
         if _ScriptedModel.calls == 1:
             message = AIMessage(
                 content="",
                 tool_calls=[
-                    {"name": "fake", "args": {}, "id": "call-1", "type": "tool_call"},
-                    {"name": "fake", "args": {}, "id": "call-2", "type": "tool_call"},
+                    {"name": "fake", "args": {}, "id": f"call-{i}", "type": "tool_call"}
+                    for i in range(1, _ScriptedModel.batch + 1)
                 ],
             )
         else:
@@ -687,17 +763,36 @@ class _ScriptedModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
-def test_run_sub_agent_real_graph_resume_after_budget_raise(monkeypatch):
-    """Hermetic end-to-end of the resume mechanics: the real
-    ``create_react_agent`` + ``InMemorySaver`` + guard callback resume the
-    conversation after the raise and finalize with the scripted answer."""
+def _script_model(batch):
+    """Reset the class-level model script before a test uses it."""
     _ScriptedModel.calls = 0
+    _ScriptedModel.batch = batch
+    _ScriptedModel.seen = []
+
+
+_COUNTED_RUNS: list[str] = []
+
+
+@tool("fake")
+def counted_fake() -> str:
+    """Scripted test tool that records each execution."""
+    _COUNTED_RUNS.append("run")
+    return "FAKE-RESULT"
+
+
+def test_run_sub_agent_real_graph_oversized_first_batch_runs_what_fits(monkeypatch):
+    """Cap 1, two calls requested in the first turn (the light-effort trace
+    defect): the first runs, the second is answered as skipped, and the agent
+    completes normally — no budget raise, no finalize pass."""
+    _script_model(batch=2)
+    _COUNTED_RUNS.clear()
+    monkeypatch.setitem(worker_mod.AGENT_TOOLS, step(1)["agent"], [counted_fake])
     monkeypatch.setattr(worker_mod, "create_mcp_client", lambda agent: None)
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         worker_mod, "log_event", lambda event, **kw: events.append((event, kw))
     )
-    policy = {"max_tool_calls_per_attempt": 1, "react_recursion_limit": 6}
+    policy = {"max_tool_calls_per_attempt": 1, "react_recursion_limit": 10}
 
     step_num, output, stats = asyncio.run(
         run_sub_agent_async(step(1), {}, llm=_ScriptedModel(), policy=policy)
@@ -705,14 +800,92 @@ def test_run_sub_agent_real_graph_resume_after_budget_raise(monkeypatch):
 
     assert step_num == 1
     assert output == "DONE-FINAL"
-    assert stats["budget_exhausted"] is True
-    assert stats["tool_calls"] == 2  # both requested calls, none executed
+    assert len(_COUNTED_RUNS) == 1
+    assert stats["budget_exhausted"] is False
+    assert stats["tool_calls"] == 1  # executed
+    assert stats["tool_calls_skipped"] == 1
     assert [event for event, _ in events] == [
         "run_sub_agent_start",
-        "tool_budget_exhausted",
-        "tool_budget_finalized",
+        "tool_budget_batch_truncated",
         "run_sub_agent_end",
     ]
+
+
+def test_run_sub_agent_real_graph_partial_batch_within_budget(monkeypatch):
+    """Cap 2, three calls requested in one turn: ``fake`` executes exactly
+    twice, and the model's next call sees two results plus one skip message
+    — every tool call id answered once, no finalize."""
+    _script_model(batch=3)
+    _COUNTED_RUNS.clear()
+    monkeypatch.setitem(worker_mod.AGENT_TOOLS, step(1)["agent"], [counted_fake])
+    monkeypatch.setattr(worker_mod, "create_mcp_client", lambda agent: None)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        worker_mod, "log_event", lambda event, **kw: events.append((event, kw))
+    )
+    policy = {"max_tool_calls_per_attempt": 2, "react_recursion_limit": 10}
+
+    _, output, stats = asyncio.run(
+        run_sub_agent_async(step(1), {}, llm=_ScriptedModel(), policy=policy)
+    )
+
+    assert output == "DONE-FINAL"
+    assert len(_COUNTED_RUNS) == 2
+    assert _ScriptedModel.calls == 2
+    tool_messages = [m for m in _ScriptedModel.seen[-1] if isinstance(m, ToolMessage)]
+    assert sorted(m.tool_call_id for m in tool_messages) == ["call-1", "call-2", "call-3"]
+    assert sum(m.content == "FAKE-RESULT" for m in tool_messages) == 2
+    skipped = [m for m in tool_messages if m.status == "error"]
+    assert [m.tool_call_id for m in skipped] == ["call-3"]
+    assert "Not executed" in skipped[0].content
+    assert (stats["tool_calls"], stats["tool_calls_skipped"]) == (2, 1)
+    assert stats["budget_exhausted"] is False
+    assert "tool_budget_exhausted" not in [event for event, _ in events]
+
+
+class _FakeMCPClient:
+    """``MultiServerMCPClient`` stand-in: only ``get_tools`` is used."""
+
+    def __init__(self, tools):
+        self._tools = tools
+
+    async def get_tools(self):
+        return list(self._tools)
+
+
+def test_run_sub_agent_runs_mcp_calls_one_at_a_time(monkeypatch):
+    """Three MCP calls requested in one turn all execute, but never
+    concurrently — the per-attempt lock from ``serialize_tool_calls``. No
+    policy: serialization does not depend on a budget."""
+    _script_model(batch=3)
+    tracker = {"in_flight": 0, "max_in_flight": 0, "runs": 0}
+
+    async def call_tool(**arguments):
+        tracker["in_flight"] += 1
+        tracker["max_in_flight"] = max(tracker["max_in_flight"], tracker["in_flight"])
+        await asyncio.sleep(0.01)
+        tracker["in_flight"] -= 1
+        tracker["runs"] += 1
+        return "MCP-RESULT"
+
+    mcp_tool = StructuredTool(
+        name="fake",
+        description="Fake MCP tool.",
+        args_schema={"type": "object", "properties": {}},
+        coroutine=call_tool,
+    )
+    monkeypatch.setitem(worker_mod.AGENT_TOOLS, step(1)["agent"], [])
+    monkeypatch.setattr(
+        worker_mod, "create_mcp_client", lambda agent: _FakeMCPClient([mcp_tool])
+    )
+
+    _, output, _ = asyncio.run(
+        run_sub_agent_async(step(1), {}, llm=_ScriptedModel())
+    )
+
+    assert output == "DONE-FINAL"
+    assert tracker["runs"] == 3
+    assert tracker["max_in_flight"] == 1
 
 
 # ---------------------------------------------------------------------------

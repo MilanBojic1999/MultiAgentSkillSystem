@@ -258,10 +258,17 @@ Guarantees and semantics:
 - Effective worker attempts are `min(agent_config.max_attempts,
   policy.max_worker_attempts)` — static agent configuration stays an upper
   limit, and effort never touches model/temperature/`max_tokens` settings.
-- When a worker exceeds its per-attempt tool budget, the agent is told to
-  finalize with the information it already retrieved (a strict finalize pass
-  with **no further tool calls**) instead of failing the step — the step fails
-  only if the agent still requests tools on that finalize pass.
+- "Tool calls / attempt" counts **executed** calls. When one model turn asks
+  for more calls than the budget has left, the first `remaining` calls run
+  and the rest are answered with a "not executed, budget exhausted" tool
+  result — the batch is truncated, not rejected, and the agent continues.
+  Only if the agent asks for tools after the budget is fully spent is it told
+  to finalize with the information it already retrieved (a strict finalize
+  pass with **no further tool calls**) instead of failing the step — the step
+  fails only if the agent still requests tools on that finalize pass.
+- Each agent runs its **MCP tool calls one at a time** (queued client-side, so
+  a server's timeout only starts once a call is sent); different agents still
+  run in parallel, and native tools are unaffected.
 - When the verification budget is exhausted, the writer still synthesizes the
   best available result with an explicit `partial` status and a
   "Partial result warning" block (verifier notes included) — never a loop,
