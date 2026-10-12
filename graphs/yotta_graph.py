@@ -501,7 +501,9 @@ async def verify_node(state: dict) -> dict:
             + f"\n\n## Sub-agent results\n{results_summary}\n\n"
         ),
         "skills_needed": ["information-verifier"],
-        "depends_on": [s["step"] for s in plan],
+        # Results are rendered into the subtask; depends_on would duplicate
+        # them as "## Upstream context" in the system prompt.
+        "depends_on": [],
     }
 
     # Bounded attempt loop (Slice 3): the verifier's single LLM call runs
@@ -903,7 +905,10 @@ async def writer_node(state: dict) -> dict:
         "agent": "writer",
         "subtask": subtask,
         "skills_needed": ["answer-writer"],
-        "depends_on": list(results.keys()),
+        # No depends_on: the results are already rendered into the subtask
+        # above. Listing them here would make run_sub_agent_async inject them
+        # a second time as "## Upstream context" in the system prompt.
+        "depends_on": [],
     }
 
     # Bounded attempt loop (Slice 3), same as the workers and verifier —
@@ -967,7 +972,8 @@ async def citatitaion_node(state: dict) -> dict:
             )
         ),
         "skills_needed": ["citation-qa-agent"],
-        "depends_on": list(results.keys()),
+        # Findings are rendered into the subtask — see writer_node.
+        "depends_on": [],
     }
 
     _, output, _ = await run_sub_agent_async(
