@@ -17,7 +17,13 @@ from langgraph.errors import NodeCancelledError
 
 from agents.agent_states import RESULTS_RESET, YottaState
 from execution_policy import ExecutionPolicy, resolve_execution_policy
-from graphs.yotta_graph import _latest_retry_note, after_verify, fan_out_router
+from graphs.yotta_graph import (
+    _carry_forward,
+    _latest_retry_note,
+    after_verify,
+    carry_forward_node,
+    fan_out_router,
+)
 from tests.plans import DIAMOND_PLAN, LINEAR_PLAN, step
 
 CONFIG = {"configurable": {"thread_id": "test-yotta-graph"}}
@@ -190,13 +196,132 @@ def test_latest_retry_note_empty_without_retry_lines():
 
 
 # ---------------------------------------------------------------------------
-# YottaState.results reducer — sentinel clears, ordinary merges accumulate
+# YottaState.results reducer — sentinel replaces, ordinary merges accumulate
 # ---------------------------------------------------------------------------
 
 def test_yotta_results_reducer_sentinel_clears_and_merges_accumulate():
     reducer = YottaState.__annotations__["results"].__metadata__[0]
     assert reducer({1: "a", 2: "b"}, {RESULTS_RESET: ""}) == {}
     assert reducer({1: "a"}, {2: "b"}) == {1: "a", 2: "b"}
+
+
+def test_yotta_results_reducer_sentinel_replaces_with_rest_of_update():
+    """The sentinel gives the update replace semantics: the channel becomes
+    the rest of that update, with the sentinel itself dropped."""
+    reducer = YottaState.__annotations__["results"].__metadata__[0]
+    assert reducer({1: "a", 2: "b", 3: "c"}, {RESULTS_RESET: "", 2: "b"}) == {2: "b"}
+
+
+# ---------------------------------------------------------------------------
+# Replan carry-forward — _carry_forward / carry_forward_node
+# ---------------------------------------------------------------------------
+
+def _verdict(n, verdict="PASSED", subtask=None, agent="researcher", **extra):
+    """A step_verifications entry as verify_node records it (subtask stamped)."""
+    return {"verdict": verdict, "notes": "", "retries": 0,
+            "subtask": subtask if subtask is not None else f"subtask {n}",
+            "agent": agent, **extra}
+
+
+DIAMOND_RESULTS = {1: "out-1", 2: "out-2", 3: "out-3"}
+
+
+def test_carry_forward_keeps_passed_unchanged_steps():
+    svs = {n: _verdict(n) for n in (1, 2, 3)}
+    kept, verifs = _carry_forward(DIAMOND_PLAN, DIAMOND_RESULTS, svs)
+    assert kept == DIAMOND_RESULTS
+    assert set(verifs) == {1, 2, 3}
+
+
+def test_carry_forward_reruns_failed_step_and_its_dependents():
+    """Step 1 FAILED → it re-runs; step 3 depends on it → re-runs too even
+    though it PASSED; independent step 2 is carried."""
+    svs = {1: _verdict(1, "FAILED"), 2: _verdict(2), 3: _verdict(3)}
+    kept, verifs = _carry_forward(DIAMOND_PLAN, DIAMOND_RESULTS, svs)
+    assert kept == {2: "out-2"}
+    # all three still match the new plan — their verdicts (and any retry
+    # feedback) survive, carried or not
+    assert set(verifs) == {1, 2, 3}
+
+
+def test_carry_forward_invalidation_is_transitive():
+    """1 → 2 → 3 chain: re-running step 1 re-runs the whole chain."""
+    svs = {1: _verdict(1, "FAILED"), 2: _verdict(2), 3: _verdict(3)}
+    kept, _ = _carry_forward(LINEAR_PLAN, DIAMOND_RESULTS, svs)
+    assert kept == {}
+
+
+def test_carry_forward_accepts_passed_with_notes():
+    svs = {n: _verdict(n, "PASSED WITH NOTES") for n in (1, 2, 3)}
+    kept, _ = _carry_forward(DIAMOND_PLAN, DIAMOND_RESULTS, svs)
+    assert kept == DIAMOND_RESULTS
+
+
+def test_carry_forward_reworded_subtask_reruns_and_drops_verdict():
+    """A reworded subtask is a different step: not carried, and its old
+    verdict is dropped."""
+    plan = [step(1), {**step(2), "subtask": "a reworded subtask 2"}, step(3, deps=[1, 2])]
+    svs = {n: _verdict(n) for n in (1, 2, 3)}
+    kept, verifs = _carry_forward(plan, DIAMOND_RESULTS, svs)
+    assert kept == {1: "out-1"}             # 2 reworded, 3 depends on 2
+    assert set(verifs) == {1, 3}
+
+
+def test_carry_forward_ignores_whitespace_and_case_in_subtask():
+    plan = [step(1), {**step(2), "subtask": "  SubTask   2 "}, step(3, deps=[1, 2])]
+    svs = {n: _verdict(n) for n in (1, 2, 3)}
+    kept, _ = _carry_forward(plan, DIAMOND_RESULTS, svs)
+    assert kept == DIAMOND_RESULTS
+
+
+def test_carry_forward_changed_agent_reruns():
+    plan = [step(1), step(2, agent="mathematician"), step(3, deps=[1, 2])]
+    svs = {n: _verdict(n) for n in (1, 2, 3)}
+    kept, verifs = _carry_forward(plan, DIAMOND_RESULTS, svs)
+    assert kept == {1: "out-1"}
+    assert 2 not in verifs
+
+
+def test_carry_forward_drops_verdicts_for_removed_steps():
+    """Old step 3 FAILED and was replaced by new step 4: its stale FAILED
+    verdict must not survive, or the aggregate would stay FAILED forever."""
+    plan = [step(1), step(2), step(4, deps=[1, 2])]
+    svs = {1: _verdict(1), 2: _verdict(2), 3: _verdict(3, "FAILED")}
+    kept, verifs = _carry_forward(plan, DIAMOND_RESULTS, svs)
+    assert kept == {1: "out-1", 2: "out-2"}
+    assert set(verifs) == {1, 2}
+
+
+def test_carry_forward_never_carries_failure_or_skip_markers():
+    results = {1: "[STEP FAILED] boom", 2: "[SKIPPED — dependency failed]", 3: "out-3"}
+    plan = [step(1), step(2), step(3)]
+    svs = {n: _verdict(n) for n in (1, 2, 3)}
+    kept, _ = _carry_forward(plan, results, svs)
+    assert kept == {3: "out-3"}
+
+
+def test_carry_forward_ignores_verdicts_without_a_recorded_subtask():
+    """Entries from before verify_node stamped subtasks (or its parse-failure
+    path) can't be matched, so nothing is carried — the safe default."""
+    svs = {n: {"verdict": "PASSED", "notes": "", "retries": 0} for n in (1, 2, 3)}
+    kept, verifs = _carry_forward(DIAMOND_PLAN, DIAMOND_RESULTS, svs)
+    assert kept == {} and verifs == {}
+
+
+def test_carry_forward_node_is_a_noop_on_the_first_pass():
+    state = {"plan": DIAMOND_PLAN, "results": DIAMOND_RESULTS,
+             "step_verifications": {n: _verdict(n) for n in (1, 2, 3)},
+             "replan_count": 0}
+    assert carry_forward_node(state) == {}
+
+
+def test_carry_forward_node_replaces_results_after_a_replan():
+    state = {"plan": DIAMOND_PLAN, "results": DIAMOND_RESULTS, "replan_count": 1,
+             "step_verifications": {1: _verdict(1, "FAILED"), 2: _verdict(2),
+                                    3: _verdict(3)}}
+    out = carry_forward_node(state)
+    assert out["results"] == {RESULTS_RESET: "", 2: "out-2"}
+    assert set(out["step_verifications"]) == {1, 2, 3}
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +402,12 @@ def test_e2e_retry_reruns_failed_step_exactly_once_with_feedback(monkeypatch):
     assert out["step_verifications"][2]["retries"] == 1
 
 
-def test_e2e_replan_wipes_results_and_routes_to_writer_at_cap(monkeypatch):
-    """Every verify pass demands a replan: the orchestrator runs again, the
-    reset sentinel wipes results so workers re-run, and at the replan cap the
-    run falls through to the writer."""
+def test_e2e_replan_carries_passed_steps_and_routes_to_writer_at_cap(monkeypatch):
+    """Every verify pass demands a replan of step 1: the orchestrator runs
+    again, and only what needs it re-runs — step 1 (FAILED) and step 3 (its
+    upstream re-ran). Step 2 PASSED, is unchanged in the new plan and has no
+    re-running upstream, so its output is carried forward. At the replan cap
+    the run falls through to the writer with every result intact."""
     orchestrator_calls = {"n": 0}
 
     def counting_orchestrator(state):
@@ -299,8 +426,9 @@ def test_e2e_replan_wipes_results_and_routes_to_writer_at_cap(monkeypatch):
     # initial plan + 2 replan passes = 3 orchestrator calls, then the cap
     # routes to the writer instead of a fourth pass
     assert orchestrator_calls["n"] == 3
-    # results were wiped on each replan — every step re-ran 3 times
-    assert sorted(s for s, _ in fake.worker_calls) == [1, 1, 1, 2, 2, 2, 3, 3, 3]
+    # step 2 ran once and was carried across both replans; 1 and 3 re-ran
+    assert sorted(s for s, _ in fake.worker_calls) == [1, 1, 1, 2, 3, 3, 3]
+    assert out["results"] == {1: "out-1", 2: "out-2", 3: "out-3"}
     assert out["replan_count"] == 3
     assert out["final_output"] == "FINAL"
 
@@ -356,6 +484,45 @@ def test_e2e_empty_plan_after_replan_skips_second_pass(monkeypatch):
     assert "## Original plan" not in fake.writer_subtask
 
 
+def test_e2e_replan_to_new_step_id_passes_without_stale_verdict(monkeypatch):
+    """The planner follows its prompt: the FAILED step 3 is reworded under a
+    new id 4. Steps 1 and 2 are carried (not re-run), only step 4 runs, and
+    old step 3's stale FAILED verdict is dropped — so the second pass ends
+    PASSED instead of replanning until the budget is exhausted."""
+    replanned = [step(1), step(2), {**step(4, deps=[1, 2]), "subtask": "reworded 3"}]
+    orchestrator_calls = {"n": 0}
+
+    def replanning_orchestrator(state):
+        orchestrator_calls["n"] += 1
+        plan = DIAMOND_PLAN if orchestrator_calls["n"] == 1 else replanned
+        return {"plan": plan, "results": {}, "current_step": 0}
+
+    fake = FakeLLMCall(verdicts=[
+        [
+            {"step": 1, "verification_result": "PASSED", "notes": ""},
+            {"step": 2, "verification_result": "PASSED", "notes": ""},
+            {"step": 3, "verification_result": "FAILED", "notes": "REPLAN: reword it"},
+        ],
+        [
+            {"step": 1, "verification_result": "PASSED", "notes": ""},
+            {"step": 2, "verification_result": "PASSED", "notes": ""},
+            {"step": 4, "verification_result": "PASSED", "notes": ""},
+        ],
+    ])
+    graph = _build_yotta(monkeypatch, fake, orchestrator=replanning_orchestrator)
+    out = _invoke(graph, search_results="sr")
+
+    assert orchestrator_calls["n"] == 2                  # initial + one replan
+    assert sorted(s for s, _ in fake.worker_calls) == [1, 2, 3, 4]
+    assert out["results"] == {1: "out-1", 2: "out-2", 4: "out-4"}
+    assert set(out["step_verifications"]) == {1, 2, 4}  # step 3 dropped
+    assert out["verification_result"] == "PASSED"
+    assert out["verification_route"] == "proceed"
+    assert out["replan_count"] == 1
+    assert out["verification_exhausted"] is False
+    assert out["final_output"] == "FINAL"
+
+
 # ---------------------------------------------------------------------------
 # Effort slider — instant route, policy caps, safety stops
 # ---------------------------------------------------------------------------
@@ -405,7 +572,10 @@ def test_e2e_instant_single_writer_no_planner_no_verifier(monkeypatch):
     assert out["replan_count"] == 0
     assert out["verification_attempts"] == 0
     assert out.get("status") is None                    # status derived at the boundary
-    assert out.get("step_stats") is None                # no worker rows on this route
+    # ``step_stats`` is an ``operator.add`` channel, so LangGraph materializes
+    # its empty value ([]) even when no node writes it — unlike plain channels
+    # such as ``status``, which stay absent. Either shape means "no worker rows".
+    assert not out.get("step_stats")                    # no worker rows on this route
 
 
 def test_e2e_instant_writer_receives_attached_files(monkeypatch):
@@ -497,6 +667,11 @@ def test_e2e_replan_exhaustion_is_partial_with_warning(monkeypatch):
     assert out["verification_result"] == "FAILED"
     assert "Partial result warning" in fake.writer_subtask
     assert "verification budget" in fake.writer_subtask
+    # exhaustion must not wipe the research: the partial writer still sees
+    # every sub-agent result (it used to receive an empty results channel)
+    assert "## Sub-agent results" in fake.writer_subtask
+    for n in (1, 2, 3):
+        assert f"out-{n}" in fake.writer_subtask
     assert out["final_output"] == "FINAL"
 
 
@@ -528,6 +703,42 @@ def test_e2e_deadline_safety_stop_before_any_dispatch(monkeypatch):
     assert out["safety_stop_reason"] == "wall-clock deadline exceeded"
     assert fake.worker_calls == []
     assert out["status"] == "partial"
+
+
+def test_e2e_deadline_expires_during_final_wave_skips_verify(monkeypatch):
+    """A deadline that expires while the last worker wave is in flight is
+    enforced when that wave completes: the scheduler finalizes the best
+    result available (partial) instead of starting the verification phase.
+
+    The flag must flip during the FINAL wave (step 3 of DIAMOND_PLAN): the
+    scheduler runs three times (#1 dispatches {1,2}, #2 dispatches {3}, #3
+    sees ``"verify"``). A flip during wave 1 would be caught by the existing
+    pre-dispatch gate at #2 and would exercise none of the post-wave check.
+    """
+    expired = {"flag": False}
+
+    def deadline_flag(policy, now=None):
+        return expired["flag"]
+
+    monkeypatch.setattr("graphs.yotta_graph.deadline_exceeded", deadline_flag)
+
+    class DeadlineFakeLLMCall(FakeLLMCall):
+        async def __call__(self, step, results, current_datetime="", **kwargs):
+            if step["step"] == 3:      # DIAMOND_PLAN: the final wave
+                expired["flag"] = True
+            return await super().__call__(step, results, current_datetime, **kwargs)
+
+    fake = DeadlineFakeLLMCall(verdicts=[list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, effort="standard", execution_policy=_policy("standard"))
+
+    assert out["safety_stop_reason"] == "wall-clock deadline exceeded"
+    assert out["dispatch_count"] == 2                    # both waves dispatched
+    assert sorted(s for s, _ in fake.worker_calls) == [1, 2, 3]
+    assert fake.verifier_subtasks == []                  # verification never started
+    assert out["status"] == "partial"
+    assert "Partial result warning" in fake.writer_subtask
+    assert "wall-clock deadline exceeded" in fake.writer_subtask
 
 
 def test_e2e_replan_feedback_reaches_the_planner_state(monkeypatch):

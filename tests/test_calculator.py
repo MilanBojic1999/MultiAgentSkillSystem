@@ -718,3 +718,145 @@ def test_single_expression_still_uses_result():
     # The singular 'result' key is present for single expressions.
     # 'results' (plural) is absent — callers shouldn't have to check both.
     # (It's only present for multi-expression inputs.)
+
+
+# ---------------------------------------------------------------------------
+# Batch (list) input — calculate.invoke({"expr": [...]})
+# ---------------------------------------------------------------------------
+
+def test_calculate_list_all_success():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["2 + 2", "3^2", "10 % 3"]})
+    assert env["ok"] is True
+    assert "result" not in env
+    assert env["expression"] == ["2 + 2", "3^2", "10 % 3"]
+    assert env["results"] == [
+        {"text": "4", "kind": "integer"},
+        {"text": "9", "kind": "integer"},
+        {"text": "1", "kind": "integer"},
+    ]
+    assert env["error"] is None
+    assert env["steps"] == []
+
+
+def test_calculate_list_partial_failure_keeps_good_results():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["2 + 2", "1 / 0", "sqrt(9)"]})
+    assert env["ok"] is False
+    assert env["results"][0] == {"text": "4", "kind": "integer"}
+    assert env["results"][1]["error"]["code"] == "divide_by_zero"
+    assert env["results"][1]["error"]["index"] == 1
+    assert env["results"][1]["error"]["position"] is None
+    assert env["results"][1]["error"]["message"] == "Division by zero"
+    assert "text" not in env["results"][1]
+    assert "kind" not in env["results"][1]
+    assert env["results"][2] == {"text": "3", "kind": "real"}
+    assert env["error"] is None
+
+
+def test_calculate_list_all_fail():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["1 / 0", "foo"]})
+    assert env["ok"] is False
+    assert len(env["results"]) == 2
+    assert env["results"][0]["error"]["code"] == "divide_by_zero"
+    assert env["results"][0]["error"]["index"] == 0
+    assert env["results"][1]["error"]["code"] == "unknown_identifier"
+    assert env["results"][1]["error"]["index"] == 1
+    assert env["error"] is None
+
+
+def test_calculate_list_empty():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": []})
+    assert env["ok"] is False
+    assert env["expression"] == []
+    assert env["results"] == []
+    assert env["error"]["code"] == "invalid_arguments"
+    assert env["steps"] == []
+
+
+def test_calculate_list_single_item_uses_batch_shape():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["2 + 2"]})
+    assert env["ok"] is True
+    assert "result" not in env
+    assert len(env["results"]) == 1
+    assert env["results"][0]["text"] == "4"
+    assert env["steps"] == []
+
+
+def test_calculate_list_blank_item():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["2 + 2", ""]})
+    assert env["ok"] is False
+    assert env["results"][0] == {"text": "4", "kind": "integer"}
+    assert env["results"][1]["error"]["code"] == "blank_input"
+    assert env["results"][1]["error"]["index"] == 1
+    assert env["error"] is None
+
+
+def test_calculate_list_comma_item_is_per_item_error():
+    from tools.calculator import calculate
+
+    env = calculate.invoke({"expr": ["1, 2"]})
+    assert env["ok"] is False
+    assert env["results"][0]["error"]["code"] == "invalid_arguments"
+    assert env["results"][0]["error"]["index"] == 0
+
+    # Comma-separated expressions remain supported via the string path.
+    string_env = calculate.invoke({"expr": "1, 2"})
+    assert string_env["ok"] is True
+    assert len(string_env["results"]) == 2
+
+
+def test_calculate_list_with_steps():
+    from tools.calculator import calculate
+
+    env = calculate.invoke(
+        {"expr": ["2 + 3 * 4", "sqrt(16)"], "include_steps": True}
+    )
+    assert env["ok"] is True
+    assert len(env["results"]) == 2
+    assert len(env["steps"]) == 2
+    assert "3 * 4" in " ".join(env["steps"][0])
+    assert any("sqrt(16)" in s for s in env["steps"][1])
+
+
+def test_calculate_list_with_steps_failed_item_steps_empty():
+    from tools.calculator import calculate
+
+    env = calculate.invoke(
+        {"expr": ["1 / 0", "2 + 2"], "include_steps": True}
+    )
+    assert env["ok"] is False
+    assert len(env["steps"]) == 2
+    assert env["steps"][0] == []
+    assert env["steps"][1] != []
+
+
+def test_calculate_list_no_stdout(capsys):
+    from tools.calculator import calculate
+
+    calculate.invoke({"expr": ["2 + 2", "1 / 0"]})
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_calculate_args_schema_allows_list():
+    import json
+
+    from tools.calculator import calculate
+
+    schema = calculate.args_schema.model_json_schema()
+    json.dumps(schema)  # must be JSON-serializable
+    expr_schema = schema["properties"]["expr"]
+    assert "anyOf" in expr_schema
+    assert {"type": "string"} in expr_schema["anyOf"]

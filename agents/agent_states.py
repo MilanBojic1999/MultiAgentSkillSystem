@@ -142,7 +142,7 @@ class WorkerState(TypedDict):
     files: NotRequired[dict[str, str]]
 
 
-RESULTS_RESET = "__reset__"  # sentinel: clear results on replan
+RESULTS_RESET = "__reset__"  # sentinel: replace results on replan
 
 
 class YottaState(AgentState):
@@ -151,12 +151,16 @@ class YottaState(AgentState):
     The only difference from ``AgentState`` is the ``results`` reducer: the
     shared ``{**a, **b}`` merge can never delete keys, so the orchestrator's
     ``results: {}`` wipe is a no-op and the replan loop would re-verify stale
-    results forever. The reset-aware reducer lets ``verify_node`` clear
-    ``results`` on the replan route by returning ``{RESULTS_RESET: ""}``
-    (parallel/sequential keep the plain merge — untouched).
+    results forever. The reset-aware reducer gives an update carrying
+    ``RESULTS_RESET`` *replace* semantics: the channel becomes the rest of
+    that update. ``carry_forward_node`` uses it after a replan to keep only
+    the accepted outputs the new plan still needs (a bare
+    ``{RESULTS_RESET: ""}`` still clears everything). Parallel/sequential keep
+    the plain merge — untouched.
     """
     results: Annotated[dict[int, str],
-                       lambda a, b: {} if RESULTS_RESET in b else {**a, **b}]
+                       lambda a, b: ({k: v for k, v in b.items() if k != RESULTS_RESET}
+                                     if RESULTS_RESET in b else {**a, **b})]
     streaming: bool
     files: dict[str, str]
     search_results: str

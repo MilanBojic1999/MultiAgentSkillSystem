@@ -46,7 +46,7 @@ Current datetime: {current_datetime}
 ## Replanning
 A verifier report in your input means this is a replanning pass, not a first pass. Revise only the subqueries it flagged — add a missing one, reword an unanswerable one, or fix a wrong dependency — and leave every subquery the verifier already passed untouched. The run's effort policy caps the number of replanning passes; the input tells you how many have already run. If you are at the cap, mark any subquery still unresolved as such rather than requesting another pass.
 
-**Stable step ids**: for every subquery you are keeping unchanged (the verifier already approved it), reuse its EXACT SAME `step` id and EXACT SAME `subtask` text from the previous plan — the pipeline uses an (id, subtask) match to carry its already-verified output forward without re-running it. If you reword a kept subquery even slightly, its research will be discarded and it will re-run from scratch. Only assign new ids (starting above the highest id in the previous plan) to genuinely new or reworded subqueries.
+**Stable step ids**: for every subquery you are keeping unchanged (the verifier already approved it), reuse its EXACT SAME `step` id and EXACT SAME `subtask` text from the previous plan — the pipeline uses an (id, subtask) match to carry its already-verified output forward without re-running it. If you reword a kept subquery even slightly, its research will be discarded and it will re-run from scratch. A kept subquery that depends on a subquery that re-runs will also re-run, since its research was built on the replaced result. Only assign new ids (starting above the highest id in the previous plan) to genuinely new or reworded subqueries. The previous plan, with each subquery's verdict, is in your input under "## Previous plan" — copy the subqueries you keep from there.
 
 ## Available sub-agents
 {agent_roster}
@@ -93,6 +93,28 @@ def _describe_attached_files(files: dict[str, str]) -> str:
             preview += "..."
         lines.append(f"- **{filename}** ({len(content):,} chars): {preview}")
     return "## Attached documents\n" + "\n".join(lines)
+
+
+_PREVIOUS_PLAN_FIELDS = ("step", "subtask", "agent", "skills_needed", "depends_on", "files")
+
+
+def _describe_previous_plan(plan: list[dict], step_verifications: dict) -> str:
+    """Render the plan being replanned, each step tagged with its verdict.
+
+    The planner copies the steps it keeps verbatim from here: the yotta graph
+    carries an accepted step's output forward only when its id, subtask and
+    agent are unchanged (``carry_forward_node`` in ``graphs/yotta_graph.py``).
+    The extra ``verdict`` key is harmless if echoed back — plan validation
+    ignores unknown fields.
+    """
+    if not plan:
+        return ""
+    steps = []
+    for s in plan:
+        entry = {k: s[k] for k in _PREVIOUS_PLAN_FIELDS if k in s}
+        entry["verdict"] = (step_verifications.get(s["step"]) or {}).get("verdict") or "NOT VERIFIED"
+        steps.append(entry)
+    return "## Previous plan (with verifier verdicts)\n" + json.dumps(steps, indent=2, ensure_ascii=False)
 
 def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
     # The orchestrator only emits strict JSON, so it runs at low temperature —
@@ -158,8 +180,15 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
             user_parts.append(files_block)
 
         # Replan pass: the verifier's structured notes are the feedback the
-        # planner must address — without them a replan would plan blind.
+        # planner must address — without them a replan would plan blind. The
+        # previous plan (still in state until this node overwrites it) lets
+        # the planner copy kept steps verbatim so their output carries over.
         if state.get("replan_count", 0) > 0:
+            previous_plan = _describe_previous_plan(
+                state.get("plan") or [], state.get("step_verifications") or {}
+            )
+            if previous_plan:
+                user_parts.append(previous_plan)
             feedback = state.get("verification_notes") or state.get("verifier_report", "")
             if feedback:
                 user_parts.append(

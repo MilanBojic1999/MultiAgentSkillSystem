@@ -692,7 +692,7 @@ Tools are LangChain `@tool`-decorated Python functions that sub-agents can call.
 
 | Tool | File | Description |
 |---|---|---|
-| `calculate(expr, include_steps=False)` | `tools/calculator.py` | Recursive-descent expression evaluator. Returns a structured ``{"ok": …, "result": …, "error": …}`` envelope. Right-associative power, conventional precedence (``2*3^2=18``, ``-2^2=-4``, ``-3!=-6``). Factorial/GCD/LCM/combinatorics require integral inputs — no silent rounding |
+| `calculate(expr, include_steps=False)` | `tools/calculator.py` | Recursive-descent expression evaluator. ``expr`` may be a single string or a list of strings evaluated independently — the list form returns a batch envelope with per-item results/errors. String form returns a structured ``{"ok": …, "result": …, "error": …}`` envelope. Right-associative power, conventional precedence (``2*3^2=18``, ``-2^2=-4``, ``-3!=-6``). Factorial/GCD/LCM/combinatorics require integral inputs — no silent rounding |
 | `plotting_tool(expr, x_min, x_max)` | `tools/plotting.py` | Plots a mathematical expression using NumPy + Matplotlib. Returns the image path |
 | `run_bash(command, timeout)` | `tools/bash_tool.py` | Executes a bash command in a sandboxed subprocess |
 | `run_bash_with_approval(command)` | `tools/bash_tool.py` | Same as above but requires user confirmation first |

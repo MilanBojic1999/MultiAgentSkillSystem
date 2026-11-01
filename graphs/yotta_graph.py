@@ -8,6 +8,9 @@ Capabilities (moved from the old root ``yotta_graph.py``):
 - parallel fan-out of ready steps via ``Send`` through a scheduler barrier
   (same topology as ``graphs/parallel_pipeline_graph.py``);
 - per-step verification with retry / replan routing (``verify_node``);
+- replan carry-forward (``carry_forward_node``): a replan re-runs only the
+  steps that need it — accepted steps the new plan keeps unchanged (same
+  id, subtask and agent, no re-running upstream) carry their output forward;
 - LLM writer synthesis, including the direct (empty-plan) route where yotta
   search results were already sufficient;
 - **effort slider** (``execution_policy``): an entry router resolves the
@@ -30,7 +33,7 @@ from langgraph.types import Send, RetryPolicy
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 
-from agents.agent_states import YottaState, RESULTS_RESET
+from agents.agent_states import YottaState, RESULTS_RESET, _transitive_dependents
 from agents.orchestrator_node import make_orchestrator_agent
 from agents.sub_agents_nodes import (
     _bind_config,
@@ -128,11 +131,21 @@ def _yotta_scheduler(state: dict) -> dict:
 
     Runs the shared skip-marker barrier, then decides — on the projected
     state the router will actually see — whether the next move is a worker
-    dispatch wave. Only dispatch waves consume the ``max_graph_dispatches``
-    and wall-clock deadline budgets, so a pathological replan/retry cycle
+    dispatch wave or the start of verification. Only dispatch waves consume
+    the ``max_graph_dispatches`` budget, so a pathological replan/retry cycle
     always terminates with a structured ``safety_stop_reason`` (never an
     unbounded loop) while a legitimate run's verification passes never
     consume wave budget.
+
+    The wall-clock deadline is enforced both **before** a dispatch wave and
+    **after** one: the wave itself can overrun the deadline, so when the
+    completed wave leaves ``"verify"`` as the next move, the run finalizes
+    the best result available (the writer marks it partial) instead of
+    starting the verification phase. ``"verify"`` is post-dispatch by
+    construction — a non-empty plan with missing results always projects a
+    ``"sub_agent"`` wave (plan validation rejects cycles, so a dependency-free
+    root exists), while empty plans and an existing safety stop project
+    ``"writer"``.
     """
     updates = scheduler_node(state)
 
@@ -142,19 +155,26 @@ def _yotta_scheduler(state: dict) -> dict:
 
     dispatch_count = state.get("dispatch_count", 0)
     safety = state.get("safety_stop_reason", "") or ""
+    policy = policy_from_state(state)
+    route = _wave_or_route(projected)
 
-    if _wave_or_route(projected) == "sub_agent":
+    if route == "sub_agent":
         dispatch_count += 1
-        policy = policy_from_state(state)
         if dispatch_count > policy.max_graph_dispatches:
             safety = (
                 f"max_graph_dispatches={policy.max_graph_dispatches} exceeded"
             )
         elif deadline_exceeded(policy):
             safety = "wall-clock deadline exceeded"
-        if safety:
-            log_event("effort_safety_stop", reason=safety,
-                      effort=policy.preset, dispatch_count=dispatch_count)
+    elif route == "verify" and deadline_exceeded(policy):
+        # The wave that just completed ran past the wall-clock deadline —
+        # finalize the best result (the writer renders it partial) instead
+        # of starting the verification phase.
+        safety = "wall-clock deadline exceeded"
+
+    if safety:
+        log_event("effort_safety_stop", reason=safety,
+                  effort=policy.preset, dispatch_count=dispatch_count)
 
     out = dict(updates)
     out["dispatch_count"] = dispatch_count
@@ -455,8 +475,10 @@ async def verify_node(state: dict) -> dict:
     Routing (fixes F4/F5/F6): a single ``verification_route`` decision;
     on ``"retry"`` the failed steps are re-dispatched via ``pending_retries``
     (their old result stays in ``results`` — overwritten on re-execution);
-    on ``"replan"`` results are wiped via the ``RESULTS_RESET`` sentinel so
-    the orchestrator's new plan replaces the research wholesale.
+    on ``"replan"`` ``results`` is left intact and ``carry_forward_node``
+    reconciles it against the orchestrator's new plan, so already-accepted
+    steps are not re-executed. Each per-step verdict records the subtask and
+    agent it judged, which is what that reconciliation matches on.
 
     Effort policy: the verifier's LLM call attempts, the per-step retry cap
     and the replan cap all come from the policy. When the replan budget is
@@ -583,6 +605,7 @@ async def verify_node(state: dict) -> dict:
             per_step[sid] = {"verdict": verdict, "notes": notes}
 
         # ---- accumulate with existing step_verifications ----------------------
+        plan_by_id = {s["step"]: s for s in plan}
         for sid, v in per_step.items():
             verdict = v["verdict"]
             notes = v["notes"]
@@ -591,6 +614,11 @@ async def verify_node(state: dict) -> dict:
             if acc is None:
                 acc = {"verdict": "", "notes": "", "retries": 0}
                 accumulated[sid] = acc
+            # Record WHICH subtask this verdict judged: after a replan,
+            # ``carry_forward_node`` only carries an output forward when the
+            # new plan's step still has the same (id, subtask, agent).
+            acc["subtask"] = plan_by_id.get(sid, {}).get("subtask", "")
+            acc["agent"] = plan_by_id.get(sid, {}).get("agent", "")
 
             # Normalise existing notes to a list for append-only accumulation.
             # Notes may be a newline-joined string (from a previous cycle) or a
@@ -656,9 +684,10 @@ async def verify_node(state: dict) -> dict:
             aggregate_verdict = "PASSED"
 
         # ---- compute the single routing decision (fixes F5) -------------------
-        # Mixed pass (replan + retry) dominates as "replan" — the orchestrator
-        # wipes state on replan anyway, so retry-clearing steps here would just
-        # lose research for nothing (fixes F4's mixed-pass case).
+        # Mixed pass (replan + retry) dominates as "replan" — a FAILED step is
+        # never carried forward across a replan, so a retry-flagged step the
+        # new plan keeps re-runs anyway, with its [Retry k/N] note as feedback
+        # (fixes F4's mixed-pass case).
         if any_retry and not any_replan:
             route = "retry"
         elif any_replan:
@@ -737,14 +766,14 @@ async def verify_node(state: dict) -> dict:
     # ---- routing payload --------------------------------------------------
     # retry:  re-dispatch the failed steps via pending_retries (their old
     #         result stays in results — overwritten on re-execution);
-    # replan: wipe results via the reset sentinel so the orchestrator's new
-    #         plan replaces the research wholesale;
+    # replan: results are deliberately left intact — the new plan does not
+    #         exist yet, so ``carry_forward_node`` (after the orchestrator)
+    #         decides which accepted outputs survive. Left intact, an
+    #         exhausted replan budget also hands the writer every result;
     # else:   nothing pending.
     updates: dict = {"pending_retries": []}
     if route == "retry" and steps_to_remove:
         updates["pending_retries"] = sorted(steps_to_remove)
-    elif route == "replan":
-        updates["results"] = {RESULTS_RESET: ""}
 
     return {
         "verification_result": aggregate_verdict,
@@ -784,6 +813,92 @@ def after_verify(state: dict) -> str:
     if route == "replan" and replan_count <= policy_from_state(state).max_replans:
         return "orchestrator"
     return "writer"
+
+
+# ---------------------------------------------------------------------------
+# Replan carry-forward — keep the accepted steps the new plan still needs
+# ---------------------------------------------------------------------------
+
+_ACCEPTED_VERDICTS = {"PASSED", "PASSED WITH NOTES"}
+_UNUSABLE_OUTPUT_PREFIXES = ("[STEP FAILED", "[SKIPPED")
+
+
+def _norm_subtask(text) -> str:
+    """Whitespace- and case-insensitive form of a subtask, so a planner that
+    re-emits a kept step with cosmetic differences still matches it."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _carry_forward(plan: list[dict], results: dict,
+                   step_verifications: dict[int, dict]) -> tuple[dict, dict]:
+    """Reconcile the previous pass's research with a new (replanned) plan.
+
+    Returns ``(kept_results, kept_verifications)``:
+
+    - ``kept_results`` — outputs carried forward without re-running. A step
+      qualifies when its id, normalized subtask and agent match a verdict the
+      verifier accepted (PASSED / PASSED WITH NOTES), its output is a real
+      result (not a failure or skip marker), and every step it depends on —
+      directly or transitively — is carried too: an output built on a
+      re-running upstream must re-run as well.
+    - ``kept_verifications`` — the ``step_verifications`` entries whose
+      (id, subtask, agent) still match a step of the new plan, carried or
+      not (a re-running step keeps its retry count and latest
+      ``[Retry k/N]`` feedback). Verdicts for removed ids, or for ids the
+      planner reused for a different subtask, are dropped — a stale FAILED
+      verdict there would keep the aggregate verdict FAILED forever.
+    """
+    def same_step(s: dict) -> bool:
+        v = step_verifications.get(s["step"])
+        return (
+            v is not None
+            and _norm_subtask(v.get("subtask")) == _norm_subtask(s.get("subtask"))
+            and v.get("agent", "") == s.get("agent", "")
+        )
+
+    matched = [s for s in plan if same_step(s)]
+    kept = {
+        s["step"] for s in matched
+        if step_verifications[s["step"]].get("verdict") in _ACCEPTED_VERDICTS
+        and s["step"] in results
+        and not str(results[s["step"]]).startswith(_UNUSABLE_OUTPUT_PREFIXES)
+    }
+    # Dependency invalidation: anything downstream of a re-running step
+    # re-runs too (the same transitive walk the scheduler uses for skips).
+    kept -= _transitive_dependents(plan, {s["step"] for s in plan} - kept)
+
+    kept_results = {sid: results[sid] for sid in kept}
+    kept_verifications = {s["step"]: step_verifications[s["step"]] for s in matched}
+    return kept_results, kept_verifications
+
+
+def carry_forward_node(state: dict) -> dict:
+    """Between the orchestrator and the scheduler: after a replan, carry the
+    accepted outputs the new plan still needs and reset everything else.
+
+    ``verify_node`` leaves ``results`` intact on the replan route because the
+    new plan does not exist yet; this node runs once the orchestrator has
+    written it. The ``RESULTS_RESET`` sentinel gives the update replace
+    semantics (see ``YottaState``), so ``results`` becomes exactly the
+    carried outputs and ``fan_out_router`` dispatches only the rest. An empty
+    new plan carries nothing — the writer's direct route sees empty results,
+    as before. The first planning pass is a no-op.
+    """
+    replan_count = state.get("replan_count", 0)
+    if not replan_count:
+        return {}
+
+    plan = state.get("plan", [])
+    kept_results, kept_verifications = _carry_forward(
+        plan, state.get("results", {}), state.get("step_verifications", {})
+    )
+    log_event("replan_carry_forward", replan_count=replan_count,
+              kept=sorted(kept_results),
+              rerun=sorted(s["step"] for s in plan if s["step"] not in kept_results))
+    return {
+        "results": {RESULTS_RESET: "", **kept_results},
+        "step_verifications": kept_verifications,
+    }
 
 
 async def writer_node(state: dict) -> dict:
@@ -1014,6 +1129,7 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
     builder.add_node("orchestrator", orchestrator,
                      retry_policy=RetryPolicy(max_attempts=2, retry_on=(ValueError,)))
     builder.add_node("sub_agent", sub_agent)
+    builder.add_node("carry_forward", carry_forward_node)
     builder.add_node("scheduler", _yotta_scheduler)
     builder.add_node("verify", verify_node)
     builder.add_node("writer", writer_node)
@@ -1026,7 +1142,10 @@ def build(*, checkpointer=None, orchestrator=None, sub_agent=None):
                                   ["orchestrator", "writer"])
     # Workers re-enter the scheduler barrier (no-op skip-marker pass).
     builder.add_edge("sub_agent", "scheduler")
-    builder.add_edge("orchestrator", "scheduler")
+    # A new plan first passes carry_forward (no-op on the first pass; after
+    # a replan it keeps the accepted outputs the new plan still needs).
+    builder.add_edge("orchestrator", "carry_forward")
+    builder.add_edge("carry_forward", "scheduler")
     builder.add_conditional_edges("scheduler", fan_out_router,
                                   ["writer", "verify", "sub_agent"])
     builder.add_conditional_edges("verify", after_verify,

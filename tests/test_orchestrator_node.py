@@ -138,3 +138,32 @@ def test_first_pass_does_not_inject_verifier_feedback():
     node(_policy_state("standard", verification_notes="stale notes"))
     (messages,) = recording.calls
     assert "Verifier report" not in messages[1].content
+
+
+def test_replan_pass_shows_previous_plan_with_verdicts():
+    """The plan being replanned (still in state) is rendered with each step's
+    verdict, so the planner can copy kept steps verbatim and their output
+    carries forward (yotta's carry_forward_node matches id+subtask+agent)."""
+    recording = _RecordingLLM({"plan": DIAMOND_PLAN})
+    node = orch.make_orchestrator_agent(llm=recording)
+    node(_policy_state(
+        "standard", replan_count=1, plan=DIAMOND_PLAN,
+        step_verifications={1: {"verdict": "FAILED"}, 2: {"verdict": "PASSED"}},
+    ))
+    (messages,) = recording.calls
+    human = messages[1].content
+    assert "## Previous plan (with verifier verdicts)" in human
+    block = human.split("## Previous plan (with verifier verdicts)\n", 1)[1]
+    previous = json.loads(block[: block.index("\n]") + 2])
+    assert [s["step"] for s in previous] == [1, 2, 3]
+    assert [s["subtask"] for s in previous] == ["subtask 1", "subtask 2", "subtask 3"]
+    assert [s["verdict"] for s in previous] == ["FAILED", "PASSED", "NOT VERIFIED"]
+    assert previous[2]["depends_on"] == [1, 2]
+
+
+def test_first_pass_does_not_show_a_previous_plan():
+    recording = _RecordingLLM({"plan": DIAMOND_PLAN})
+    node = orch.make_orchestrator_agent(llm=recording)
+    node(_policy_state("standard", plan=DIAMOND_PLAN))
+    (messages,) = recording.calls
+    assert "## Previous plan" not in messages[1].content
