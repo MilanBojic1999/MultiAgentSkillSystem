@@ -55,14 +55,6 @@ def test_plan_in_json_fence_is_parsed():
     assert [s["step"] for s in out["plan"]] == [1, 2, 3]
 
 
-def test_empty_plan_signals_the_direct_route():
-    """An empty plan is the orchestrator's "search results were sufficient"
-    signal (yotta's direct route) — it is returned, not an error."""
-    node = orch.make_orchestrator_agent(llm=fake_llm({"plan": []}))
-    out = node({"task": "do things"})
-    assert out == {"plan": [], "results": {}, "current_step": 0}
-
-
 def test_non_json_response_raises():
     node = orch.make_orchestrator_agent(llm=fake_llm("I cannot help with that."))
     with pytest.raises(ValueError, match="Failed to parse JSON"):

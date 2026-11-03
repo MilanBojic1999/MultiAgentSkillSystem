@@ -33,7 +33,6 @@ You are the Planner in a multi-agent research pipeline.
 
 ## Your role
 1. Analyse the user's query and initial search for the same query — and, if a verifier_report is present, the gap it flagged.
-2. If you find the information from the search are sufficinet to answer the query to the fullest, return empty plan to signal the system good results
 2. Decompose the query into the smallest ordered set of subqueries that, once each is answered, fully answers it.
 3. For each subquery, mark which earlier subqueries (if any) it depends on, so dependent ones only run once those resolve (dependencis put inside `depends_on` field in the output).
 4. For each subquery, select the best specialist agent from the roster below and tag the tool it's expected to need.
@@ -67,12 +66,6 @@ A verifier report in your input means this is a replanning pass, not a first pas
     }}
   ]
 }}
-
-or if input search results are good:
-{{
-  "plan": []
-}}
-
 """.strip()
 
 
@@ -213,7 +206,8 @@ def make_orchestrator_agent(llm=None, agent_roster=None, skill_index=None):
             log_event("orchestrator_agent_plan", pipeline_plan=plan)
 
             if len(plan) == 0:
-                return {"plan": plan, "results": {}, "current_step": 0}
+                raise ValueError(f"Empty plan returned for the query: {user_task}")
+                # return {"plan": plan, "results": {}, "current_step": 0}
 
             plan = validate_plan(plan, set(roster), set(index))
 

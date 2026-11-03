@@ -261,22 +261,56 @@ def _llm_kwargs(llm_block: dict, agent_name: str) -> dict:
         )
     return dict(llm_block)
 
+def _budget_prompt_block(tool_budget: int | None) -> str:
+    """Render the per-attempt tool-call budget into the system prompt.
+
+    ``_ToolBudgetGuard`` enforces the cap out-of-band (batch truncation and
+    the budget-exhaustion finalize pass), so this block is the only *advance*
+    notice the agent gets — without it a truncated batch or a finalize pass
+    surprises the model mid-task. ``None`` means no policy (legacy callers):
+    no budget is enforced and nothing is rendered.
+    """
+    if tool_budget is None:
+        return ""
+    if tool_budget <= 0:
+        return (
+            "\n\n## Tool budget\n"
+            "No tool calls are available this attempt — every tool call will "
+            "be rejected. Answer using the information already in this "
+            "conversation."
+        )
+    return (
+        "\n\n## Tool budget\n"
+        f"You may make at most {tool_budget} tool call(s) during this attempt, "
+        f"counted across all turns. Calls beyond the budget are not executed. "
+        f"Plan before calling: batch independent calls into one turn and "
+        f"prefer the fewest calls that answer the task."
+    )
+
+
 def _build_system_prompt(agent_name: str, agent_description: str,
                           skill_bodies: list[str], context: dict,
                           current_datetime: str = "",
-                          documents_block: str = "") -> str:
+                          documents_block: str = "",
+                          tool_budget: int | None = None) -> str:
     skill_block   = "\n\n---\n\n".join(skill_bodies)
     context_block = f"\n\n## Upstream context\n{context}" if context else ""
     datetime_line = f"\n\nCurrent datetime: {current_datetime}" if current_datetime else ""
     docs_block    = f"\n\n{documents_block}" if documents_block else ""
+    budget_block  = _budget_prompt_block(tool_budget)
+    tools_line    = (
+        "Do not call any tools."
+        if tool_budget is not None and tool_budget <= 0
+        else "Use tools when needed."
+    )
     return f"""You are the {agent_name} specialist agent.
 Role: {agent_description}
 
 ## Active skills
 {skill_block}
-{context_block}{datetime_line}{docs_block}
+{context_block}{datetime_line}{docs_block}{budget_block}
 
-Use tools when needed. Return your final answer as plain text. No meta-commentary."""
+{tools_line} Return your final answer as plain text. No meta-commentary."""
 
 
 async def run_sub_agent_async(
@@ -316,7 +350,9 @@ async def run_sub_agent_async(
     budget is enforced then, preserving current behavior). When present it
     enforces, *in flight*:
 
-    - ``max_tool_calls_per_attempt`` — a batch that needs more calls than the
+    - ``max_tool_calls_per_attempt`` — announced to the agent in its system
+      prompt (``_budget_prompt_block``) so it can plan its calls, then
+      enforced in flight: a batch that needs more calls than the
       budget has left runs its first ``remaining`` calls; the rest are
       answered with a "not executed, budget exhausted" ``ToolMessage`` and the
       agent continues (``_ToolBudgetGuard.post_model_hook``). If the model
@@ -397,7 +433,8 @@ async def run_sub_agent_async(
     documents_block = render_files_block(selected_files)
 
     system_prompt = _build_system_prompt(
-        agent_name, AGENT_ROSTER[agent_name], skill_bodies, context, dt, documents_block
+        agent_name, AGENT_ROSTER[agent_name], skill_bodies, context, dt, documents_block,
+        tool_budget=cap,
     )
 
     # Combine native tools + MCP tools for this agent

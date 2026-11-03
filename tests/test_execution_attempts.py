@@ -472,6 +472,34 @@ def test_tool_budget_guard_cap_zero_raises_on_any_tool_request():
         _ToolBudgetGuard(0).on_llm_end(LLMResult(generations=[[_generation(1)]]))
 
 
+def test_system_prompt_announces_the_tool_budget():
+    """The guard enforces out-of-band; the prompt is the agent's only advance
+    notice of the cap."""
+    prompt = worker_mod._build_system_prompt(
+        "researcher", "desc", ["skill body"], {}, "now", "", tool_budget=5,
+    )
+    assert "## Tool budget" in prompt
+    assert "at most 5 tool call(s)" in prompt
+    assert "Use tools when needed." in prompt
+
+
+def test_system_prompt_cap_zero_forbids_tool_calls():
+    """Instant's cap: the prompt must not invite tools the guard will reject."""
+    prompt = worker_mod._build_system_prompt(
+        "writer", "desc", [], {}, "", "", tool_budget=0,
+    )
+    assert "No tool calls are available" in prompt
+    assert "Do not call any tools." in prompt
+    assert "Use tools when needed." not in prompt
+
+
+def test_system_prompt_without_a_policy_has_no_budget_block():
+    """Legacy callers without a policy see exactly the old prompt."""
+    prompt = worker_mod._build_system_prompt("researcher", "desc", [], {}, "", "")
+    assert "Tool budget" not in prompt
+    assert "Use tools when needed." in prompt
+
+
 def _tool_calls(*ids):
     return [{"name": "t", "args": {}, "id": i, "type": "tool_call"} for i in ids]
 
