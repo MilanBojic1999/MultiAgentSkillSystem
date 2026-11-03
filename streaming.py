@@ -18,8 +18,11 @@ complete frame; payloads are JSON, since a subtask may contain any character):
     <agent_end>{"step":1,"agent":"…","status":"completed","duration_s":12.4,…}</agent_end>
     <verification>…raw verifier report…</verification>
     <answer>                                ← writer node started
-    …visible tokens, raw, one yield per chunk…
+    …visible tokens, one yield per chunk. ``{{ID}}`` citation markers are
+    translated live into ``[ID](url)`` / ``[ID]``; a marker split across
+    chunks is buffered until it completes (see utils/citations.py)…
     <answer_restart>                        ← writer attempt restarted; drop what came before
+    ### Sources …                           ← cited-only appendix, before the close
     </answer>                               ← writer node ended
     <tool>{"name":"…","args":{…}}</tool>    ← the writer's tool calls only
     [error] <message>                       ← one frame, newlines escaped
@@ -51,6 +54,7 @@ import uuid
 from agents.agent_states import get_current_datetime_str
 from execution_policy import normalize_effort, resolve_execution_policy
 from pipeline_entry import build_task_string, build_files_state
+from utils.citations import StreamingCitationResolver, parse_source_registry
 from utils.logger import log_event
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,50 @@ def _visible_delta(chunk) -> str:
     return ""
 
 
+def _content_text(content) -> str:
+    """Text of one message's ``content`` — a str, a dict, or content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return _content_text(content.get("text", ""))
+    if isinstance(content, (list, tuple)):
+        return "".join(_content_text(block) for block in content)
+    text = getattr(content, "text", None)     # a content-block object
+    return text if isinstance(text, str) else ""
+
+
+def _messages_text(value) -> str:
+    """Flatten the message payload of an ``on_chat_model_start`` event.
+
+    ``data.input`` is ``{"messages": [[SystemMessage, HumanMessage]]}`` — one
+    list per batch. Messages may be BaseMessage objects or dicts, and their
+    content may be a string or a content-block list. The writer's prompt
+    (which carries the source registry) is the only place the registry
+    travels, so this is what the streaming resolver parses.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if "content" in value:
+            return _content_text(value["content"])
+        if "messages" in value:
+            return _messages_text(value["messages"])
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_messages_text(item) for item in value)
+    content = getattr(value, "content", None)
+    if content is not None:
+        return _content_text(content)
+    return ""
+
+
+def _event_input_text(event) -> str:
+    data = event.get("data") or {}
+    return _messages_text(data.get("input"))
+
+
 def _node_of(event) -> str | None:
     """The graph node an event belongs to — but only for the node's **own**
     chain event.
@@ -161,14 +209,15 @@ class _ProtocolTranslator:
 
     Pure and synchronous — no I/O, no graph, no LLM — so the protocol is unit
     testable against hand-written event dicts (tests/test_streaming_protocol.py).
-    All state is the writer gate: whether the writer node is running, and
-    whether it has already emitted answer text.
+    State is the writer gate (whether the writer node is running and whether
+    it has already emitted answer text) plus the live citation resolver.
     """
 
     def __init__(self):
         self.writer_active = False
         self.answer_chars = 0
         self.in_think = False
+        self.citation_resolver = StreamingCitationResolver()
 
     # -- public -------------------------------------------------------------
 
@@ -179,7 +228,7 @@ class _ProtocolTranslator:
         if kind == "on_chain_end":
             return self._node_end(_node_of(event), event)
         if kind == "on_chat_model_start":
-            return self._model_start()
+            return self._model_start(event)
         if kind == "on_chat_model_stream":
             return self._model_stream(event)
         if kind == "on_tool_start":
@@ -188,9 +237,9 @@ class _ProtocolTranslator:
 
     def finish(self) -> list[str]:
         """Close an ``<answer>`` the writer never closed (error, cancellation)."""
-        if self.writer_active:
-            return self._close_answer()
-        return []
+        if not self.writer_active:
+            return []
+        return self._flush_answer() + self._close_answer()
 
     # -- node lifecycle -----------------------------------------------------
 
@@ -209,6 +258,7 @@ class _ProtocolTranslator:
             self.writer_active = True
             self.answer_chars = 0
             self.in_think = False
+            self.citation_resolver.reset()
             return ["<answer>"]
         return []
 
@@ -239,25 +289,36 @@ class _ProtocolTranslator:
                 # The writer produced no streamed token — a non-streaming
                 # client, or the budget-exhaustion finalize pass. Emit the
                 # assembled document itself so the reader is never left with
-                # an empty answer.
+                # an empty answer. The writer node already resolved its
+                # citation markers and appended the sources list.
                 final = self._output(event).get("final_output") or ""
                 if final:
                     frames.append(str(final))
+            else:
+                frames.extend(self._flush_answer())
             frames.extend(self._close_answer())
             return frames
         return []
 
     # -- token / tool stream ------------------------------------------------
 
-    def _model_start(self) -> list[str]:
+    def _model_start(self, event) -> list[str]:
+        if not self.writer_active:
+            return []
+        frames: list[str] = []
         # A second LLM call while the writer is streaming means the bounded
         # attempt loop re-invoked it: everything sent so far is a dead draft.
-        if self.writer_active and self.answer_chars:
+        if self.answer_chars:
             frames = self._close_think()
             frames.append("<answer_restart>")
             self.answer_chars = 0
-            return frames
-        return []
+            self.citation_resolver.reset()
+        # The registry reaches the model only as part of its prompt, so this
+        # event's input is the stream's source of truth for the ID map.
+        self.citation_resolver.set_sources(
+            parse_source_registry(_event_input_text(event))
+        )
+        return frames
 
     def _model_stream(self, event) -> list[str]:
         if not self.writer_active:
@@ -276,8 +337,13 @@ class _ProtocolTranslator:
         if not visible:
             return []
         frames = self._close_think()
+        # The raw delta, not the resolved text, drives the answer counter and
+        # the restart fallback — a held partial marker must still count as
+        # streamed content.
         self.answer_chars += len(visible)
-        frames.append(visible)
+        resolved = self.citation_resolver.feed(visible)
+        if resolved:
+            frames.append(resolved)
         return frames
 
     def _tool_start(self, event) -> list[str]:
@@ -293,6 +359,17 @@ class _ProtocolTranslator:
         })]
 
     # -- helpers ------------------------------------------------------------
+
+    def _flush_answer(self) -> list[str]:
+        """Release any buffered citation text, then the sources appendix."""
+        frames: list[str] = []
+        tail = self.citation_resolver.flush()
+        if tail:
+            frames.append(tail)
+        section = self.citation_resolver.sources_section()
+        if section:
+            frames.append(section)
+        return frames
 
     def _close_think(self) -> list[str]:
         if self.in_think:

@@ -264,6 +264,96 @@ def test_finish_closes_an_open_answer():
 
 
 # ---------------------------------------------------------------------------
+# Writer citations — {{ID}} markers are translated live
+# ---------------------------------------------------------------------------
+
+REGISTRY_PROMPT = (
+    "## Sources for citation\n\n"
+    "Cite only the IDs listed below, in `{{ID}}` form.\n\n"
+    "- {{1}} — https://example.com/a\n"
+    "- {{2}} — notes.md"
+)
+
+
+def model_start(prompt: str) -> dict:
+    """The writer's ``on_chat_model_start``: the prompt travels in the input."""
+    return nested_event("on_chat_model_start", "ChatOpenAI", "model",
+                        {"input": {"messages": [[{"content": prompt}]]}})
+
+
+def test_writer_stream_resolves_markers_split_across_tokens():
+    translator = _ProtocolTranslator()
+    out = frames(translator, [
+        node_event("on_chain_start", "writer", {"input": {}}),
+        model_start(REGISTRY_PROMPT),
+        token("Claim {{"),
+        token("1"),
+        token("}}."),
+        node_event("on_chain_end", "writer",
+                   {"output": {"final_output": "already resolved upstream"}}),
+    ])
+
+    visible = "".join(frame for frame in out if not frame.startswith("<"))
+    assert "{{" not in visible
+    assert visible == (
+        "Claim [1](https://example.com/a).\n\n"
+        "### Sources\n\n1. https://example.com/a")
+    assert out[0] == "<answer>"
+    assert out[-1] == "</answer>"
+    assert out[-2].startswith("\n\n### Sources")   # appendix precedes the close
+
+
+def test_writer_stream_restart_resets_citation_state():
+    translator = _ProtocolTranslator()
+    out = frames(translator, [
+        node_event("on_chain_start", "writer", {"input": {}}),
+        model_start(REGISTRY_PROMPT),
+        token("First {{1}}"),
+        model_start(REGISTRY_PROMPT),
+        token("Second {{2}}."),
+        node_event("on_chain_end", "writer", {"output": {"final_output": "x"}}),
+    ])
+
+    assert "<answer_restart>" in out
+    after_restart = "".join(
+        frame for frame in out[out.index("<answer_restart>") + 1:]
+        if not frame.startswith("<")
+    )
+    assert "Second [2]." in after_restart
+    assert "### Sources" in after_restart
+    assert "notes.md" in after_restart
+    # the dead first attempt's citation is not carried into the appendix
+    assert "https://example.com/a" not in after_restart
+
+
+def test_writer_stream_strips_markers_without_a_registry():
+    out = frames(_ProtocolTranslator(), [
+        node_event("on_chain_start", "writer", {"input": {}}),
+        model_start("a prompt with no registry"),
+        token("Claim {{9}}."),
+        node_event("on_chain_end", "writer", {"output": {"final_output": "x"}}),
+    ])
+    assert [frame for frame in out if not frame.startswith("<")] == ["Claim."]
+    assert out[-1] == "</answer>"
+
+
+def test_model_start_reads_content_block_message_lists():
+    """The real event carries content-block lists, not bare strings."""
+    translator = _ProtocolTranslator()
+    event = nested_event("on_chat_model_start", "ChatOpenAI", "model",
+                         {"input": {"messages": [[{
+                             "content": [{"type": "text",
+                                          "text": REGISTRY_PROMPT}]}]]}})
+    frames(translator, [
+        node_event("on_chain_start", "writer", {"input": {}}),
+        event,
+        token("cites {{1}}"),
+    ])
+    assert [source.label for source in translator.citation_resolver.cited] == [
+        "https://example.com/a"]
+
+
+# ---------------------------------------------------------------------------
 # Robustness — a malformed event must never break a run
 # ---------------------------------------------------------------------------
 

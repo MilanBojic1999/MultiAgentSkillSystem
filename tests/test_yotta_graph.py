@@ -34,18 +34,22 @@ _STATS = {"input_tokens": 10, "output_tokens": 10, "tool_calls": 0}
 class FakeLLMCall:
     """Scripted ``run_sub_agent_async`` covering all three call sites.
 
-    - workers (numeric step): return ``(step, "out-<n>", stats)``, recording
-      the step and the ``feedback`` kwarg the production worker binds (F2),
-      plus — in ``worker_files`` — the step's own ``files`` assignment and the
-      ``files`` kwarg carrying the run's attached documents;
+    - workers (numeric step): return ``out-<n>`` (or the scripted
+      ``worker_outputs[n]``), recording the step and the ``feedback`` kwarg
+      the production worker binds (F2), plus — in ``worker_files`` — the
+      step's own ``files`` assignment and the ``files`` kwarg carrying the
+      run's attached documents;
     - verifier (step ``"verify"``): replay the scripted verdict lists, one
       per verify pass;
-    - writer (step ``"assemble"``): return ``"FINAL"``, recording the subtask
-      so tests can inspect the writer's prompt blocks (direct route).
+    - writer (step ``"assemble"``): return ``"FINAL"`` (or the scripted
+      ``writer_output``), recording the subtask so tests can inspect the
+      writer's prompt blocks and its citation handling.
     """
 
-    def __init__(self, verdicts):
+    def __init__(self, verdicts, writer_output="FINAL", worker_outputs=None):
         self.verdicts = list(verdicts)
+        self.writer_output = writer_output
+        self.worker_outputs = dict(worker_outputs or {})
         self.worker_calls: list[tuple[int, str]] = []
         # (step number, the step's own ``files`` assignment, the ``files`` kwarg)
         self.worker_files: list[tuple[int, list[str], dict[str, str]]] = []
@@ -59,12 +63,16 @@ class FakeLLMCall:
             return step["step"], json.dumps(payload), _STATS
         if step["step"] == "assemble":
             self.writer_subtask = step["subtask"]
-            return step["step"], "FINAL", _STATS
+            return step["step"], self.writer_output, _STATS
         self.worker_calls.append((step["step"], kwargs.get("feedback", "")))
         self.worker_files.append(
             (step["step"], step.get("files", []), kwargs.get("files") or {})
         )
-        return step["step"], f"out-{step['step']}", _STATS
+        return (
+            step["step"],
+            self.worker_outputs.get(step["step"], f"out-{step['step']}"),
+            _STATS,
+        )
 
 
 def _build_yotta(monkeypatch, fake, orchestrator=None, sub_agent=None):
@@ -776,3 +784,96 @@ def test_effort_policy_round_trips_through_state_and_entry(monkeypatch):
     again = ExecutionPolicy.from_dict(out["execution_policy"])
     assert again.preset == "thorough"
     assert again.max_replans == 2
+
+
+# ---------------------------------------------------------------------------
+# Writer citations — registry in the prompt, {{ID}} resolved in final_output
+# ---------------------------------------------------------------------------
+
+SEARCH_WITH_URL = "- Alpha [source: https://example.com/a]"
+
+
+def test_e2e_writer_prompt_has_registry_and_output_is_resolved(monkeypatch):
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)],
+                       writer_output="Alpha is true {{1}}.")
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, search_results=SEARCH_WITH_URL)
+
+    assert "## Sources for citation" in fake.writer_subtask
+    assert "- {{1}} — https://example.com/a" in fake.writer_subtask
+    assert out["final_output"] == (
+        "Alpha is true [1](https://example.com/a).\n\n"
+        "### Sources\n\n1. https://example.com/a")
+
+
+def test_e2e_file_source_resolves_to_a_bare_number(monkeypatch):
+    fake = FakeLLMCall(verdicts=[],
+                       writer_output="The notes say X {{1}}.")
+
+    def empty_orchestrator(state):
+        return {"plan": [], "results": {}, "current_step": 0}
+
+    graph = _build_yotta(monkeypatch, fake, orchestrator=empty_orchestrator)
+    out = _invoke(graph, files={"notes.md": "document text"})
+
+    assert "- {{1}} — notes.md" in fake.writer_subtask
+    assert out["final_output"] == (
+        "The notes say X [1].\n\n### Sources\n\n1. notes.md")
+
+
+def test_e2e_worker_findings_become_citable_sources(monkeypatch):
+    worker_one = json.dumps({"findings": [
+        {"content": "found it", "source": "https://example.com/w"}]})
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)],
+                       worker_outputs={1: worker_one},
+                       writer_output="Found {{1}}.")
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph)
+
+    assert "- {{1}} — https://example.com/w" in fake.writer_subtask
+    assert out["final_output"] == (
+        "Found [1](https://example.com/w).\n\n"
+        "### Sources\n\n1. https://example.com/w")
+
+
+def test_e2e_non_json_worker_outputs_register_only_search_sources(monkeypatch):
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)],
+                       writer_output="x {{2}}.")
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, search_results=SEARCH_WITH_URL)
+
+    # exactly one registered ID: the search URL; the prose worker outputs
+    # contribute nothing (and cite nothing)
+    assert fake.writer_subtask.count("- {{") == 1
+    assert out["final_output"] == "x."
+
+
+def test_e2e_invented_id_is_stripped_without_an_appendix(monkeypatch):
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)],
+                       writer_output="Claim {{99}}.")
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph)                 # no evidence at all -> no registry
+
+    assert "## Sources for citation" not in fake.writer_subtask
+    assert out["final_output"] == "Claim."
+
+
+def test_e2e_registered_sources_are_not_listed_unless_cited(monkeypatch):
+    """A registered source the writer never cites stays out of the appendix."""
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)],
+                       writer_output="Claim {{99}}.")
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, search_results=SEARCH_WITH_URL)
+
+    assert "- {{1}} — https://example.com/a" in fake.writer_subtask
+    assert out["final_output"] == "Claim."
+    assert "### Sources" not in out["final_output"]
+
+
+def test_e2e_no_citations_leaves_the_answer_exactly_unchanged(monkeypatch):
+    fake = FakeLLMCall(verdicts=[list(ALL_PASSED)])
+    graph = _build_yotta(monkeypatch, fake)
+    out = _invoke(graph, search_results=SEARCH_WITH_URL)
+
+    assert out["final_output"] == "FINAL"
+    assert "### Sources" not in out["final_output"]

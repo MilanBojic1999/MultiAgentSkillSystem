@@ -52,6 +52,7 @@ from execution_policy import (
 )
 from graphs.parallel_pipeline_graph import scheduler_node
 from pipeline_entry import render_files_block
+from utils.citations import build_source_map, render_source_registry, resolve_and_append
 from utils.json_utils import extract_json
 from utils.logger import log_event
 
@@ -950,10 +951,12 @@ async def writer_node(state: dict) -> dict:
     # Direct route only: no document-reader steps ran, so the writer needs
     # the raw attached documents itself. On the normal route, the writer
     # relies on document-reader-worker findings in ``results`` instead.
+    rendered_files = None
     if not plan and files:
         files_block = render_files_block(files)
         if files_block:
             blocks.append(files_block)
+            rendered_files = files
 
     # Original plan (normal route only)
     if plan:
@@ -978,6 +981,22 @@ async def writer_node(state: dict) -> dict:
     # instead of parsing the task string.
     if search_results:
         blocks.append(f"## Search results (initial grounding)\n{search_results}")
+
+    # Source registry: the writer cites ``{{ID}}`` markers only (never URLs,
+    # titles or paths); the IDs are resolved after it responds. Built from
+    # the exact evidence rendered above — a source with no ID is uncitable.
+    source_map = build_source_map(
+        search_results=search_results,
+        rendered_files=rendered_files,
+        results=results if plan else {},     # mirror the prompt
+        attached_filenames=tuple(files or {}),
+    )
+    registry_block = render_source_registry(source_map)
+    if registry_block:
+        blocks.append(registry_block)
+    log_event("writer_sources_registered", registered=len(source_map.sources),
+              steps_without_sources=list(source_map.steps_without_sources),
+              skipped_findings=source_map.skipped_findings)
 
     # Verifier notes (normal route)
     if verification_notes:
@@ -1011,10 +1030,6 @@ async def writer_node(state: dict) -> dict:
         + "\n\n".join(blocks)
     )
 
-    print('&'*50)
-    print(subtask)
-    print('&'*50)
-
     write_step = {
         "step": "assemble",
         "agent": "writer",
@@ -1042,10 +1057,19 @@ async def writer_node(state: dict) -> dict:
         graph_name="yotta",
     )
 
+    # Resolve the writer's ``{{ID}}`` markers into Markdown links / bare
+    # numbers, then append the cited-only sources list. Text without markers
+    # is returned byte-for-byte unchanged (so a plain answer keeps its exact
+    # shape and no empty appendix is added).
+    final_output, resolution = resolve_and_append(output, source_map.sources)
+    log_event("writer_citations_resolved", marker_count=resolution.marker_count,
+              cited_ids=[source.id for source in resolution.cited],
+              unknown_ids=list(resolution.unknown_ids))
+
     # The assembled document is the terminal product — results must not be
     # repopulated with it (the old ``{"assemble": ...}`` entry polluted the
     # results channel for no reader).
-    updates: dict = {"final_output": output}
+    updates: dict = {"final_output": final_output}
     if partial_reasons:
         updates["status"] = "partial"
     return updates

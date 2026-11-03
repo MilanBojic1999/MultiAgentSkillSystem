@@ -584,6 +584,9 @@ async def run_step_with_attempts(
             raise
         except Exception as exc:
             last_exc = exc
+            print("&"*20)
+            print(str(exc))
+            print("&"*20)
             if attempt < max_attempts:
                 log_event(
                     "sub_agent_attempt_failed",
