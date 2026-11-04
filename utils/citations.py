@@ -291,8 +291,8 @@ def _format_marker(source: Source) -> str:
     if not source.url:
         return f"[{source.id}]"
     if any(char.isspace() or char in "()" for char in source.url):
-        return f"[{source.id}](<{source.url}>)"
-    return f"[{source.id}]({source.url})"
+        return "{{{{{}}}}}".format(source.url)
+    return "{{{{{}}}}}".format(source.url)
 
 
 def _strip_trailing_space(pieces: list[str]) -> None:
@@ -398,20 +398,21 @@ def resolve_citations(text: str, sources: Iterable[Source] = ()) -> CitationReso
     )
 
 
-def _format_sources_section(cited: Iterable[Source]) -> str:
-    ordered = sorted(cited, key=lambda source: source.id)
-    if not ordered:
-        return ""
-    items = "\n".join(
-        f"{index}. {source.label}" for index, source in enumerate(ordered, start=1)
-    )
-    return f"### Sources\n\n{items}"
+# def _format_sources_section(cited: Iterable[Source]) -> str:
+#     ordered = sorted(cited, key=lambda source: source.id)
+#     if not ordered:
+#         return ""
+#     items = "\n".join(
+#         f"{index}. {source.label}" for index, source in enumerate(ordered, start=1)
+#     )
+#     return f"### Sources\n\n{items}"
 
 
 def append_sources_section(text: str, cited: Iterable[Source]) -> str:
     """Append a ``### Sources`` list of the cited sources (ascending, once
     each). No citations → *text* is returned byte-for-byte unchanged."""
-    section = _format_sources_section(cited)
+    # section = _format_sources_section(cited)
+    section = ""
     if not section:
         return text
     body = text.rstrip()
@@ -423,7 +424,7 @@ def resolve_and_append(
 ) -> tuple[str, CitationResolution]:
     """Resolve markers, then append the sources section; returns both."""
     resolution = resolve_citations(text, sources)
-    return append_sources_section(resolution.text, resolution.cited), resolution
+    return resolution.text, resolution
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +498,10 @@ class StreamingCitationResolver:
 
     def sources_section(self) -> str:
         """The ``### Sources`` appendix for the answer stream, or ``""``."""
-        section = _format_sources_section(self.cited)
-        return f"\n\n{section}" if section else ""
+        # section = _format_sources_section(self.cited)
+        # return f"\n\n{section}" if section else ""
+
+        return ""
 
     def reset(self) -> None:
         """Writer attempt restart: everything sent so far is a dead draft."""

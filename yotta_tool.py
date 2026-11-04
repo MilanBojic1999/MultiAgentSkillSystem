@@ -1,11 +1,32 @@
 import asyncio
+import os
 import requests
 import traceback
 import json
 
+from dotenv import load_dotenv
 
-yotta_api = "http://216.151.16.11:5155/api/question/answer-engine"
-api_key = "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiZGV2X3VzZXIiLCJleHAiOjMyNTAzNjgwMDAwfQ.zZcSMdiMSSuT7p5IQG-l9IUbR3A9aUlzYkESiObCgDM"
+load_dotenv()
+
+
+def _yotta_config() -> tuple[str, str]:
+    """Read the yotta endpoint and auth header from the environment.
+
+    ``YOTTA_API_KEY`` is required and holds the bearer token only; the
+    ``Bearer `` prefix is added here if it is missing. See ``.env.example``.
+    """
+    token = os.getenv("YOTTA_API_KEY", "").strip()
+    if not token:
+        raise EnvironmentError(
+            "Missing required Yotta configuration: YOTTA_API_KEY. "
+            "Set it in .env (see .env.example)."
+        )
+    if not token.lower().startswith("bearer "):
+        token = f"Bearer {token}"
+    api_url = os.getenv("YOTTA_API_URL", "").strip()
+    assert api_url != ""
+    return api_url, token
+
 
 def process_serper_kg_entites(kg_data):
     kg_list = []
@@ -25,13 +46,14 @@ def process_serper_kg_entites(kg_data):
 def _call_yotta_sync(question: str, answers_returned: int=10, sents_per_answer: int=1) -> str:
     """Synchronous core: see ``call_yotta`` for the public async API."""
 
+    api_url, auth_header = _yotta_config()
     body = {"question":question,"version":"v3","sents_per_answer":sents_per_answer}
-    headers = {"Content-Type": "application/json", "Authorization": api_key}
+    headers = {"Content-Type": "application/json", "Authorization": auth_header}
 
 
     response = None
     try:
-        response = requests.post(yotta_api, json=body, headers=headers, timeout=30)
+        response = requests.post(api_url, json=body, headers=headers, timeout=30)
         response.raise_for_status()
         answers = response.json()
 

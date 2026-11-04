@@ -758,6 +758,8 @@ The API uses Pydantic models for request/response validation and includes CORS m
 | `LLM_MODEL` | Model name to use | `deepseek-v4-flash` |
 | `LLM_KEY` | API key for the LLM service | (required) |
 | `CONFIG_PATH` | Path to the unified agent config JSON | `agents/agent_config.json` |
+| `YOTTA_API_KEY` | Bearer token for the yotta answer engine (`Bearer ` prefix optional) | (required for yotta) |
+| `YOTTA_API_URL` | Yotta answer-engine endpoint | `http://216.151.16.11:5155/api/question/answer-engine` |
 | `LOG_LEVEL` | Logging level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) | `INFO` |
 | `LOG_FILE` | Log file path (empty string disables file logging) | `langgraph_smart_reasoning.log` |
 | `LOG_CONSOLE` | Also emit log events to stderr (`true`/`false`) | `false` |
